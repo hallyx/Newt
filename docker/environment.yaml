@@ -1,0 +1,41 @@
+name: newt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - glew
+  - glib
+  - pip
+  - python=3.10
+  - pip:
+    - dm-control
+    - glfw
+    - gymnasium==0.29.1
+    - gymnasium[atari,accept-rom-license]
+    - gymnasium[box2d]
+    - ffmpeg
+    - imageio
+    - imageio-ffmpeg
+    - h5py
+    - hydra-core
+    - hydra-submitit-launcher
+    - submitit
+    - omegaconf
+    - git+https://github.com/Farama-Foundation/Metaworld.git@185775b1ac9ed505bfa89f55c643bd63dbaaa5f0
+    - mani_skill-nightly
+    - moviepy
+    - mujoco
+    - numpy==1.24.4
+    - robodesk
+    - ogbench
+    - swig
+    - tensordict
+    - torch
+    - torchvision
+    - torchrl
+    - transformers
+    - kornia
+    - termcolor
+    - tqdm
+    - pandas
+    - wandb
