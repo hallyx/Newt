@@ -20,13 +20,16 @@ class Buffer():
 			horizon: int = 3,
 			multiproc: bool = False,
 			cache_values: bool = False,
+			storage_device: str = 'cuda:0',
 	):
-		self.set_storage_device('cuda:0')
+		self.set_storage_device(storage_device)
+		self._multiproc = multiproc
+		self._sampler_use_gpu = self._storage_device.type != 'cuda'
+		self._prefetch = None if (self._multiproc or self._storage_device.type == 'cuda') else 8
 		self._capacity = capacity
 		self._batch_size = batch_size
 		self._sample_size = batch_size * (horizon + 1)
 		self._horizon = horizon
-		self._multiproc = multiproc
 		self._sampler = SliceSampler(
 			num_slices=batch_size,
 			end_key=None,
@@ -34,18 +37,19 @@ class Buffer():
 			truncated_key=None,
 			strict_length=True,
 			cache_values=cache_values,
-			use_gpu=True,
+			use_gpu=self._sampler_use_gpu,
 			compile=False,
 		)
 		self._storage = LazyTensorStorage(
 			self._capacity,
 			device=self._storage_device,
+			shared_init=self._multiproc,
 		)
 		self._buffer = ReplayBuffer(
 			storage=self._storage,
 			sampler=self._sampler,
 			pin_memory=False,
-			prefetch=None if self._multiproc else 8,
+			prefetch=self._prefetch,
 			batch_size=self._sample_size,
 			shared=self._multiproc,
 		)
@@ -87,6 +91,7 @@ class Buffer():
 		total_bytes = bytes_per_step*self._capacity
 		print(f'[{self.__class__.__name__}] Storage required: {total_bytes/1e9:.2f} GB')
 		print(f'[{self.__class__.__name__}] Using {self._storage_device} memory for storage.')
+		print(f'[{self.__class__.__name__}] SliceSampler use_gpu={self._sampler_use_gpu}, prefetch={self._prefetch}.')
 
 	def save(self, path):
 		"""

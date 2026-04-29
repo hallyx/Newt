@@ -32,15 +32,37 @@ class Trainer():
 		self._step = 0
 		self._ep_idx = 0
 		self._start_time = time()
-		self._tasks = torch.tensor(split_by_rank(range(cfg.num_global_tasks), cfg.rank, cfg.world_size),
-			dtype=torch.int32, device='cpu')
-		self._episode_lengths = torch.tensor(split_by_rank(cfg.episode_lengths, cfg.rank, cfg.world_size),
-			dtype=torch.int32, device='cpu')
-		if cfg.task != 'soup':
+		self._rollout_device = torch.device(f'cuda:{cfg.device_id}') if (
+			cfg.task.startswith('isaaclab-') or cfg.get('isaaclab_env_id', '').startswith('Isaac-')
+		) else torch.device('cpu')
+		if cfg.task == 'soup':
+			self._tasks = torch.tensor(split_by_rank(range(cfg.num_global_tasks), cfg.rank, cfg.world_size),
+				dtype=torch.int32, device=self._rollout_device)
+			self._episode_lengths = torch.tensor(split_by_rank(cfg.episode_lengths, cfg.rank, cfg.world_size),
+				dtype=torch.int32, device=self._rollout_device)
+		elif cfg.num_global_tasks > 1:
+			task_id = int(cfg.eval_task_id) if cfg.eval_task_id is not None else 0
+			if cfg.eval_task_id is None and cfg.rank == 0:
+				print(colored(
+					'Warning: multi-task config without eval_task_id; defaulting evaluation task to task_id=0.',
+					'yellow',
+					attrs=['bold'],
+				))
+			self._tasks = torch.full((cfg.num_envs,), task_id, dtype=torch.int32, device=self._rollout_device)
+			self._episode_lengths = torch.full(
+				(cfg.num_envs,),
+				int(cfg.episode_lengths[task_id]),
+				dtype=torch.int32,
+				device=self._rollout_device,
+			)
+		else:
+			self._tasks = torch.tensor([0], dtype=torch.int32, device=self._rollout_device)
+			self._episode_lengths = torch.tensor([cfg.episode_lengths[0]], dtype=torch.int32, device=self._rollout_device)
 			self._tasks = self._tasks.repeat_interleave(cfg.num_envs)
-		assert self.cfg.episode_length in self._episode_lengths, \
-			f'[Rank {cfg.rank}] Expected maximum episode length {self.cfg.episode_length} to be in {self._episode_lengths.tolist()}.'
-		self._tds = TensorDict({}, batch_size=(self.cfg.episode_length+1, self.cfg.num_envs), device='cpu')
+			self._episode_lengths = self._episode_lengths.repeat_interleave(cfg.num_envs)
+		assert int(self._episode_lengths.max().item()) <= int(self.cfg.episode_length), \
+			f'[Rank {cfg.rank}] Expected configured episode_length={self.cfg.episode_length} to cover task lengths {self._episode_lengths.tolist()}.'
+		self._tds = TensorDict({}, batch_size=(self.cfg.episode_length+1, self.cfg.num_envs), device=self._rollout_device)
 		self._update_freq = self.cfg.num_envs * self.cfg.episode_length * self.cfg.world_size
 		self._update_tokens = 0
 		self._eps_per_update_freq = int((cfg.episode_length / np.array(cfg.episode_lengths)).sum())
@@ -64,9 +86,9 @@ class Trainer():
 		task_results = defaultdict(empty_metrics)
 
 		obs, info = self.env.reset()
-		episode_reward = torch.zeros(self.cfg.num_envs)
-		episode_len = torch.zeros(self.cfg.num_envs)
-		episodes_completed = torch.zeros(self.cfg.num_envs, dtype=torch.int32)
+		episode_reward = torch.zeros(self.cfg.num_envs, device=self._rollout_device)
+		episode_len = torch.zeros(self.cfg.num_envs, device=self._rollout_device)
+		episodes_completed = torch.zeros(self.cfg.num_envs, dtype=torch.int32, device=self._rollout_device)
 
 		if self.cfg.save_video:
 			self.logger.video.init(self.env, enabled=self.cfg.rank==0)
@@ -133,7 +155,7 @@ class Trainer():
 
 		# Compute unweighted averages *across tasks*
 		num_tasks = len(task_results)
-		if self.cfg.rank == 0:
+		if self.cfg.rank == 0 and self.cfg.task == 'soup':
 			assert num_tasks == self.cfg.num_global_tasks, \
 				f'Number of eval tasks ({num_tasks}) does not match expected ({self.cfg.num_global_tasks})'
 		results['episode_reward'] = sum(
@@ -151,17 +173,23 @@ class Trainer():
 	def to_td(self, obs, action=None, reward=None, terminated=None):
 		"""Creates a TensorDict for a new episode."""
 		if isinstance(obs, dict):
-			obs = TensorDict(obs, batch_size=(), device='cpu')
+			obs = TensorDict(obs, batch_size=(), device=self._rollout_device)
 		else:
-			obs = obs.cpu()
+			obs = obs.to(self._rollout_device, non_blocking=True)
 		if action is None:
 			action = torch.full_like(self.env.rand_act(), float('nan'))
+		else:
+			action = action.to(self._rollout_device, non_blocking=True)
 		if reward is None:
-			reward = torch.tensor(float('nan')).repeat(self.cfg.num_envs)
+			reward = torch.tensor(float('nan'), device=self._rollout_device).repeat(self.cfg.num_envs)
+		else:
+			reward = reward.to(self._rollout_device, non_blocking=True)
 		if terminated is None:
-			terminated = torch.tensor(False).repeat(self.cfg.num_envs)
+			terminated = torch.tensor(False, device=self._rollout_device).repeat(self.cfg.num_envs)
 		elif not isinstance(terminated, torch.Tensor):
-			terminated = torch.stack(terminated.tolist())
+			terminated = torch.stack(terminated.tolist()).to(self._rollout_device, non_blocking=True)
+		else:
+			terminated = terminated.to(self._rollout_device, non_blocking=True)
 		td = TensorDict(
 			obs=obs,
 			action=action,
@@ -225,6 +253,12 @@ class Trainer():
 				if self.cfg.task == 'soup':
 					self.logger.pprint_multitask(eval_metrics, self.cfg)
 				self.logger.log(eval_metrics, 'eval')
+				if self.cfg.save_best and self._step > 0:
+					self.logger.maybe_save_best_agent(
+						self.agent,
+						eval_metrics,
+						self._step,
+					)
 
 				# Save agent
 				if self._step % self.cfg.save_freq == 0 and self._step > 0:
@@ -232,9 +266,9 @@ class Trainer():
 
 				# Reset environment and metrics
 				obs, info = self.env.reset()
-				ep_reward = torch.zeros((self.cfg.num_envs,))
-				ep_len = torch.zeros((self.cfg.num_envs,), dtype=torch.int32)
-				done = torch.full((self.cfg.num_envs,), True, dtype=torch.bool)
+				ep_reward = torch.zeros((self.cfg.num_envs,), device=self._rollout_device)
+				ep_len = torch.zeros((self.cfg.num_envs,), dtype=torch.int32, device=self._rollout_device)
+				done = torch.full((self.cfg.num_envs,), True, dtype=torch.bool, device=self._rollout_device)
 				action_infos = []
 				self._next_action = None
 				self._tds[ep_len] = self.to_td(obs)
@@ -293,8 +327,6 @@ class Trainer():
 				
 				# Log and reset metrics if enough data is collected
 				if max_ep_len >= self.cfg.episode_length:
-					assert self._step % self._update_freq == 0, \
-						f'Step {self._step} is not a multiple of update frequency {self._update_freq}.'
 					self._ep_idx += self._eps_per_update_freq
 					for key in ['episode_reward', 'episode_success', 'episode_score', 'episode_length', 'episode_terminated']:
 						train_metrics[key] = torch.tensor(train_metrics[key], dtype=torch.float32).nanmean().item()

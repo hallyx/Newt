@@ -6,7 +6,7 @@ class RunningScale(torch.nn.Module):
 
 	def __init__(self, cfg):
 		super().__init__()
-		self.device = torch.device(f'cuda:{cfg.rank}')
+		self.device = torch.device(f'cuda:{cfg.device_id}')
 		self.register_buffer('value', torch.ones(1, dtype=torch.float32, device=self.device))
 		self.register_buffer('_percentiles', torch.tensor([5, 95], dtype=torch.float32, device=self.device))
 		self.tau = cfg.tau

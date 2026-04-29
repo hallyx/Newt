@@ -14,23 +14,26 @@ class WorldModel(nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
+		self._multitask = cfg.num_global_tasks is not None and cfg.num_global_tasks > 1
 		if cfg.finetune:
 			self._task_emb = nn.Embedding(200, cfg.task_dim)
 			self._task_emb._parameters['weight'] = torch.tensor(self.cfg.task_embeddings[:1], dtype=torch.float32).repeat(200, 1)
 			print(f'Using pre-computed language embeddings for task {self.cfg.task}.')
 		else:
 			self._task_emb = nn.Embedding(len(cfg.task_embeddings), cfg.task_dim) if cfg.task_dim > 0 else None
-			if cfg.task == 'soup':
+			if self._task_emb is not None:
 				if cfg.disable_task_emb:
 					self._task_emb._parameters['weight'] = torch.zeros_like(self._task_emb._parameters['weight'])
 					if cfg.rank == 0:
 						print('Warning: Task embeddings are DISABLED by setting them to all zeros.')
-				else:
+				elif not cfg.learn_task_emb:
 					self._task_emb._parameters['weight'] = torch.tensor(self.cfg.task_embeddings, dtype=torch.float32)
 					if cfg.rank == 0:
 						print('Using pre-computed language embeddings.')
+				elif cfg.rank == 0:
+					print('Using learnable task embeddings.')
 		if self._task_emb is not None:
-			self._task_emb.weight.requires_grad = False  # Freeze task embeddings
+			self._task_emb.weight.requires_grad = bool(cfg.learn_task_emb) and not cfg.disable_task_emb
 		if cfg.finetune:
 			self.register_buffer("_action_masks", torch.zeros(200, cfg.action_dim))
 			self._action_masks[:, :cfg.action_dims[0]] = 1.
@@ -90,6 +93,11 @@ class WorldModel(nn.Module):
 		"""
 		if not hasattr(self, '_task_emb') or self._task_emb is None:
 			return x
+		if task is None:
+			if self._task_emb.num_embeddings == 1:
+				task = torch.zeros(x.shape[:-1], device=x.device, dtype=torch.long)
+			else:
+				raise ValueError("Task ids are required when using multi-task embeddings.")
 
 		if isinstance(task, int):
 			task = torch.tensor([task], device=x.device)

@@ -1,0 +1,32 @@
+_wandb:
+    value:
+        cli_version: 0.22.3
+        e:
+            jbw5bjfaai49kav7vbc66st8drvk9kpe:
+                email: xinghu@stu.xjtu.edu.cn
+                executable: /home/gpuserver/miniconda3/envs/isaac51/bin/python
+                git:
+                    commit: 803ee99d95b13a3ce4b7fe6ff58275e52e83e960
+                    remote: git@github.com:hallyx/Newt.git
+                host: gpuserver-System-Product-Name
+                os: Linux-6.8.0-107-generic-x86_64-with-glibc2.35
+                program: <stdin>
+                python: CPython 3.11.14
+                root: /home/gpuserver/hx/github/Newt
+                startedAt: "2026-04-23T07:19:53.688598Z"
+                writerId: jbw5bjfaai49kav7vbc66st8drvk9kpe
+        m: []
+        python_version: 3.11.14
+        t:
+            "1":
+                - 105
+            "2":
+                - 105
+            "3":
+                - 2
+            "4": 3.11.14
+            "5": 0.22.3
+            "10":
+                - 20
+            "12": 0.22.3
+            "13": linux-x86_64

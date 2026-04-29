@@ -85,7 +85,8 @@ def train(rank: int, cfg: dict, buffer: Buffer):
 		print(colored('Rank:', 'yellow', attrs=['bold']), rank)
 	set_seed(cfg.seed + rank)
 	cfg.rank = rank
-	torch.cuda.set_device(rank)
+	cfg.device_id = cfg.gpu_id + rank
+	torch.cuda.set_device(cfg.device_id)
 
 	# split tasks across processes by rank
 	if cfg.task == 'soup':
@@ -97,9 +98,9 @@ def train(rank: int, cfg: dict, buffer: Buffer):
 		cfg.num_envs = len(cfg.tasks)
 
 	def make_agent(cfg):
-		model = WorldModel(cfg).to(f"cuda:{cfg.rank}")
+		model = WorldModel(cfg).to(f"cuda:{cfg.device_id}")
 		if cfg.world_size > 1:
-			model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[cfg.rank])
+			model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[cfg.device_id])
 			model = DDPWrapper(model)
 		agent = TDMPC2(model, cfg)
 		return agent
@@ -123,7 +124,6 @@ def train(rank: int, cfg: dict, buffer: Buffer):
 		print(colored(f'[Rank {cfg.rank}] Training interrupted by user (Ctrl+C)', 'red', attrs=['bold']))
 		raise  # Optional: raise again if you want the shell to show KeyboardInterrupt
 	finally:
-		print(colored('Training interrupted', 'red', attrs=['bold']))
 		if torch.distributed.is_initialized():
 			torch.distributed.destroy_process_group()
 
@@ -210,9 +210,20 @@ def launch(cfg: Config):
 	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.work_dir)
 
 	# Set batch size
-	cfg.world_size = torch.cuda.device_count() if cfg.multiproc else 1
+	available_gpus = torch.cuda.device_count() - cfg.gpu_id
+	assert available_gpus > 0, \
+		f'gpu_id={cfg.gpu_id} leaves no visible CUDA devices (total={torch.cuda.device_count()}).'
+	if cfg.multiproc:
+		requested_gpus = cfg.num_gpus if cfg.num_gpus is not None else available_gpus
+		assert requested_gpus > 0, f'num_gpus must be positive, got {requested_gpus}.'
+		assert requested_gpus <= available_gpus, \
+			f'Requested num_gpus={requested_gpus}, but only {available_gpus} GPUs are available from gpu_id={cfg.gpu_id}.'
+		cfg.world_size = requested_gpus
+	else:
+		cfg.world_size = 1
 	if cfg.world_size > 1:
-		print(colored(f'Using {cfg.world_size} GPUs', 'green', attrs=['bold']))
+		gpu_range = f'{cfg.gpu_id}-{cfg.gpu_id + cfg.world_size - 1}'
+		print(colored(f'Using {cfg.world_size} GPUs (cuda:{gpu_range})', 'green', attrs=['bold']))
 		assert cfg.batch_size % cfg.world_size == 0, \
 			'Batch size must be divisible by number of GPUs.'
 		print(colored('Effective batch size:', 'yellow', attrs=['bold']), cfg.batch_size)
@@ -225,6 +236,7 @@ def launch(cfg: Config):
 		'batch_size': cfg.batch_size,
 		'horizon': cfg.horizon,
 		'multiproc': cfg.multiproc,
+		'storage_device': f'cuda:{cfg.gpu_id}',
 	}
 	if cfg.use_demos and cfg.no_demo_buffer:
 		buffer = Buffer(**buffer_args)

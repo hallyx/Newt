@@ -20,15 +20,18 @@ class TDMPC2(torch.nn.Module):
 		super().__init__()
 		self.cfg = deepcopy(cfg)
 		self.cfg.action_dim = cfg.action_dim
-		self.device = torch.device(f'cuda:{self.cfg.rank}')
+		self.device = torch.device(f'cuda:{self.cfg.device_id}')
 		self.model = model
-		self.optim = torch.optim.Adam([
+		optim_groups = [
 			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
 			{'params': self.model._dynamics.parameters()},
 			{'params': self.model._reward.parameters()},
 			{'params': self.model._Qs.online.parameters()},
 			{'params': self.model._pi.parameters()},
-		], lr=self.cfg.lr, capturable=True)
+		]
+		if getattr(self.model, '_task_emb', None) is not None and self.model._task_emb.weight.requires_grad:
+			optim_groups.append({'params': self.model._task_emb.parameters()})
+		self.optim = torch.optim.Adam(optim_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
 		if self.cfg.lr_schedule:
 			self.scheduler = math.MultiWarmupConstantLR(
@@ -150,6 +153,8 @@ class TDMPC2(torch.nn.Module):
 				"pi_mean": action_info["mean"].mean(),
 				"pi_std": action_info["log_std"].exp().mean(),
 			})
+		if self.cfg.task.startswith('isaaclab-') or self.cfg.isaaclab_env_id.startswith('Isaac-'):
+			return action, info
 		return action.cpu(), info
 	
 	@torch.no_grad()

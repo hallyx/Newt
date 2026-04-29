@@ -25,18 +25,19 @@ class PretrainedEncoder():
 
 	def _init_encoder(self):
 		global __RGB_PROCESSOR__, __RGB_ENCODER__
+		device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
 		__RGB_PROCESSOR__ = AutoImageProcessor.from_pretrained(
 			'facebook/dinov2-base',
 			use_fast=True,
 		)
 		__RGB_ENCODER__ = AutoModel.from_pretrained(
-			'facebook/dinov2-base').to('cuda:0')
+			'facebook/dinov2-base').to(device)
 		__RGB_ENCODER__.eval()
 		print('PretrainedEncoder: using', __RGB_ENCODER__.name_or_path)
 		print('PretrainedEncoder: model size is', pcount(__RGB_ENCODER__))
 
 		# Test the encoder
-		x = (torch.clamp(torch.randn(1, 3, 224, 224, device=0) * 0.5 + 0.5, 0, 1) * 255).to(torch.uint8)
+		x = (torch.clamp(torch.randn(1, 3, 224, 224, device=device) * 0.5 + 0.5, 0, 1) * 255).to(torch.uint8)
 		print('PretrainedEncoder: output shape is', self(x).shape)
 
 	@torch.no_grad()

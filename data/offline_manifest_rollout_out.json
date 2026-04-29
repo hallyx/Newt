@@ -1,0 +1,54 @@
+{
+  "tasks": [
+    {
+      "task_id": 0,
+      "task_name": "isaaclab-automate-assembly-00141",
+      "assembly_id": "00141",
+      "source_fp": "/home/gpuserver/hx/github/SRSA/rollout_out/00141/teacher_rollouts_newt.pt",
+      "action_dim": 6,
+      "max_episode_steps": 74,
+      "success_count": 147,
+      "failure_count": 4853
+    },
+    {
+      "task_id": 1,
+      "task_name": "isaaclab-automate-assembly-00211",
+      "assembly_id": "00211",
+      "source_fp": "/home/gpuserver/hx/github/SRSA/rollout_out/00211/teacher_rollouts_newt.pt",
+      "action_dim": 6,
+      "max_episode_steps": 74,
+      "success_count": 3873,
+      "failure_count": 1127
+    },
+    {
+      "task_id": 2,
+      "task_name": "isaaclab-automate-assembly-00426",
+      "assembly_id": "00426",
+      "source_fp": "/home/gpuserver/hx/github/SRSA/rollout_out/00426/teacher_rollouts_newt.pt",
+      "action_dim": 6,
+      "max_episode_steps": 74,
+      "success_count": 5000,
+      "failure_count": 0
+    },
+    {
+      "task_id": 3,
+      "task_name": "isaaclab-automate-assembly-00638",
+      "assembly_id": "00638",
+      "source_fp": "/home/gpuserver/hx/github/SRSA/rollout_out/00638/teacher_rollouts_newt.pt",
+      "action_dim": 6,
+      "max_episode_steps": 74,
+      "success_count": 2030,
+      "failure_count": 2970
+    },
+    {
+      "task_id": 4,
+      "task_name": "isaaclab-automate-assembly-00783",
+      "assembly_id": "00783",
+      "source_fp": "/home/gpuserver/hx/github/SRSA/rollout_out/00783/teacher_rollouts_newt.pt",
+      "action_dim": 6,
+      "max_episode_steps": 74,
+      "success_count": 4999,
+      "failure_count": 1
+    }
+  ]
+}

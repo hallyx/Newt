@@ -1,10 +1,12 @@
 import os
 import datetime
 import re
+import json
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import torch
 from termcolor import colored
 
 from common import TASK_SET
@@ -112,44 +114,75 @@ class Logger:
 
 	def __init__(self, cfg):
 		self.rank = cfg.rank
-		self.project = cfg.get("wandb_project", "none")
-		self.entity = cfg.get("wandb_entity", "none")
-		if self.rank > 0 or not cfg.enable_wandb or self.project == "none" or self.entity == "none":
-			if self.rank == 0:
-				print(colored("Wandb disabled.", "blue", attrs=["bold"]))
-			else:
-				print(colored(f"Logging disabled for rank {self.rank}.", "blue", attrs=["bold"]))
-			cfg.save_agent = False
-			cfg.save_video = False
-			self._save_agent = False
-			self._wandb = None
-			self._video = None
-			return
+		self.project = self._resolve_project(cfg)
+		self.entity = self._resolve_entity(cfg)
 		self._log_dir = Path(make_dir(cfg.work_dir))
 		self._model_dir = make_dir(self._log_dir / "models")
-		self._save_agent = cfg.save_agent
+		self._local_log_fp = self._log_dir / "metrics.jsonl"
+		self._save_agent = cfg.save_agent and self.rank == 0
 		self._group = cfg_to_group(cfg)
 		self._seed = cfg.seed
 		self._eval = []
+		self._wandb = None
+		self._video = None
+		self._best_metric_name = cfg.get("save_best_metric", "episode_success")
+		self._best_metric_value = None
+		self._best_step = None
+
+		if self.rank > 0:
+			print(colored(f"Logging disabled for rank {self.rank}.", "blue", attrs=["bold"]))
+			cfg.save_video = False
+			return
+
 		print_run(cfg)
+		if not cfg.enable_wandb or self.project is None:
+			print(colored("Wandb disabled. Using local logging only.", "blue", attrs=["bold"]))
+			cfg.save_video = False
+			return
+
 		os.environ["WANDB_SILENT"] = "true" if cfg.wandb_silent else "false"
-		import wandb
-		wandb.init(
-			project=self.project,
-			entity=self.entity,
-			name=str(cfg.seed),
-			group=self._group,
-			tags=cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"],
-			dir=self._log_dir,
-			config=cfg,
-		)
-		print(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
-		self._wandb = wandb
-		self._video = (
-			VideoRecorder(cfg, self._wandb)
-			if self._wandb and cfg.save_video
-			else None
-		)
+		try:
+			import wandb
+			wandb.init(
+				project=self.project,
+				entity=self.entity,
+				name=str(cfg.seed),
+				group=self._group,
+				tags=cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"],
+				dir=self._log_dir,
+				config=cfg,
+			)
+			dest = self.project if self.entity is None else f"{self.entity}/{self.project}"
+			print(colored(f"Logs will be synced with wandb: {dest}.", "blue", attrs=["bold"]))
+			self._wandb = wandb
+			self._video = VideoRecorder(cfg, self._wandb) if cfg.save_video else None
+		except Exception as exc:
+			cfg.save_video = False
+			print(colored(f"Wandb init failed; continuing with local logging only. {exc}", "yellow", attrs=["bold"]))
+
+	@staticmethod
+	def _normalize_wandb_field(value):
+		if value is None:
+			return None
+		value = str(value).strip()
+		if value.lower() in {"", "none", "null", "entity", "project"}:
+			return None
+		return value
+
+	def _resolve_project(self, cfg):
+		project = self._normalize_wandb_field(os.getenv("WANDB_PROJECT"))
+		if project is not None:
+			return project
+		project = self._normalize_wandb_field(cfg.get("wandb_project", None))
+		if project is not None:
+			return project
+		return re.sub("[^0-9a-zA-Z._-]+", "-", cfg.task)
+
+	def _resolve_entity(self, cfg):
+		entity = self._normalize_wandb_field(os.getenv("WANDB_ENTITY"))
+		if entity is not None:
+			return entity
+		return self._normalize_wandb_field(cfg.get("wandb_entity", None))
 
 	@property
 	def video(self):
@@ -167,11 +200,67 @@ class Logger:
 				artifact.add_file(fp)
 				self._wandb.log_artifact(artifact)
 
+	def maybe_save_best_agent(self, agent, metrics, step):
+		if not self._save_agent or not agent:
+			return False
+		metric_name = self._best_metric_name
+		if metric_name not in metrics:
+			return False
+		value = metrics[metric_name]
+		if isinstance(value, torch.Tensor):
+			value = value.item()
+		elif isinstance(value, np.generic):
+			value = value.item()
+		value = float(value)
+		if np.isnan(value):
+			return False
+		is_better = self._best_metric_value is None or value > self._best_metric_value
+		if not is_better:
+			return False
+		self._best_metric_value = value
+		self._best_step = int(step)
+		self.save_agent(agent, 'best')
+		meta = {
+			'metric': metric_name,
+			'value': value,
+			'step': int(step),
+		}
+		with open(self._model_dir / 'best.json', 'w', encoding='utf-8') as f:
+			json.dump(meta, f, ensure_ascii=True, indent=2)
+		print(colored(
+			f"Saved new best checkpoint: {metric_name}={value:.4f} at step {int(step):,}.",
+			'green',
+			attrs=['bold'],
+		))
+		return True
+
 	def finish(self, agent=None):
 		if agent is not None:
 			self.save_agent(agent)
 		if self._wandb:
 			self._wandb.finish()
+
+	def _to_serializable(self, value):
+		if isinstance(value, torch.Tensor):
+			if value.numel() == 1:
+				return value.item()
+			return value.detach().cpu().tolist()
+		if isinstance(value, np.generic):
+			return value.item()
+		if isinstance(value, np.ndarray):
+			return value.tolist()
+		if isinstance(value, dict):
+			return {k: self._to_serializable(v) for k, v in value.items()}
+		if isinstance(value, (list, tuple)):
+			return [self._to_serializable(v) for v in value]
+		return value
+
+	def _write_local(self, d, category):
+		record = {"category": category}
+		for k, v in d.items():
+			record[k] = self._to_serializable(v)
+		with open(self._local_log_fp, "a", encoding="utf-8") as f:
+			f.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 	def _format(self, key, value, ty):
 		if ty == "int":
@@ -236,6 +325,7 @@ class Logger:
 		if self.rank > 0:
 			return
 		assert category in CAT_TO_COLOR.keys(), f"invalid category: {category}"
+		self._write_local(d, category)
 		if self._wandb:
 			_d = dict()
 			for k, v in d.items():

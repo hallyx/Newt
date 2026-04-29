@@ -1,0 +1,15 @@
+{
+  "os":  "Linux-6.8.0-107-generic-x86_64-with-glibc2.35",
+  "python":  "CPython 3.11.14",
+  "startedAt":  "2026-04-23T07:19:53.688598Z",
+  "program":  "<stdin>",
+  "git":  {
+    "remote":  "git@github.com:hallyx/Newt.git",
+    "commit":  "803ee99d95b13a3ce4b7fe6ff58275e52e83e960"
+  },
+  "email":  "xinghu@stu.xjtu.edu.cn",
+  "root":  "/home/gpuserver/hx/github/Newt",
+  "host":  "gpuserver-System-Product-Name",
+  "executable":  "/home/gpuserver/miniconda3/envs/isaac51/bin/python",
+  "writerId":  "jbw5bjfaai49kav7vbc66st8drvk9kpe"
+}

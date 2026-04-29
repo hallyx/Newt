@@ -461,12 +461,17 @@ def api_model_conversion(target_state_dict, source_state_dict):
 
 	if '_action_masks' in target_state_dict and '_action_masks' in source_state_dict and \
 			source_state_dict['_action_masks'].shape != target_state_dict['_action_masks'].shape:
-		# repeat first dimension to match
-		source_state_dict['_action_masks'] = source_state_dict['_action_masks'].repeat(
-			target_state_dict['_action_masks'].shape[0] // source_state_dict['_action_masks'].shape[0], 1)
-		if '_task_emb.weight' in source_state_dict:
-			source_state_dict['_task_emb.weight'] = source_state_dict['_task_emb.weight'].repeat(
-				target_state_dict['_action_masks'].shape[0] // source_state_dict['_task_emb.weight'].shape[0], 1)
+		src_n = source_state_dict['_action_masks'].shape[0]
+		tgt_n = target_state_dict['_action_masks'].shape[0]
+		if src_n > tgt_n:
+			source_state_dict['_action_masks'] = source_state_dict['_action_masks'][:tgt_n]
+			if '_task_emb.weight' in source_state_dict:
+				source_state_dict['_task_emb.weight'] = source_state_dict['_task_emb.weight'][:tgt_n]
+		elif src_n < tgt_n:
+			repeats = (tgt_n + src_n - 1) // src_n
+			source_state_dict['_action_masks'] = source_state_dict['_action_masks'].repeat(repeats, 1)[:tgt_n]
+			if '_task_emb.weight' in source_state_dict:
+				source_state_dict['_task_emb.weight'] = source_state_dict['_task_emb.weight'].repeat(repeats, 1)[:tgt_n]
 		
 	if '_task_emb.weight' in source_state_dict and not '_task_emb.weight' in target_state_dict:
 		# delete task embedding from source state dict
