@@ -33,7 +33,10 @@ class Trainer():
 		self._ep_idx = 0
 		self._start_time = time()
 		self._rollout_device = torch.device(f'cuda:{cfg.device_id}') if (
-			cfg.task.startswith('isaaclab-') or cfg.get('isaaclab_env_id', '').startswith('Isaac-')
+			cfg.task.startswith('isaaclab-') or
+			cfg.get('isaaclab_env_id', '').startswith('Isaac-') or
+			cfg.get('isaaclab_backend', 'auto') == 'srsa' or
+			cfg.get('isaaclab_task_package', None) == 'SRSA.tasks'
 		) else torch.device('cpu')
 		if cfg.task == 'soup':
 			self._tasks = torch.tensor(split_by_rank(range(cfg.num_global_tasks), cfg.rank, cfg.world_size),
@@ -238,7 +241,7 @@ class Trainer():
 			print(f'Set prior_coef to {self.agent.cfg.prior_coef} after pretraining.')
 			if self.cfg.rank == 0:
 				print('Pretraining complete.')
-			self.logger.save_agent(self.agent, f'{self._step:,}'.replace(',', '_'))
+			self.logger.save_agent(self.agent, f'{self._step:,}'.replace(',', '_'), metrics=pretrain_metrics)
 
 		# Training loop
 		if self.cfg.rank == 0:
@@ -262,7 +265,9 @@ class Trainer():
 
 				# Save agent
 				if self._step % self.cfg.save_freq == 0 and self._step > 0:
-					self.logger.save_agent(self.agent, f'{self._step:,}'.replace(',', '_'))
+					save_metrics = dict(eval_metrics)
+					save_metrics['step'] = self._step
+					self.logger.save_agent(self.agent, f'{self._step:,}'.replace(',', '_'), metrics=save_metrics)
 
 				# Reset environment and metrics
 				obs, info = self.env.reset()

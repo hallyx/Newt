@@ -3,7 +3,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Any
 
+import datetime
 import json
+import re
 import hydra
 from termcolor import colored
 from omegaconf import OmegaConf
@@ -26,6 +28,8 @@ class Config:
 	env_mode: str = "async"
 	tasks_fp: str = "/path/to/your/tasks.json"
 	isaaclab_dir: str = "/home/gpuserver/IsaacLab"
+	isaaclab_backend: str = "auto"
+	isaaclab_task_package: Optional[str] = None
 	isaaclab_env_id: str = "Isaac-AutoMate-Assembly-Direct-v0"
 	isaaclab_task_name: str = "insertion"
 	assembly_id: str = "00004"
@@ -33,10 +37,40 @@ class Config:
 	isaaclab_enable_cameras: bool = False
 	isaaclab_use_fabric: Optional[bool] = None
 	isaaclab_use_canonical_obs: bool = False
+	isaaclab_canonical_append_force: bool = False
+	isaaclab_canonical_append_task_params: bool = False
+	isaaclab_canonical_use_visual_noise: bool = False
 	isaaclab_action_dim: int = 6
 	isaaclab_max_episode_steps: int = 75
 	isaaclab_force_cpu_softdtw: bool = False
 	isaaclab_disable_imitation_reward: bool = False
+	isaaclab_debug_io: bool = False
+	isaaclab_debug_io_steps: int = 3
+	isaaclab_debug_io_every: int = 1
+	srsa_dir: str = "/home/gpuserver/hx/github/srsa"
+	srsa_task_family_name: Optional[str] = None
+	srsa_task_family_id: Optional[int] = None
+	srsa_plug_diameter: Optional[float] = None
+	srsa_hole_diameter: Optional[float] = None
+	srsa_clearance: Optional[float] = None
+	srsa_clearance_ratio: Optional[float] = None
+	srsa_insertion_depth: Optional[float] = None
+	srsa_success_pos_tol: Optional[float] = None
+	srsa_task_param_obs: bool = False
+	srsa_if_sbc: Optional[bool] = None
+	srsa_if_logging_eval: bool = False
+	srsa_eval_filename: Optional[str] = None
+	srsa_num_eval_trials: int = 100
+	srsa_vision_noise_xy_std: float = 0.0
+	srsa_vision_noise_xy_jitter_std: float = 0.0
+	srsa_vision_noise_z_std: float = 0.0
+	srsa_vision_noise_z_jitter_std: float = 0.0
+	srsa_enable_flange_force_sensor: bool = False
+	srsa_flange_force_sensor_body_name: str = "panda_hand"
+	srsa_flange_force_sensor_source: str = "held_sensor"
+	srsa_flange_force_sensor_obs_frame: str = "socket"
+	srsa_flange_force_sensor_obs_scale: float = 50.0
+	srsa_flange_force_sensor_force_threshold: float = 1.0
 
 	# evaluation
 	checkpoint: Optional[str] = None
@@ -134,6 +168,7 @@ class Config:
 	wandb_entity: str = "entity"
 	wandb_silent: bool = False
 	enable_wandb: bool = True
+	run_id: Optional[str] = None
 
 	# misc
 	multiproc: bool = False
@@ -174,6 +209,32 @@ class Config:
 	get = lambda self, val, default=None: getattr(self, val, default)
 
 
+def safe_run_token(value, fallback="na"):
+	value = str(value if value is not None else fallback).strip()
+	value = re.sub(r"[^0-9a-zA-Z._-]+", "-", value)
+	value = value.strip("-_.")
+	return value or fallback
+
+
+def make_run_id(cfg):
+	stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+	parts = [stamp]
+	if cfg.get('offline_manifest_fp', None):
+		if cfg.get('eval_task_id', None) is not None:
+			parts.append(f"tid-{int(cfg.eval_task_id)}")
+		else:
+			num_tasks = int(cfg.get('num_global_tasks', 0) or 0)
+			if num_tasks > 0:
+				parts.append(f"tids-0-{num_tasks - 1}")
+	else:
+		assembly_id = cfg.get('assembly_id', None)
+		if assembly_id:
+			parts.append(f"asm-{safe_run_token(assembly_id)}")
+		if cfg.get('eval_task_id', None) is not None:
+			parts.append(f"tid-{int(cfg.eval_task_id)}")
+	return "_".join(parts)
+
+
 def split_by_rank(global_list, rank, world_size):
 	"""Split a global list into sublists for each rank."""
 	return [global_list[i] for i in range(len(global_list)) if i % world_size == rank]
@@ -183,7 +244,14 @@ def is_isaaclab_task(cfg):
 	"""Return True if the task should be created through Isaac Lab."""
 	task = getattr(cfg, 'task', '')
 	env_id = getattr(cfg, 'isaaclab_env_id', '')
-	return task.startswith('isaaclab-') or task.startswith('Isaac-') or env_id.startswith('Isaac-')
+	backend = getattr(cfg, 'isaaclab_backend', 'auto')
+	return (
+		backend in ('isaaclab', 'srsa') or
+		bool(getattr(cfg, 'isaaclab_task_package', None)) or
+		task.startswith('isaaclab-') or
+		task.startswith('Isaac-') or
+		env_id.startswith('Isaac-')
+	)
 
 
 def make_isaaclab_task_info(cfg):
@@ -221,8 +289,15 @@ def parse_cfg(cfg):
 	"""
 	Parses the experiment config dataclass. Mostly for convenience.
 	"""
+	if cfg.get('isaaclab_backend', 'auto') == 'srsa':
+		if cfg.task == 'soup':
+			cfg.task = 'isaaclab-srsa-assembly'
+		if cfg.isaaclab_env_id == 'Isaac-AutoMate-Assembly-Direct-v0':
+			cfg.isaaclab_env_id = 'Assembly-Direct-v0'
+		if cfg.isaaclab_task_package is None:
+			cfg.isaaclab_task_package = 'SRSA.tasks'
+
 	# Convenience
-	cfg.work_dir = Path(hydra.utils.get_original_cwd()) / 'logs' / cfg.task / str(cfg.seed) / cfg.exp_name
 	cfg.task_title = cfg.task.replace("-", " ").title()
 	cfg.bin_size = (cfg.vmax - cfg.vmin) / (cfg.num_bins-1)  # Bin size for discrete regression
 
@@ -301,5 +376,10 @@ def parse_cfg(cfg):
 	if cfg.eval_task_id is not None:
 		assert 0 <= cfg.eval_task_id < cfg.num_global_tasks, \
 			f'eval_task_id={cfg.eval_task_id} is out of range for {cfg.num_global_tasks} tasks.'
+	if cfg.run_id is None:
+		cfg.run_id = make_run_id(cfg)
+	else:
+		cfg.run_id = safe_run_token(cfg.run_id)
+	cfg.work_dir = Path(hydra.utils.get_original_cwd()) / 'logs' / cfg.task / str(cfg.seed) / cfg.exp_name / cfg.run_id
 
 	return OmegaConf.to_object(cfg)

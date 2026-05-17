@@ -147,7 +147,7 @@ def _run_stage(agent: TDMPC2, dataset: OfflineSequenceDataset, logger: Logger, c
 		if update == 1 or update % log_freq == 0 or update == num_steps:
 			logger.log(metrics, 'pretrain')
 		if logger.rank == 0 and (update % save_freq == 0 or update == num_steps):
-			logger.save_agent(agent, f'{stage_name}_{update:,}'.replace(',', '_'))
+			logger.save_agent(agent, f'{stage_name}_{update:,}'.replace(',', '_'), metrics=metrics)
 
 
 @hydra.main(version_base=None, config_name="config")

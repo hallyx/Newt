@@ -2,6 +2,7 @@ import os
 import datetime
 import re
 import json
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -81,6 +82,27 @@ def cfg_to_group(cfg, return_list=False):
 	return lst if return_list else "-".join(lst)
 
 
+def _safe_token(value, fallback="na"):
+	value = str(value if value is not None else fallback).strip()
+	value = re.sub(r"[^0-9a-zA-Z._-]+", "-", value)
+	value = value.strip("-_.")
+	return value or fallback
+
+
+def _format_metric_token(value):
+	if isinstance(value, torch.Tensor):
+		value = value.item() if value.numel() == 1 else float("nan")
+	elif isinstance(value, np.generic):
+		value = value.item()
+	try:
+		value = float(value)
+	except (TypeError, ValueError):
+		return _safe_token(value)
+	if np.isnan(value):
+		return "nan"
+	return f"{value:.4f}".replace(".", "p").replace("-", "m")
+
+
 class VideoRecorder:
 	"""Utility class for logging evaluation videos."""
 
@@ -122,6 +144,7 @@ class Logger:
 		self._save_agent = cfg.save_agent and self.rank == 0
 		self._group = cfg_to_group(cfg)
 		self._seed = cfg.seed
+		self._run_id = cfg.get("run_id", None)
 		self._eval = []
 		self._wandb = None
 		self._video = None
@@ -134,6 +157,7 @@ class Logger:
 			cfg.save_video = False
 			return
 
+		self._write_run_metadata(cfg)
 		print_run(cfg)
 		if not cfg.enable_wandb or self.project is None:
 			print(colored("Wandb disabled. Using local logging only.", "blue", attrs=["bold"]))
@@ -146,7 +170,7 @@ class Logger:
 			wandb.init(
 				project=self.project,
 				entity=self.entity,
-				name=str(cfg.seed),
+				name=str(self._run_id or cfg.seed),
 				group=self._group,
 				tags=cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"],
 				dir=self._log_dir,
@@ -184,21 +208,60 @@ class Logger:
 			return entity
 		return self._normalize_wandb_field(cfg.get("wandb_entity", None))
 
+	def _write_run_metadata(self, cfg):
+		meta = {
+			"run_id": cfg.get("run_id", None),
+			"task": cfg.task,
+			"exp_name": cfg.exp_name,
+			"seed": int(cfg.seed),
+			"assembly_id": cfg.get("assembly_id", None),
+			"eval_task_id": cfg.get("eval_task_id", None),
+			"offline_manifest_fp": cfg.get("offline_manifest_fp", None),
+			"num_global_tasks": cfg.get("num_global_tasks", None),
+			"work_dir": str(self._log_dir),
+			"model_dir": str(self._model_dir),
+			"metrics_fp": str(self._local_log_fp),
+		}
+		with open(self._log_dir / "run.json", "w", encoding="utf-8") as f:
+			json.dump(meta, f, ensure_ascii=True, indent=2)
+
+	def _checkpoint_filename(self, identifier, metrics=None):
+		identifier = _safe_token(identifier)
+		parts = [identifier]
+		metrics = metrics or {}
+		step = metrics.get("step", None)
+		if step is not None and identifier in {"best", "final"}:
+			try:
+				parts.append(f"step-{int(step)}")
+			except (TypeError, ValueError):
+				pass
+		for key in ("episode_success", self._best_metric_name, "success_rate"):
+			if key in metrics:
+				parts.append(f"s-{_format_metric_token(metrics[key])}")
+				break
+		return "_".join(parts) + ".pt"
+
 	@property
 	def video(self):
 		return self._video
 
-	def save_agent(self, agent=None, identifier='final'):
+	def save_agent(self, agent=None, identifier='final', metrics=None, aliases=None):
 		if self._save_agent and agent:
-			fp = self._model_dir / f'{str(identifier)}.pt'
+			fp = self._model_dir / self._checkpoint_filename(identifier, metrics)
 			agent.save(fp)
+			for alias in aliases or []:
+				alias_fp = self._model_dir / f"{_safe_token(alias)}.pt"
+				shutil.copy2(fp, alias_fp)
 			if self._wandb:
 				artifact = self._wandb.Artifact(
-					self._group + '-' + str(self._seed) + '-' + str(identifier),
+					self._group + '-' + str(self._seed) + '-' + fp.stem,
 					type='model',
 				)
 				artifact.add_file(fp)
 				self._wandb.log_artifact(artifact)
+			print(colored(f"Saved checkpoint: {fp}", "green", attrs=["bold"]))
+			return fp
+		return None
 
 	def maybe_save_best_agent(self, agent, metrics, step):
 		if not self._save_agent or not agent:
@@ -219,11 +282,15 @@ class Logger:
 			return False
 		self._best_metric_value = value
 		self._best_step = int(step)
-		self.save_agent(agent, 'best')
+		save_metrics = dict(metrics)
+		save_metrics['step'] = int(step)
+		fp = self.save_agent(agent, 'best', metrics=save_metrics, aliases=['best'])
 		meta = {
 			'metric': metric_name,
 			'value': value,
 			'step': int(step),
+			'checkpoint': str(fp) if fp is not None else None,
+			'alias': str(self._model_dir / 'best.pt'),
 		}
 		with open(self._model_dir / 'best.json', 'w', encoding='utf-8') as f:
 			json.dump(meta, f, ensure_ascii=True, indent=2)

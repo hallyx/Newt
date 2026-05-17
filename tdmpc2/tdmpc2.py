@@ -153,7 +153,12 @@ class TDMPC2(torch.nn.Module):
 				"pi_mean": action_info["mean"].mean(),
 				"pi_std": action_info["log_std"].exp().mean(),
 			})
-		if self.cfg.task.startswith('isaaclab-') or self.cfg.isaaclab_env_id.startswith('Isaac-'):
+		if (
+			self.cfg.task.startswith('isaaclab-') or
+			self.cfg.isaaclab_env_id.startswith('Isaac-') or
+			self.cfg.get('isaaclab_backend', 'auto') == 'srsa' or
+			self.cfg.get('isaaclab_task_package', None) == 'SRSA.tasks'
+		):
 			return action, info
 		return action.cpu(), info
 	
