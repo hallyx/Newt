@@ -5,6 +5,7 @@ from typing import Optional, Any
 
 import datetime
 import json
+import math
 import re
 import hydra
 from termcolor import colored
@@ -78,12 +79,7 @@ class Config:
 	eval_trials: Optional[int] = None
 	eval_task_id: Optional[int] = None
 	eval_freq: Optional[int] = None
-	eval_zmq_enabled: bool = False
-	eval_zmq_server: str = "tcp://localhost:5555"
-	eval_zmq_env_index: int = 0
-	eval_zmq_rate: float = 0.0
-	eval_zmq_action_scale: float = 1.0
-	eval_zmq_send_done: bool = True
+	skip_initial_eval: bool = False
 
 	# offline training
 	offline_only: bool = False
@@ -127,6 +123,8 @@ class Config:
 	lr_schedule: Optional[str] = None
 	warmup_steps: int = 5_000
 	seeding_coef: int = 5
+	progress_log_interval_sec: float = 30.0
+	eval_hang_guard_factor: float = 2.0
 	exp_name: str = "default"
 	finetune: bool = False
 
@@ -164,6 +162,17 @@ class Config:
 	mlp_dim: int = 1024
 	latent_dim: int = 512
 	task_dim: int = 512
+	task_conditioning: str = "axial_params"
+	axial_task_dim: int = 64
+	axial_task_vec_dim: int = 6
+	axial_task_type: str = "peg_in_hole"
+	axial_task_type_id: Optional[int] = None
+	axial_task_vec_6: Any = None
+	axial_reference_radius: float = 0.003993
+	axial_reference_depth: float = 0.015
+	axial_target_insertion_depth: Optional[float] = None
+	axial_scale_ratio: Optional[float] = None
+	axial_yaw_requirement: bool = False
 	num_q: int = 5
 	simnorm_dim: int = 8
 	disable_task_emb: bool = False
@@ -202,6 +211,7 @@ class Config:
 	num_tasks: Optional[int] = None
 	num_global_tasks: Optional[int] = None
 	task_embeddings: Any = None
+	task_vectors: Any = None
 	obs_shape: Any = None
 	action_dim: Optional[int] = None
 	episode_length: Optional[int] = None
@@ -241,6 +251,201 @@ def make_run_id(cfg):
 	return "_".join(parts)
 
 
+AXIAL_TASK_CONDITIONING_MODES = {"axial", "axial_params", "param", "param_only"}
+ID_TASK_CONDITIONING_MODES = {"id", "id_embedding", "language", "language_embedding"}
+NO_TASK_CONDITIONING_MODES = {"none", "disabled"}
+
+AXIAL_TASK_TYPE_IDS = {
+	"peg_in_hole": 0,
+	"shaft_in_hole": 0,
+	"pin_in_hole": 0,
+	"axis_into_hole": 0,
+	"sleeve_on_shaft": 1,
+	"hole_on_shaft": 1,
+	"socket_on_pin": 1,
+}
+
+SRSA_BASE_PLUG_DIAMETER = 0.007986
+SRSA_BASE_HOLE_DIAMETER = 0.008100
+SRSA_TASK_FAMILY_PRESETS = {
+	"baseline": {"task_family_id": -1, "plug_diameter": SRSA_BASE_PLUG_DIAMETER, "hole_diameter": SRSA_BASE_HOLE_DIAMETER},
+	"normal_fit": {"task_family_id": 1, "plug_diameter": SRSA_BASE_PLUG_DIAMETER, "hole_diameter": SRSA_BASE_HOLE_DIAMETER},
+	"loose_fit": {"task_family_id": 0, "plug_diameter": SRSA_BASE_PLUG_DIAMETER, "hole_diameter": 0.008386},
+	"tight_fit": {"task_family_id": 2, "plug_diameter": SRSA_BASE_PLUG_DIAMETER, "hole_diameter": 0.008036},
+}
+
+
+def task_conditioning_mode(cfg):
+	return str(cfg.get('task_conditioning', 'axial_params')).strip().lower()
+
+
+def uses_axial_task_encoder(cfg):
+	return task_conditioning_mode(cfg) in AXIAL_TASK_CONDITIONING_MODES
+
+
+def uses_id_task_embedding(cfg):
+	return task_conditioning_mode(cfg) in ID_TASK_CONDITIONING_MODES
+
+
+def uses_no_task_conditioning(cfg):
+	return task_conditioning_mode(cfg) in NO_TASK_CONDITIONING_MODES
+
+
+def _get_value(source, key, default=None):
+	if source is None:
+		return default
+	if isinstance(source, dict):
+		return source.get(key, default)
+	return getattr(source, key, default)
+
+
+def _first_value(*values):
+	for value in values:
+		if value is not None:
+			return value
+	return None
+
+
+def _optional_float(value):
+	if value is None:
+		return None
+	return float(value)
+
+
+def _parse_vector(raw, *, expected_dim=6):
+	if raw is None:
+		return None
+	if isinstance(raw, str):
+		raw = raw.strip()
+		if raw.startswith("[") and raw.endswith("]"):
+			raw = raw[1:-1]
+		raw = [item for item in raw.replace(";", ",").split(",") if item.strip()]
+	values = [float(item) for item in raw]
+	if len(values) != expected_dim:
+		raise ValueError(f"Expected axial task vector with {expected_dim} values, got {len(values)}: {values}")
+	return values
+
+
+def _resolve_axial_task_type_id(cfg, item=None):
+	raw = _first_value(
+		_get_value(item, "task_type_id", None),
+		_get_value(item, "task_type_id_float", None),
+		cfg.get("axial_task_type_id", None),
+	)
+	if raw is not None:
+		return int(float(raw))
+	task_type = str(_first_value(_get_value(item, "task_type", None), cfg.get("axial_task_type", "peg_in_hole")))
+	if task_type not in AXIAL_TASK_TYPE_IDS:
+		raise ValueError(f"Unknown axial task_type={task_type!r}. Expected one of {sorted(AXIAL_TASK_TYPE_IDS)}.")
+	return AXIAL_TASK_TYPE_IDS[task_type]
+
+
+def _resolve_srsa_family_preset(cfg, item=None):
+	family_name = _first_value(_get_value(item, "task_family_name", None), cfg.get("srsa_task_family_name", None))
+	if family_name in SRSA_TASK_FAMILY_PRESETS:
+		return SRSA_TASK_FAMILY_PRESETS[family_name]
+	family_id = _first_value(_get_value(item, "task_family_id", None), cfg.get("srsa_task_family_id", None))
+	if family_id is None:
+		return SRSA_TASK_FAMILY_PRESETS["normal_fit"]
+	for preset in SRSA_TASK_FAMILY_PRESETS.values():
+		if int(preset["task_family_id"]) == int(family_id):
+			return preset
+	return SRSA_TASK_FAMILY_PRESETS["normal_fit"]
+
+
+def make_axial_task_vec(cfg, item=None):
+	"""
+	Create the param-only axial task vector.
+
+	The vector intentionally excludes initial pose error, visual noise, task_id, and assembly_id.
+	"""
+	explicit = _first_value(
+		_get_value(item, "task_vec_6", None),
+		_get_value(item, "axial_task_vec", None),
+		_get_value(item, "axial_task_vec_6", None),
+		cfg.get("axial_task_vec_6", None),
+	)
+	parsed = _parse_vector(explicit, expected_dim=int(cfg.get("axial_task_vec_dim", 6)))
+	if parsed is not None:
+		return parsed
+
+	direct_fields = [
+		"task_type_id_float",
+		"log_scale",
+		"clearance_abs_norm",
+		"clearance_rel_norm",
+		"depth_abs_norm",
+		"yaw_requirement_float",
+	]
+	if item is not None and all(_get_value(item, key, None) is not None for key in direct_fields):
+		return [float(_get_value(item, key)) for key in direct_fields]
+
+	preset = _resolve_srsa_family_preset(cfg, item)
+	male_diameter = _optional_float(_first_value(
+		_get_value(item, "male_diameter", None),
+		_get_value(item, "plug_diameter", None),
+		cfg.get("srsa_plug_diameter", None),
+		preset.get("plug_diameter"),
+		SRSA_BASE_PLUG_DIAMETER,
+	))
+	female_diameter = _optional_float(_first_value(
+		_get_value(item, "female_diameter", None),
+		_get_value(item, "hole_diameter", None),
+		cfg.get("srsa_hole_diameter", None),
+		preset.get("hole_diameter"),
+		SRSA_BASE_HOLE_DIAMETER,
+	))
+	male_radius = max(0.5 * float(male_diameter), 1.0e-8)
+	reference_radius = max(float(cfg.get("axial_reference_radius", male_radius)), 1.0e-8)
+	reference_depth = max(float(cfg.get("axial_reference_depth", 1.0)), 1.0e-8)
+
+	radial_clearance = _optional_float(_get_value(item, "radial_clearance", None))
+	if radial_clearance is None:
+		diametral_clearance = _optional_float(_first_value(
+			_get_value(item, "diametral_clearance", None),
+			_get_value(item, "clearance", None),
+			cfg.get("srsa_clearance", None),
+		))
+		if diametral_clearance is not None:
+			radial_clearance = 0.5 * diametral_clearance
+	if radial_clearance is None:
+		clearance_ratio = _optional_float(_first_value(
+			_get_value(item, "clearance_ratio", None),
+			cfg.get("srsa_clearance_ratio", None),
+		))
+		if clearance_ratio is not None:
+			radial_clearance = 0.5 * clearance_ratio * float(male_diameter)
+	if radial_clearance is None:
+		radial_clearance = 0.5 * max(0.0, float(female_diameter) - float(male_diameter))
+
+	target_depth = _optional_float(_first_value(
+		_get_value(item, "target_insertion_depth", None),
+		_get_value(item, "insertion_depth", None),
+		cfg.get("srsa_insertion_depth", None),
+		cfg.get("axial_target_insertion_depth", None),
+		reference_depth,
+	))
+	scale_ratio = _optional_float(_first_value(
+		_get_value(item, "scale_ratio", None),
+		cfg.get("axial_scale_ratio", None),
+		male_radius / reference_radius,
+	))
+	yaw_requirement = _first_value(
+		_get_value(item, "yaw_requirement", None),
+		_get_value(item, "yaw_requirement_float", None),
+		cfg.get("axial_yaw_requirement", False),
+	)
+
+	return [
+		float(_resolve_axial_task_type_id(cfg, item)),
+		float(math.log(max(scale_ratio, 1.0e-8))),
+		float(radial_clearance) / reference_radius,
+		float(radial_clearance) / male_radius,
+		float(target_depth) / reference_depth,
+		1.0 if bool(yaw_requirement) else 0.0,
+	]
+
+
 def split_by_rank(global_list, rank, world_size):
 	"""Split a global list into sublists for each rank."""
 	return [global_list[i] for i in range(len(global_list)) if i % world_size == rank]
@@ -267,6 +472,7 @@ def make_isaaclab_task_info(cfg):
 	for task in dict.fromkeys(cfg.tasks):
 		info[task] = {
 			'text_embedding': embedding,
+			'task_vec_6': make_axial_task_vec(cfg, {'task_name': task}),
 			'max_episode_steps': int(cfg.isaaclab_max_episode_steps),
 			'action_dim': int(cfg.isaaclab_action_dim),
 		}
@@ -283,6 +489,7 @@ def make_offline_manifest_task_info(cfg, manifest_tasks):
 			embedding = [0.0] * max(int(cfg.task_dim), 0)
 		info[task_name] = {
 			'text_embedding': embedding,
+			'task_vec_6': make_axial_task_vec(cfg, item),
 			'max_episode_steps': int(item.get('max_episode_steps', cfg.isaaclab_max_episode_steps)),
 			'action_dim': int(item.get('action_dim', cfg.isaaclab_action_dim)),
 		}
@@ -313,6 +520,19 @@ def parse_cfg(cfg):
 			f'Invalid model size {cfg.model_size}. Must be one of {list(MODEL_SIZE.keys())}'
 		for k, v in MODEL_SIZE[cfg.model_size].items():
 			cfg[k] = v
+	if uses_axial_task_encoder(cfg):
+		cfg.task_conditioning = "axial_params"
+		cfg.task_dim = int(cfg.axial_task_dim)
+	elif uses_no_task_conditioning(cfg):
+		cfg.task_conditioning = "none"
+		cfg.task_dim = 0
+	elif uses_id_task_embedding(cfg):
+		cfg.task_conditioning = "id_embedding"
+	else:
+		raise ValueError(
+			f"Unknown task_conditioning={cfg.task_conditioning!r}. "
+			"Use axial_params, id_embedding, or none."
+		)
 
 	# Set defaults
 	manifest_tasks = None
@@ -342,7 +562,7 @@ def parse_cfg(cfg):
 		cfg.num_envs = cfg.num_tasks
 		print(colored(f'Number of tasks in soup: {cfg.num_global_tasks}', 'green', attrs=['bold']))
 	if cfg.learn_task_emb is None:
-		cfg.learn_task_emb = cfg.offline_manifest_fp is not None
+		cfg.learn_task_emb = cfg.offline_manifest_fp is not None and uses_id_task_embedding(cfg)
 	if cfg.eval_freq is None:
 		cfg.eval_freq = 20 * 500 * cfg.num_envs
 	if cfg.save_freq is None:
@@ -352,7 +572,8 @@ def parse_cfg(cfg):
 	if is_isaaclab_task(cfg) and cfg.data_dir == "/path/to/your/data":
 		cfg.use_demos = False
 
-	# Load task embeddings
+	# Load task metadata. The main method uses task_vec_6 -> AxialTaskEncoder;
+	# text embeddings remain only for the id/language embedding ablation path.
 	if manifest_tasks is not None:
 		task_info = make_offline_manifest_task_info(cfg, manifest_tasks)
 	elif is_isaaclab_task(cfg) and not Path(cfg.tasks_fp).expanduser().exists():
@@ -366,12 +587,15 @@ def parse_cfg(cfg):
 		with open(cfg.tasks_fp, "r") as f:
 			task_info = json.load(f)
 	cfg.task_embeddings = []
+	cfg.task_vectors = []
 	cfg.episode_lengths = []
 	cfg.discounts = []
 	cfg.action_dims = []
 	for task in cfg.tasks:
 		assert task in task_info, f'Task {task} not found in task embeddings.'
-		cfg.task_embeddings.append(task_info[task]['text_embedding'])
+		cfg.task_embeddings.append(task_info[task].get('text_embedding', [0.0] * max(int(cfg.task_dim), 0)))
+		if uses_axial_task_encoder(cfg):
+			cfg.task_vectors.append(task_info[task].get('task_vec_6', make_axial_task_vec(cfg, task_info[task])))
 		cfg.episode_lengths.append(task_info[task]['max_episode_steps'])
 		if 'discount_factor' in task_info[task]:
 			cfg.discounts.append(task_info[task]['discount_factor'])

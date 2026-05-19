@@ -29,6 +29,8 @@ class TDMPC2(torch.nn.Module):
 			{'params': self.model._Qs.online.parameters()},
 			{'params': self.model._pi.parameters()},
 		]
+		if getattr(self.model, '_task_encoder', None) is not None:
+			optim_groups.append({'params': self.model._task_encoder.parameters()})
 		if getattr(self.model, '_task_emb', None) is not None and self.model._task_emb.weight.requires_grad:
 			optim_groups.append({'params': self.model._task_emb.parameters()})
 		self.optim = torch.optim.Adam(optim_groups, lr=self.cfg.lr, capturable=True)
@@ -94,8 +96,13 @@ class TDMPC2(torch.nn.Module):
 		
 		# Retain task_emb and action_masks if finetuning
 		if self.cfg.finetune:
-			prefix = "module." if "module._task_emb.weight" in state_dict else ""
-			state_dict[prefix+"_task_emb.weight"] = self.model._task_emb.weight
+			prefix = "module." if any(key.startswith("module.") for key in state_dict.keys()) else ""
+			if getattr(self.model, '_task_emb', None) is not None:
+				state_dict[prefix+"_task_emb.weight"] = self.model._task_emb.weight
+			if getattr(self.model, '_task_encoder', None) is not None:
+				for key, value in self.model._task_encoder.state_dict().items():
+					state_dict[prefix+f"_task_encoder.{key}"] = value
+				state_dict[prefix+"_task_vecs"] = self.model._task_vecs
 			state_dict[prefix+"_action_masks"] = self.model._action_masks
 
 		state_dict = api_model_conversion(self.model.state_dict(), state_dict)
@@ -335,6 +342,10 @@ class TDMPC2(torch.nn.Module):
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
 		self.pi_optim.step()
 		self.pi_optim.zero_grad(set_to_none=True)
+		if getattr(self.model, '_task_encoder', None) is not None:
+			self.model._task_encoder.zero_grad(set_to_none=True)
+		if getattr(self.model, '_task_emb', None) is not None:
+			self.model._task_emb.zero_grad(set_to_none=True)
 		self.model._Qs.track_grad(True)
 
 		info = TensorDict({

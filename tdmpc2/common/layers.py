@@ -477,6 +477,11 @@ def api_model_conversion(target_state_dict, source_state_dict):
 		# delete task embedding from source state dict
 		source_state_dict.pop('_task_emb.weight', None)
 
+	for key in target_state_dict.keys():
+		if key.endswith('_task_vecs') or '._task_encoder.' in key or key.startswith('_task_encoder.'):
+			if key not in source_state_dict or source_state_dict[key].shape != target_state_dict[key].shape:
+				source_state_dict[key] = target_state_dict[key]
+
 	return source_state_dict
 
 

@@ -583,6 +583,28 @@ class IsaacLabWrapper(gym.Wrapper):
 		return self.env.close()
 
 
+def _maybe_update_axial_task_vector_from_env(cfg, env):
+	if cfg.get('task_conditioning', 'axial_params') != 'axial_params':
+		return
+	current_task_params = getattr(env.unwrapped, 'current_task_params', None)
+	if not current_task_params:
+		return
+	try:
+		from config import make_axial_task_vec
+	except ImportError:
+		return
+	task_vec = make_axial_task_vec(cfg, current_task_params)
+	if not getattr(cfg, 'task_vectors', None):
+		cfg.task_vectors = [task_vec]
+	elif len(cfg.task_vectors) == 1:
+		cfg.task_vectors[0] = task_vec
+	else:
+		return
+	if int(getattr(cfg, 'rank', 0)) == 0:
+		pretty_vec = ", ".join(f"{value:.6g}" for value in task_vec)
+		print(f"[Rank {cfg.rank}] Updated axial task_vec_6 from SRSA runtime params: [{pretty_vec}]")
+
+
 def make_env(cfg):
 	"""
 	Make an Isaac Lab AutoMate environment.
@@ -614,6 +636,7 @@ def make_env(cfg):
 	render_mode = 'rgb_array' if (cfg.save_video or cfg.obs == 'rgb') else None
 	env = gym.make(cfg.isaaclab_env_id, cfg=env_cfg, render_mode=render_mode)
 	_configure_soft_dtw(env, cfg)
+	_maybe_update_axial_task_vector_from_env(cfg, env)
 	env = IsaacLabWrapper(env, cfg)
 	print(f'[Rank {cfg.rank}] Created Isaac Lab env {cfg.isaaclab_env_id} for assembly_id={cfg.assembly_id}')
 	if cfg.isaaclab_use_canonical_obs:
