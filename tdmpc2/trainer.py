@@ -1,4 +1,5 @@
 import os
+import datetime
 from collections import defaultdict, OrderedDict
 from time import time
 
@@ -32,6 +33,8 @@ class Trainer():
 		self._step = 0
 		self._ep_idx = 0
 		self._start_time = time()
+		self._last_progress_log = 0.0
+		self._progress_log_interval = max(0.0, float(cfg.get('progress_log_interval_sec', 30.0)))
 		self._rollout_device = torch.device(f'cuda:{cfg.device_id}') if (
 			cfg.task.startswith('isaaclab-') or
 			cfg.get('isaaclab_env_id', '').startswith('Isaac-') or
@@ -73,6 +76,8 @@ class Trainer():
 			print('Architecture:', self.agent.model)
 			print(f'Update frequency: {self._update_freq:,}')
 			print(f'Episodes per update frequency: {self._eps_per_update_freq:,}')
+			if self._progress_log_interval > 0:
+				print(f'Progress heartbeat: every {self._progress_log_interval:.0f}s during eval/rollout/update.')
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
@@ -83,6 +88,25 @@ class Trainer():
 			elapsed_time=elapsed_time,
 			steps_per_second=self._step / elapsed_time
 		)
+
+	def _elapsed_str(self):
+		return str(datetime.timedelta(seconds=int(time() - self._start_time)))
+
+	def _maybe_log_progress(self, phase, extra="", force=False):
+		if self.cfg.rank != 0 or self._progress_log_interval <= 0:
+			return
+		now = time()
+		if not force and now - self._last_progress_log < self._progress_log_interval:
+			return
+		self._last_progress_log = now
+		msg = (
+			f"{phase:<8} progress "
+			f"E: {self._ep_idx:,} I: {self._step:,} "
+			f"T: {self._elapsed_str()}"
+		)
+		if extra:
+			msg += f" {extra}"
+		print(colored(msg, 'cyan', attrs=['bold']), flush=True)
 
 	def eval(self):
 		"""Evaluate agent and aggregate all completed episodes per unique task name."""
@@ -96,11 +120,23 @@ class Trainer():
 		if self.cfg.save_video:
 			self.logger.video.init(self.env, enabled=self.cfg.rank==0)
 
+		eval_env_steps = 0
+		eval_guard_steps = int(
+			max(1, self.cfg.eval_episodes) *
+			max(1, self.cfg.episode_length) *
+			max(1.0, float(self.cfg.get('eval_hang_guard_factor', 2.0)))
+		)
+		self._maybe_log_progress(
+			'eval',
+			extra=f"start target_eps={self.cfg.eval_episodes} envs={self.cfg.num_envs} guard_steps={eval_guard_steps}",
+			force=True,
+		)
 		while (episodes_completed < self.cfg.eval_episodes).any():
 			use_mpc = self._step > 0 or self.cfg.finetune
 			torch.compiler.cudagraph_mark_step_begin()
 			action, _ = self.agent(obs, t0=episode_len==0, step=self._step, eval_mode=True, task=self._tasks, mpc=use_mpc)
 			obs, reward, terminated, truncated, info = self.env.step(action)
+			eval_env_steps += 1
 
 			done = terminated | truncated
 			episode_reward += reward
@@ -120,6 +156,25 @@ class Trainer():
 						episode_reward[i] = 0.0
 						episode_len[i] = 0.0
 						episodes_completed[i] += 1
+			self._maybe_log_progress(
+				'eval',
+				extra=(
+					f"env_steps={eval_env_steps} "
+					f"done_this_step={int(done.sum().item())}/{self.cfg.num_envs} "
+					f"eps_done_min={int(episodes_completed.min().item())} "
+					f"eps_done_max={int(episodes_completed.max().item())} "
+					f"ep_len_max={int(episode_len.max().item())}"
+				),
+			)
+			if eval_env_steps > eval_guard_steps and (episodes_completed < self.cfg.eval_episodes).any():
+				raise RuntimeError(
+					"Evaluation did not finish within the configured guard. "
+					f"eval_env_steps={eval_env_steps}, guard_steps={eval_guard_steps}, "
+					f"episodes_completed_min={int(episodes_completed.min().item())}, "
+					f"episodes_completed_max={int(episodes_completed.max().item())}, "
+					f"episode_len_max={int(episode_len.max().item())}. "
+					"Check whether the environment is returning truncated/final_info."
+				)
 
 			if self.cfg.save_video and episodes_completed.min() == 0:
 				self.logger.video.record(self.env)
@@ -201,6 +256,16 @@ class Trainer():
 			task=self._tasks,
 			batch_size=(self.cfg.num_envs,))
 		return td
+
+	def _reset_train_rollout(self):
+		obs, info = self.env.reset()
+		ep_reward = torch.zeros((self.cfg.num_envs,), device=self._rollout_device)
+		ep_len = torch.zeros((self.cfg.num_envs,), dtype=torch.int32, device=self._rollout_device)
+		done = torch.full((self.cfg.num_envs,), True, dtype=torch.bool, device=self._rollout_device)
+		action_infos = []
+		self._next_action = None
+		self._tds[ep_len] = self.to_td(obs)
+		return obs, ep_reward, ep_len, done, action_infos
 	
 	def train(self):
 		"""Train a Newt agent."""
@@ -246,11 +311,27 @@ class Trainer():
 		# Training loop
 		if self.cfg.rank == 0:
 			print(f'Training agent for {self.cfg.steps:,} steps...')
+			if self._progress_log_interval > 0:
+				print(
+					colored(
+						f'If the console is quiet, heartbeat lines will appear every '
+						f'{self._progress_log_interval:.0f}s.',
+						'cyan',
+						attrs=['bold'],
+					),
+					flush=True,
+				)
 		train_metrics = defaultdict(list)
+		obs = ep_reward = ep_len = done = action_infos = None
 		while self._step <= self.cfg.steps:
 
 			# Evaluate agent periodically
-			if self._step % self.cfg.eval_freq == 0:
+			should_eval = self.cfg.eval_freq and self._step % self.cfg.eval_freq == 0
+			if self._step == 0 and self.cfg.get('skip_initial_eval', False):
+				should_eval = False
+				if self.cfg.rank == 0:
+					print(colored('Skipping initial evaluation; starting rollout immediately.', 'cyan', attrs=['bold']))
+			if should_eval:
 				eval_metrics = self.eval()
 				eval_metrics.update(self.common_metrics())
 				if self.cfg.task == 'soup':
@@ -270,13 +351,9 @@ class Trainer():
 					self.logger.save_agent(self.agent, f'{self._step:,}'.replace(',', '_'), metrics=save_metrics)
 
 				# Reset environment and metrics
-				obs, info = self.env.reset()
-				ep_reward = torch.zeros((self.cfg.num_envs,), device=self._rollout_device)
-				ep_len = torch.zeros((self.cfg.num_envs,), dtype=torch.int32, device=self._rollout_device)
-				done = torch.full((self.cfg.num_envs,), True, dtype=torch.bool, device=self._rollout_device)
-				action_infos = []
-				self._next_action = None
-				self._tds[ep_len] = self.to_td(obs)
+				obs, ep_reward, ep_len, done, action_infos = self._reset_train_rollout()
+			if obs is None:
+				obs, ep_reward, ep_len, done, action_infos = self._reset_train_rollout()
 
 			# Collect experience
 			if self.cfg.finetune:
@@ -300,6 +377,15 @@ class Trainer():
 			done = terminated | truncated
 			action_infos.append(action_info)
 			self._step += self.cfg.num_envs * self.cfg.world_size
+			self._maybe_log_progress(
+				'rollout',
+				extra=(
+					f"done_this_step={int(done.sum().item())}/{self.cfg.num_envs} "
+					f"ep_len_min={int(ep_len.min().item())} "
+					f"ep_len_max={int(ep_len.max().item())} "
+					f"buffer_eps={self.buffer.num_eps}"
+				),
+			)
 
 			# Store experience
 			_obs = obs.clone()
@@ -346,9 +432,15 @@ class Trainer():
 				self._update_tokens += self.cfg.num_envs * self.cfg.world_size * self.cfg.utd
 				if self._update_tokens >= 1.0:
 					num_updates = int(self._update_tokens)
+					self._maybe_log_progress('update', extra=f"start updates={num_updates}")
 					for _ in range(num_updates):
 						_train_metrics = self.agent.update(self.buffer)
 					train_metrics.update(_train_metrics)
 					self._update_tokens -= num_updates
+					self._maybe_log_progress(
+						'update',
+						extra=f"done updates={num_updates} remaining_tokens={self._update_tokens:.3f}",
+						force=True,
+					)
 		
 		self.logger.finish()

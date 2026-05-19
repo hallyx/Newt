@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from common import layers, math, init
+from models.axial_task_encoder import AxialTaskEncoder
 from tensordict import TensorDict
 
 
@@ -15,10 +16,29 @@ class WorldModel(nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		self._multitask = cfg.num_global_tasks is not None and cfg.num_global_tasks > 1
-		if cfg.finetune:
+		self._task_emb = None
+		self._task_encoder = None
+		self._task_conditioning = str(cfg.get('task_conditioning', 'axial_params')).lower()
+		if self._task_conditioning in {'axial', 'axial_params', 'param', 'param_only'}:
+			self._task_conditioning = 'axial_params'
+			task_vectors = cfg.get('task_vectors', None)
+			if task_vectors is None or len(task_vectors) == 0:
+				task_vectors = [[0.0] * int(cfg.get('axial_task_vec_dim', 6))]
+			task_vectors = torch.tensor(task_vectors, dtype=torch.float32)
+			if task_vectors.ndim != 2 or task_vectors.shape[-1] != int(cfg.get('axial_task_vec_dim', 6)):
+				raise ValueError(f'Expected task_vectors shape (N, 6), got {tuple(task_vectors.shape)}.')
+			self.register_buffer('_task_vecs', task_vectors)
+			self._task_encoder = AxialTaskEncoder(task_dim=cfg.task_dim)
+			if cfg.rank == 0:
+				print(f'Using AxialTaskEncoder param-only task conditioning: {tuple(task_vectors.shape)} -> {cfg.task_dim}D.')
+		elif self._task_conditioning in {'none', 'disabled'} or cfg.task_dim <= 0:
+			self._task_conditioning = 'none'
+			if cfg.rank == 0:
+				print('Task conditioning disabled.')
+		elif cfg.finetune:
 			self._task_emb = nn.Embedding(200, cfg.task_dim)
 			self._task_emb._parameters['weight'] = torch.tensor(self.cfg.task_embeddings[:1], dtype=torch.float32).repeat(200, 1)
-			print(f'Using pre-computed language embeddings for task {self.cfg.task}.')
+			print(f'Using task-id embedding ablation for task {self.cfg.task}.')
 		else:
 			self._task_emb = nn.Embedding(len(cfg.task_embeddings), cfg.task_dim) if cfg.task_dim > 0 else None
 			if self._task_emb is not None:
@@ -29,9 +49,9 @@ class WorldModel(nn.Module):
 				elif not cfg.learn_task_emb:
 					self._task_emb._parameters['weight'] = torch.tensor(self.cfg.task_embeddings, dtype=torch.float32)
 					if cfg.rank == 0:
-						print('Using pre-computed language embeddings.')
+						print('Using pre-computed task-id embeddings as an ablation.')
 				elif cfg.rank == 0:
-					print('Using learnable task embeddings.')
+					print('Using learnable task-id embeddings as an ablation.')
 		if self._task_emb is not None:
 			self._task_emb.weight.requires_grad = bool(cfg.learn_task_emb) and not cfg.disable_task_emb
 		if cfg.finetune:
@@ -57,10 +77,19 @@ class WorldModel(nn.Module):
 
 	def __repr__(self):
 		repr = 'Newt World Model\n'
-		modules = ['Encoder', 'Dynamics', 'Reward', 'Policy prior', 'Q-functions']
-		for i, m in enumerate([self._encoder, self._dynamics, self._reward, self._pi, self._Qs.online]):
-			params = "{:,}".format(sum(p.numel() for p in m.parameters() if p.requires_grad))
-			repr += f"{modules[i]} ({params}): {m}\n"
+		modules = []
+		if self._task_encoder is not None:
+			modules.append(('Axial task encoder', self._task_encoder))
+		modules.extend([
+			('Encoder', self._encoder),
+			('Dynamics', self._dynamics),
+			('Reward', self._reward),
+			('Policy prior', self._pi),
+			('Q-functions', self._Qs.online),
+		])
+		for name, module in modules:
+			params = "{:,}".format(sum(p.numel() for p in module.parameters() if p.requires_grad))
+			repr += f"{name} ({params}): {module}\n"
 		repr += "Learnable parameters: {:,}".format(self.total_params)
 		return repr
 
@@ -86,49 +115,83 @@ class WorldModel(nn.Module):
 		"""
 		self._Qs.soft_update_target()
 
-	def task_emb(self, x, task):
-		"""
-		Appends task embedding to input x along the last dimension.
-		Handles broadcast, reshape, and shape mismatches robustly.
-		"""
-		if not hasattr(self, '_task_emb') or self._task_emb is None:
-			return x
+	def _broadcast_task_ids(self, task, x):
+		x_batch_shape = x.shape[:-1]
 		if task is None:
-			if self._task_emb.num_embeddings == 1:
-				task = torch.zeros(x.shape[:-1], device=x.device, dtype=torch.long)
-			else:
-				raise ValueError("Task ids are required when using multi-task embeddings.")
-
+			num_tasks = (
+				self._task_vecs.shape[0] if hasattr(self, '_task_vecs')
+				else self._task_emb.num_embeddings
+			)
+			if num_tasks == 1:
+				return torch.zeros(x_batch_shape, device=x.device, dtype=torch.long)
+			raise ValueError("Task ids are required when using multi-task conditioning.")
 		if isinstance(task, int):
 			task = torch.tensor([task], device=x.device)
+		task = task.to(x.device, non_blocking=True)
 
-		x_batch_shape = x.shape[:-1]
-		E = self._task_emb.embedding_dim
-
-		# Step 1: Pad task shape (add singleton dims) until it's same rank as x_batch_shape
+		if task.ndim == 1 and len(x_batch_shape) > 1:
+			if task.shape[0] == x_batch_shape[0]:
+				task = task.view(task.shape[0], *([1] * (len(x_batch_shape) - 1)))
+			elif task.shape[0] == x_batch_shape[-1]:
+				task = task.view(*([1] * (len(x_batch_shape) - 1)), task.shape[0])
 		while task.ndim < len(x_batch_shape):
 			task = task.unsqueeze(-1)
-
-		# Step 2: Try broadcasting
 		try:
-			broadcast_shape = torch.broadcast_shapes(task.shape, x_batch_shape)
+			return task.expand(*x_batch_shape).long()
 		except RuntimeError:
-			# Step 3: Try reshape fallback if total number of elements match
 			if task.numel() == int(torch.tensor(x_batch_shape).prod().item()):
-				task = task.reshape(*x_batch_shape)
+				return task.reshape(*x_batch_shape).long()
+			raise ValueError(
+				f"Incompatible task shape: got {tuple(task.shape)}, expected broadcastable to {x_batch_shape} "
+				f"(x.shape = {tuple(x.shape)})"
+			)
+
+	def _expand_task_context(self, context, x):
+		x_batch_shape = x.shape[:-1]
+		context_dim = context.shape[-1]
+		while context.ndim < x.ndim:
+			context = context.unsqueeze(-2)
+		try:
+			return context.expand(*x_batch_shape, context_dim)
+		except RuntimeError:
+			if context.numel() == int(torch.tensor((*x_batch_shape, context_dim)).prod().item()):
+				return context.reshape(*x_batch_shape, context_dim)
+			raise ValueError(
+				f"Incompatible task context shape: got {tuple(context.shape)}, "
+				f"expected broadcastable to {(*x_batch_shape, context_dim)}."
+			)
+
+	def task_context(self, x, task):
+		if self._task_encoder is not None:
+			if (
+				task is not None and
+				torch.is_tensor(task) and
+				task.is_floating_point() and
+				task.ndim > 0 and
+				task.shape[-1] == self.cfg.axial_task_vec_dim
+			):
+				task_vec = task.to(device=x.device, dtype=torch.float32, non_blocking=True)
 			else:
-				raise ValueError(
-					f"Incompatible task shape: got {task.shape}, expected broadcastable to {x_batch_shape} "
-					f"(x.shape = {x.shape})"
-				)
+				task_ids = self._broadcast_task_ids(task, x)
+				task_vec = self._task_vecs[task_ids]
+			return self._expand_task_context(self._task_encoder(task_vec), x)
 
-		# Step 4: Embed and expand
-		emb = self._task_emb(task.long())  # shape (..., E)
-		while emb.ndim < x.ndim:
-			emb = emb.unsqueeze(-2)
+		if not hasattr(self, '_task_emb') or self._task_emb is None:
+			return None
+		task_ids = self._broadcast_task_ids(task, x)
+		return self._expand_task_context(self._task_emb(task_ids), x)
 
-		emb = emb.expand(*x_batch_shape, E)
-		return torch.cat([x, emb], dim=-1)
+	def task_emb(self, x, task):
+		"""
+		Appends the task context to input x.
+
+		Main path: task id -> task_vec_6 -> AxialTaskEncoder -> c_task.
+		A task-id embedding path is retained only as an ablation.
+		"""
+		context = self.task_context(x, task)
+		if context is None:
+			return x
+		return torch.cat([x, context], dim=-1)
 
 	def encode(self, obs, task):
 		"""
