@@ -9,6 +9,7 @@ from tqdm import tqdm
 from tensordict.tensordict import TensorDict
 
 from common import barrier
+from zmq_action_publisher import make_eval_zmq_publisher
 
 
 def split_by_rank(global_list, rank, world_size):
@@ -96,33 +97,51 @@ class Trainer():
 		if self.cfg.save_video:
 			self.logger.video.init(self.env, enabled=self.cfg.rank==0)
 
-		while (episodes_completed < self.cfg.eval_episodes).any():
-			use_mpc = self._step > 0 or self.cfg.finetune
-			torch.compiler.cudagraph_mark_step_begin()
-			action, _ = self.agent(obs, t0=episode_len==0, step=self._step, eval_mode=True, task=self._tasks, mpc=use_mpc)
-			obs, reward, terminated, truncated, info = self.env.step(action)
+		with make_eval_zmq_publisher(self.cfg) as action_publisher:
+			while (episodes_completed < self.cfg.eval_episodes).any():
+				use_mpc = self._step > 0 or self.cfg.finetune
+				torch.compiler.cudagraph_mark_step_begin()
+				action, _ = self.agent(obs, t0=episode_len==0, step=self._step, eval_mode=True, task=self._tasks, mpc=use_mpc)
+				if self.cfg.rank == 0:
+					env_index = int(self.cfg.get('eval_zmq_env_index', 0))
+					action_publisher.send_action(
+						action,
+						step=self._step,
+						episode_step=int(episode_len[env_index].item()),
+						task_id=int(self._tasks[env_index].item()),
+					)
+				obs, reward, terminated, truncated, info = self.env.step(action)
 
-			done = terminated | truncated
-			episode_reward += reward
-			episode_len += 1
+				done = terminated | truncated
+				episode_reward += reward
+				episode_len += 1
 
-			if 'final_info' in info:
-				for i in range(self.cfg.num_envs):
-					if done[i]:
-						task_id = self._tasks[i].item()
-						task_name = self.cfg.global_tasks[task_id]
+				if self.cfg.rank == 0:
+					env_index = int(self.cfg.get('eval_zmq_env_index', 0))
+					if bool(done[env_index].item()):
+						action_publisher.send_done(
+							step=self._step,
+							episode_step=int(episode_len[env_index].item()),
+							task_id=int(self._tasks[env_index].item()),
+						)
 
-						task_results[task_name]['reward'].append(episode_reward[i].item())
-						task_results[task_name]['length'].append(episode_len[i].item())
-						task_results[task_name]['success'].append(info['final_info']['success'][i].item())
-						task_results[task_name]['score'].append(info['final_info']['score'][i].item())
+				if 'final_info' in info:
+					for i in range(self.cfg.num_envs):
+						if done[i]:
+							task_id = self._tasks[i].item()
+							task_name = self.cfg.global_tasks[task_id]
 
-						episode_reward[i] = 0.0
-						episode_len[i] = 0.0
-						episodes_completed[i] += 1
+							task_results[task_name]['reward'].append(episode_reward[i].item())
+							task_results[task_name]['length'].append(episode_len[i].item())
+							task_results[task_name]['success'].append(info['final_info']['success'][i].item())
+							task_results[task_name]['score'].append(info['final_info']['score'][i].item())
 
-			if self.cfg.save_video and episodes_completed.min() == 0:
-				self.logger.video.record(self.env)
+							episode_reward[i] = 0.0
+							episode_len[i] = 0.0
+							episodes_completed[i] += 1
+
+				if self.cfg.save_video and episodes_completed.min() == 0:
+					self.logger.video.record(self.env)
 
 		if self.cfg.save_video:
 			self.logger.video.save(self._step)

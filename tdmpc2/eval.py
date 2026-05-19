@@ -21,6 +21,7 @@ from config import Config, parse_cfg
 from envs import make_env
 from tdmpc2 import TDMPC2
 from trainer import Trainer
+from zmq_action_publisher import make_eval_zmq_publisher
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
@@ -65,34 +66,52 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	if trainer.cfg.save_video:
 		trainer.logger.video.init(trainer.env, enabled=trainer.cfg.rank == 0)
 
-	while completed < local_target:
-		use_mpc = trainer._step > 0 or trainer.cfg.finetune
-		torch.compiler.cudagraph_mark_step_begin()
-		action, _ = trainer.agent(obs, t0=episode_len == 0, step=trainer._step, eval_mode=True, task=trainer._tasks, mpc=use_mpc)
-		obs, reward, terminated, truncated, info = trainer.env.step(action)
+	with make_eval_zmq_publisher(trainer.cfg) as action_publisher:
+		while completed < local_target:
+			use_mpc = trainer._step > 0 or trainer.cfg.finetune
+			torch.compiler.cudagraph_mark_step_begin()
+			action, _ = trainer.agent(obs, t0=episode_len == 0, step=trainer._step, eval_mode=True, task=trainer._tasks, mpc=use_mpc)
+			if trainer.cfg.rank == 0:
+				env_index = int(trainer.cfg.get('eval_zmq_env_index', 0))
+				action_publisher.send_action(
+					action,
+					step=trainer._step,
+					episode_step=int(episode_len[env_index].item()),
+					task_id=int(trainer._tasks[env_index].item()),
+				)
+			obs, reward, terminated, truncated, info = trainer.env.step(action)
 
-		done = terminated | truncated
-		episode_reward += reward
-		episode_len += 1
+			done = terminated | truncated
+			episode_reward += reward
+			episode_len += 1
 
-		if 'final_info' in info:
-			for i in range(trainer.cfg.num_envs):
-				if not done[i]:
-					continue
-				if completed >= local_target:
-					break
-				task_id = trainer._tasks[i].item()
-				task_name = trainer.cfg.global_tasks[task_id]
-				task_results[task_name]['reward'].append(episode_reward[i].item())
-				task_results[task_name]['length'].append(episode_len[i].item())
-				task_results[task_name]['success'].append(info['final_info']['success'][i].item())
-				task_results[task_name]['score'].append(info['final_info']['score'][i].item())
-				episode_reward[i] = 0.0
-				episode_len[i] = 0.0
-				completed += 1
+			if trainer.cfg.rank == 0:
+				env_index = int(trainer.cfg.get('eval_zmq_env_index', 0))
+				if bool(done[env_index].item()):
+					action_publisher.send_done(
+						step=trainer._step,
+						episode_step=int(episode_len[env_index].item()),
+						task_id=int(trainer._tasks[env_index].item()),
+					)
 
-		if trainer.cfg.save_video and completed == 0:
-			trainer.logger.video.record(trainer.env)
+			if 'final_info' in info:
+				for i in range(trainer.cfg.num_envs):
+					if not done[i]:
+						continue
+					if completed >= local_target:
+						break
+					task_id = trainer._tasks[i].item()
+					task_name = trainer.cfg.global_tasks[task_id]
+					task_results[task_name]['reward'].append(episode_reward[i].item())
+					task_results[task_name]['length'].append(episode_len[i].item())
+					task_results[task_name]['success'].append(info['final_info']['success'][i].item())
+					task_results[task_name]['score'].append(info['final_info']['score'][i].item())
+					episode_reward[i] = 0.0
+					episode_len[i] = 0.0
+					completed += 1
+
+			if trainer.cfg.save_video and completed == 0:
+				trainer.logger.video.record(trainer.env)
 
 	if trainer.cfg.save_video:
 		trainer.logger.video.save(trainer._step)
@@ -183,6 +202,8 @@ def evaluate(rank: int, cfg: dict):
 			print(colored(f'Evaluating checkpoint: {cfg.checkpoint}', 'blue', attrs=['bold']))
 			if cfg.eval_task_id is not None:
 				print(colored(f'Evaluation task_id: {cfg.eval_task_id}', 'blue', attrs=['bold']))
+			if cfg.eval_zmq_enabled:
+				print(colored(f'Sending eval actions over ZMQ to {cfg.eval_zmq_server}', 'blue', attrs=['bold']))
 		if cfg.mpc:
 			trainer._step = 1
 		if cfg.eval_trials is not None:

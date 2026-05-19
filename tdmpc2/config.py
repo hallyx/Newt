@@ -78,6 +78,12 @@ class Config:
 	eval_trials: Optional[int] = None
 	eval_task_id: Optional[int] = None
 	eval_freq: Optional[int] = None
+	eval_zmq_enabled: bool = False
+	eval_zmq_server: str = "tcp://localhost:5555"
+	eval_zmq_env_index: int = 0
+	eval_zmq_rate: float = 0.0
+	eval_zmq_action_scale: float = 1.0
+	eval_zmq_send_done: bool = True
 
 	# offline training
 	offline_only: bool = False
