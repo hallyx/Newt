@@ -90,6 +90,29 @@ class Trainer():
 			steps_per_second=self._step / elapsed_time
 		)
 
+	def _uses_runtime_task_vec(self):
+		return (
+			bool(self.cfg.get('srsa_use_runtime_task_vec', True)) and
+			str(self.cfg.get('task_conditioning', '')).lower() == 'axial_params'
+		)
+
+	def _runtime_task_vec(self):
+		if not self._uses_runtime_task_vec():
+			return None
+		env = getattr(self.env, 'unwrapped', None)
+		task_vec = getattr(env, 'current_task_vec', None)
+		if task_vec is None or not torch.is_tensor(task_vec):
+			return None
+		if task_vec.ndim != 2 or task_vec.shape[0] != self.cfg.num_envs:
+			return None
+		if int(task_vec.shape[-1]) != int(self.cfg.get('axial_task_vec_dim', 6)):
+			return None
+		return task_vec.detach().to(self._rollout_device, dtype=torch.float32, non_blocking=True).clone()
+
+	def _model_tasks(self):
+		task_vec = self._runtime_task_vec()
+		return self._tasks if task_vec is None else task_vec
+
 	def _elapsed_str(self):
 		return str(datetime.timedelta(seconds=int(time() - self._start_time)))
 
@@ -136,7 +159,8 @@ class Trainer():
 			while (episodes_completed < self.cfg.eval_episodes).any():
 				use_mpc = self._step > 0 or self.cfg.finetune
 				torch.compiler.cudagraph_mark_step_begin()
-				action, _ = self.agent(obs, t0=episode_len==0, step=self._step, eval_mode=True, task=self._tasks, mpc=use_mpc)
+				model_tasks = self._model_tasks()
+				action, _ = self.agent(obs, t0=episode_len==0, step=self._step, eval_mode=True, task=model_tasks, mpc=use_mpc)
 				if self.cfg.rank == 0:
 					env_index = int(self.cfg.get('eval_zmq_env_index', 0))
 					action_publisher.send_action(
@@ -247,7 +271,7 @@ class Trainer():
 
 		return results
 
-	def to_td(self, obs, action=None, reward=None, terminated=None):
+	def to_td(self, obs, action=None, reward=None, terminated=None, task=None):
 		"""Creates a TensorDict for a new episode."""
 		if isinstance(obs, dict):
 			obs = TensorDict(obs, batch_size=(), device=self._rollout_device)
@@ -267,12 +291,16 @@ class Trainer():
 			terminated = torch.stack(terminated.tolist()).to(self._rollout_device, non_blocking=True)
 		else:
 			terminated = terminated.to(self._rollout_device, non_blocking=True)
+		if task is None:
+			task = self._model_tasks()
+		else:
+			task = task.to(self._rollout_device, non_blocking=True)
 		td = TensorDict(
 			obs=obs,
 			action=action,
 			reward=reward,
 			terminated=terminated,
-			task=self._tasks,
+			task=task,
 			batch_size=(self.cfg.num_envs,))
 		return td
 
@@ -375,16 +403,17 @@ class Trainer():
 				obs, ep_reward, ep_len, done, action_infos = self._reset_train_rollout()
 
 			# Collect experience
+			model_tasks = self._model_tasks()
 			if self.cfg.finetune:
 				torch.compiler.cudagraph_mark_step_begin()
-				action, action_info = self.agent(obs, t0=done, step=self._step, task=self._tasks, mpc=True)
+				action, action_info = self.agent(obs, t0=done, step=self._step, task=model_tasks, mpc=True)
 			elif use_demos and self.cfg.demo_steps > 0:
 				use_mpc = self._step >= self.cfg.seeding_coef * self._update_freq
 				torch.compiler.cudagraph_mark_step_begin()
-				action, action_info = self.agent(obs, t0=done, step=self._step, task=self._tasks, mpc=use_mpc)
+				action, action_info = self.agent(obs, t0=done, step=self._step, task=model_tasks, mpc=use_mpc)
 			elif self._step >= self.cfg.seeding_coef * self._update_freq:
 				torch.compiler.cudagraph_mark_step_begin()
-				action, action_info = self.agent(obs, t0=done, step=self._step, task=self._tasks)
+				action, action_info = self.agent(obs, t0=done, step=self._step, task=model_tasks)
 			else:
 				action, action_info = self.env.rand_act(), None
 
@@ -410,7 +439,7 @@ class Trainer():
 			_obs = obs.clone()
 			if 'final_observation' in info:
 				_obs[done] = info['final_observation']
-			td = self.to_td(_obs, action, reward, terminated)
+			td = self.to_td(_obs, action, reward, terminated, task=model_tasks)
 			self._tds[ep_len] = td
 			if done.any():
 				max_ep_len = ep_len.max()
@@ -434,6 +463,9 @@ class Trainer():
 						# Reset episode metrics
 						ep_reward[i] = 0.0
 						ep_len[i] = 0
+
+				reset_td = self.to_td(obs)
+				self._tds[0, done] = reset_td[done]
 				
 				# Log and reset metrics if enough data is collected
 				if max_ep_len >= self.cfg.episode_length:

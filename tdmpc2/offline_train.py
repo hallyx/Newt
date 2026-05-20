@@ -195,6 +195,17 @@ def launch(cfg: Config):
 	)
 	_run_stage(agent, dataset, logger, cfg, stage_name='wm', num_steps=cfg.offline_wm_steps)
 
+	# Stage 3: offline Max-Q fine-tuning with the learned world model and behavior prior.
+	_stage_cfg(
+		agent,
+		consistency=cfg.consistency_coef,
+		reward=cfg.reward_coef,
+		value=cfg.value_coef,
+		prior=cfg.prior_coef,
+		maxq_pi=True,
+	)
+	_run_stage(agent, dataset, logger, cfg, stage_name='rl', num_steps=cfg.offline_rl_steps)
+
 	logger.finish(agent)
 	print(colored('Offline training completed successfully.', 'green', attrs=['bold']))
 

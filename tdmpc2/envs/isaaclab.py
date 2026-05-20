@@ -48,7 +48,7 @@ def _build_canonical_obs(env, cfg=None) -> torch.Tensor:
 	]
 	if cfg is not None and cfg.get('isaaclab_canonical_append_force', False) and hasattr(env, 'flange_force_obs'):
 		parts.append(env.flange_force_obs)
-	task_params = getattr(env, 'current_task_param_tensor', None)
+	task_params = _get_srsa_task_param_obs_tensor(env, cfg)
 	if cfg is not None and cfg.get('isaaclab_canonical_append_task_params', False) and task_params is not None:
 		parts.append(task_params)
 	return torch.cat(parts, dim=-1)
@@ -163,6 +163,44 @@ def _set_env_if_value(name, value):
 		os.environ[name] = str(value)
 
 
+def _normalize_srsa_task_param_obs_mode(mode):
+	normalized = str(mode or "task_vec").strip().lower().replace("-", "_")
+	if normalized in {"task_vec", "newt", "newt_task", "newt_task_vec", "axial", "axial_task_vec"}:
+		return "task_vec"
+	if normalized in {"legacy", "legacy_9d", "task_param", "task_param_tensor"}:
+		return "legacy"
+	raise ValueError(
+		"srsa_task_param_obs_mode must be one of: task_vec, newt, axial, legacy, legacy_9d. "
+		f"Got {mode!r}."
+	)
+
+
+def _get_srsa_task_param_obs_tensor(env, cfg=None):
+	mode = _normalize_srsa_task_param_obs_mode(
+		cfg.get('srsa_task_param_obs_mode', 'task_vec') if cfg is not None else getattr(env, 'task_param_obs_mode', 'task_vec')
+	)
+	if mode == "task_vec":
+		task_vec = getattr(env, 'current_task_vec', None)
+		if task_vec is not None:
+			return task_vec
+	return getattr(env, 'current_task_param_tensor', None)
+
+
+def _get_srsa_current_task_vec(env):
+	task_vec = getattr(env, 'current_task_vec', None)
+	if torch.is_tensor(task_vec) and task_vec.ndim >= 2 and task_vec.shape[-1] == 6:
+		return task_vec.detach().to(dtype=torch.float32)
+	current_task_params = getattr(env, 'current_task_params', None)
+	if isinstance(current_task_params, dict):
+		explicit = current_task_params.get('task_vec', None)
+		if explicit is not None:
+			try:
+				return torch.as_tensor(explicit, device=env.device, dtype=torch.float32).reshape(1, 6)
+			except (TypeError, ValueError, RuntimeError):
+				return None
+	return None
+
+
 def _configure_srsa_runtime_env(cfg):
 	if not _uses_srsa_backend(cfg):
 		return
@@ -176,6 +214,37 @@ def _configure_srsa_runtime_env(cfg):
 	_set_env_if_value("SRSA_INSERTION_DEPTH", cfg.get('srsa_insertion_depth', None))
 	_set_env_if_value("SRSA_SUCCESS_POS_TOL", cfg.get('srsa_success_pos_tol', None))
 	_set_env_if_value("SRSA_TASK_PARAM_OBS", cfg.get('srsa_task_param_obs', False))
+	_set_env_if_value("SRSA_TASK_PARAM_OBS_MODE", _normalize_srsa_task_param_obs_mode(cfg.get('srsa_task_param_obs_mode', 'task_vec')))
+	_set_env_if_value("SRSA_NEWT_OBS", cfg.get('srsa_newt_obs', False))
+	_set_env_if_value("SRSA_ENABLE_AXIAL_TASK_PARAM_SAMPLER", cfg.get('srsa_enable_axial_task_param_sampler', True))
+	_set_env_if_value("SRSA_AXIAL_TASK_TYPE_ID", cfg.get('srsa_axial_task_type_id', cfg.get('axial_task_type_id', None)))
+	_set_env_if_value("SRSA_AXIAL_SCALE_RANGE", cfg.get('srsa_axial_scale_range', None))
+	_set_env_if_value("SRSA_AXIAL_FIXED_PLUG_SCALE", cfg.get('srsa_axial_fixed_plug_scale', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_RANGE", cfg.get('srsa_axial_clearance_range', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_RATIO_RANGE", cfg.get('srsa_axial_clearance_ratio_range', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_BASE", cfg.get('srsa_axial_clearance_base', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_ANCHOR_MULTIPLIERS", cfg.get('srsa_axial_clearance_anchor_multipliers', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_ANCHORS", cfg.get('srsa_axial_clearance_anchors', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_JITTER_RATIO", cfg.get('srsa_axial_clearance_jitter_ratio', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_ANCHOR_WEIGHTS", cfg.get('srsa_axial_clearance_anchor_weights', None))
+	_set_env_if_value("SRSA_AXIAL_DEPTH_RANGE", cfg.get('srsa_axial_depth_range', None))
+	_set_env_if_value("SRSA_AXIAL_TARGET_DEPTH_RANGE", cfg.get('srsa_axial_target_depth_range', None))
+	_set_env_if_value("SRSA_AXIAL_DEPTH_BASE", cfg.get('srsa_axial_depth_base', None))
+	_set_env_if_value("SRSA_AXIAL_DEPTH_ANCHOR_MULTIPLIERS", cfg.get('srsa_axial_depth_anchor_multipliers', None))
+	_set_env_if_value("SRSA_AXIAL_DEPTH_ANCHORS", cfg.get('srsa_axial_depth_anchors', None))
+	_set_env_if_value("SRSA_AXIAL_DEPTH_JITTER_RATIO", cfg.get('srsa_axial_depth_jitter_ratio', None))
+	_set_env_if_value("SRSA_AXIAL_DEPTH_ANCHOR_WEIGHTS", cfg.get('srsa_axial_depth_anchor_weights', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATE_MULTIPLIERS", cfg.get('srsa_axial_clearance_depth_template_multipliers', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATES", cfg.get('srsa_axial_clearance_depth_templates', None))
+	_set_env_if_value("SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATE_WEIGHTS", cfg.get('srsa_axial_clearance_depth_template_weights', None))
+	_set_env_if_value("SRSA_AXIAL_INIT_ERROR_XY_RANGE", cfg.get('srsa_axial_init_error_xy_range', None))
+	_set_env_if_value("SRSA_AXIAL_INIT_ERROR_Z_RANGE", cfg.get('srsa_axial_init_error_z_range', None))
+	_set_env_if_value("SRSA_AXIAL_INIT_ERROR_YAW_RANGE", cfg.get('srsa_axial_init_error_yaw_range', None))
+	_set_env_if_value("SRSA_AXIAL_VISUAL_NOISE_XY_RANGE", cfg.get('srsa_axial_visual_noise_xy_range', None))
+	_set_env_if_value("SRSA_AXIAL_VISUAL_NOISE_Z_RANGE", cfg.get('srsa_axial_visual_noise_z_range', None))
+	_set_env_if_value("SRSA_AXIAL_YAW_REQUIREMENT", cfg.get('srsa_axial_yaw_requirement', None))
+	_set_env_if_value("SRSA_AXIAL_REFERENCE_RADIUS", cfg.get('srsa_axial_reference_radius', cfg.get('axial_reference_radius', None)))
+	_set_env_if_value("SRSA_AXIAL_REFERENCE_DEPTH", cfg.get('srsa_axial_reference_depth', cfg.get('axial_reference_depth', None)))
 	_set_env_if_value("SRSA_IF_SBC", cfg.get('srsa_if_sbc', None))
 	_set_env_if_value("SRSA_IF_LOGGING_EVAL", cfg.get('srsa_if_logging_eval', False))
 	eval_filename = cfg.get('srsa_eval_filename', None)
@@ -352,7 +421,7 @@ class IsaacLabWrapper(gym.Wrapper):
 			canonical_dim = 14
 			if cfg.get('isaaclab_canonical_append_force', False) and hasattr(self.env.unwrapped, 'flange_force_obs'):
 				canonical_dim += int(self.env.unwrapped.flange_force_obs.shape[-1])
-			task_params = getattr(self.env.unwrapped, 'current_task_param_tensor', None)
+			task_params = _get_srsa_task_param_obs_tensor(self.env.unwrapped, cfg)
 			if cfg.get('isaaclab_canonical_append_task_params', False) and task_params is not None:
 				canonical_dim += int(task_params.shape[-1])
 			self.observation_space = gym.spaces.Box(
@@ -383,6 +452,7 @@ class IsaacLabWrapper(gym.Wrapper):
 				f"canonical={self._use_canonical_obs} "
 				f"append_force={cfg.get('isaaclab_canonical_append_force', False)} "
 				f"append_task_params={cfg.get('isaaclab_canonical_append_task_params', False)} "
+				f"task_param_mode={cfg.get('srsa_task_param_obs_mode', 'task_vec')} "
 				f"visual_noise={cfg.get('isaaclab_canonical_use_visual_noise', False)}"
 			)
 
@@ -419,7 +489,7 @@ class IsaacLabWrapper(gym.Wrapper):
 			force_dim = int(force.shape[-1]) if torch.is_tensor(force) and force.ndim > 0 else max(0, min(3, obs_dim - offset))
 			parts.append(("flange_force_obs", force_dim))
 		if self.cfg.get('isaaclab_canonical_append_task_params', False):
-			task_params = getattr(env, 'current_task_param_tensor', None)
+			task_params = _get_srsa_task_param_obs_tensor(env, self.cfg)
 			task_dim = int(task_params.shape[-1]) if torch.is_tensor(task_params) and task_params.ndim > 0 else max(0, obs_dim - offset)
 			parts.append(("task_params", task_dim))
 		for name, dim in parts:
@@ -439,6 +509,7 @@ class IsaacLabWrapper(gym.Wrapper):
 			("runtime.flange_force_socket", "flange_force_socket"),
 			("runtime.flange_force_norm", "flange_force_norm"),
 			("runtime.flange_force_flag", "flange_force_flag"),
+			("runtime.task_vec", "current_task_vec"),
 			("runtime.task_param_tensor", "current_task_param_tensor"),
 			("runtime.vision_noise_world", "_vision_noise_world"),
 			("runtime.vision_noise_episode_local", "_vision_noise_episode_local"),
@@ -586,18 +657,24 @@ class IsaacLabWrapper(gym.Wrapper):
 def _maybe_update_axial_task_vector_from_env(cfg, env):
 	if cfg.get('task_conditioning', 'axial_params') != 'axial_params':
 		return
-	current_task_params = getattr(env.unwrapped, 'current_task_params', None)
-	if not current_task_params:
-		return
-	try:
-		from config import make_axial_task_vec
-	except ImportError:
-		return
-	task_vec = make_axial_task_vec(cfg, current_task_params)
+	current_task_vec = _get_srsa_current_task_vec(env.unwrapped)
+	if current_task_vec is not None:
+		task_vec = current_task_vec.reshape(-1, current_task_vec.shape[-1])[0].detach().cpu().tolist()
+	else:
+		current_task_params = getattr(env.unwrapped, 'current_task_params', None)
+		if not current_task_params:
+			return
+		try:
+			from config import make_axial_task_vec
+		except ImportError:
+			return
+		task_vec = make_axial_task_vec(cfg, current_task_params)
 	if not getattr(cfg, 'task_vectors', None):
 		cfg.task_vectors = [task_vec]
 	elif len(cfg.task_vectors) == 1:
 		cfg.task_vectors[0] = task_vec
+	elif int(getattr(cfg, 'num_global_tasks', 1)) == 1:
+		cfg.task_vectors = [task_vec for _ in cfg.task_vectors]
 	else:
 		return
 	if int(getattr(cfg, 'rank', 0)) == 0:

@@ -112,13 +112,26 @@ def gumbel_softmax_sample(p, temperature=1.0, dim=1):
 def masked_bc_per_timestep(pi_action, action, task, action_masks):
 	"""
 	pi_action, action: (T, B, A)  # here T = T_actions (i.e., 3)
-	task: (1, B) int64
+	task: (1, B) int64 or (1, B, task_vec_dim) float
 	action_masks: (num_tasks, A) in {0,1}
 	returns: (T, B) = mean MSE over valid dims per sample, per timestep
 	"""
 	T, B, A = action.shape
 
-	mask_ba = action_masks.index_select(0, task[0]).to(dtype=action.dtype, device=action.device)  # (B, A)
+	if task is None:
+		task_ids = torch.zeros(B, dtype=torch.long, device=action.device)
+	elif torch.is_tensor(task) and task.is_floating_point() and task.ndim > 0 and task.shape[-1] == 6:
+		task_ids = torch.zeros(task.shape[:-1], dtype=torch.long, device=action.device)
+	else:
+		task_ids = task.to(action.device, non_blocking=True).long()
+	if task_ids.ndim > 1:
+		task_ids = task_ids.reshape(-1, B)[0]
+	elif task_ids.ndim == 0:
+		task_ids = task_ids.view(1)
+	if task_ids.numel() == 1 and B > 1:
+		task_ids = task_ids.repeat(B)
+
+	mask_ba = action_masks.index_select(0, task_ids.reshape(B)).to(dtype=action.dtype, device=action.device)  # (B, A)
 	se = F.mse_loss(pi_action, action, reduction='none')  # (T, B, A)
 
 	num = (se * mask_ba.unsqueeze(0)).sum(dim=2)         # (T, B)

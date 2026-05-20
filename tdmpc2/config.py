@@ -49,6 +49,8 @@ class Config:
 	isaaclab_debug_io_steps: int = 3
 	isaaclab_debug_io_every: int = 1
 	srsa_dir: str = "/home/gpuserver/hx/github/srsa"
+	srsa_sparse_reward: bool = False
+	srsa_sil: bool = False
 	srsa_task_family_name: Optional[str] = None
 	srsa_task_family_id: Optional[int] = None
 	srsa_plug_diameter: Optional[float] = None
@@ -58,6 +60,38 @@ class Config:
 	srsa_insertion_depth: Optional[float] = None
 	srsa_success_pos_tol: Optional[float] = None
 	srsa_task_param_obs: bool = False
+	srsa_task_param_obs_mode: str = "task_vec"
+	srsa_newt_obs: bool = False
+	srsa_enable_axial_task_param_sampler: bool = True
+	srsa_use_runtime_task_vec: bool = True
+	srsa_axial_task_type_id: Optional[int] = None
+	srsa_axial_scale_range: Any = None
+	srsa_axial_fixed_plug_scale: Optional[bool] = None
+	srsa_axial_clearance_range: Any = None
+	srsa_axial_clearance_ratio_range: Any = None
+	srsa_axial_clearance_base: Optional[float] = None
+	srsa_axial_clearance_anchor_multipliers: Any = None
+	srsa_axial_clearance_anchors: Any = None
+	srsa_axial_clearance_jitter_ratio: Optional[float] = None
+	srsa_axial_clearance_anchor_weights: Any = None
+	srsa_axial_depth_range: Any = None
+	srsa_axial_target_depth_range: Any = None
+	srsa_axial_depth_base: Optional[float] = None
+	srsa_axial_depth_anchor_multipliers: Any = None
+	srsa_axial_depth_anchors: Any = None
+	srsa_axial_depth_jitter_ratio: Optional[float] = None
+	srsa_axial_depth_anchor_weights: Any = None
+	srsa_axial_clearance_depth_template_multipliers: Any = None
+	srsa_axial_clearance_depth_templates: Any = None
+	srsa_axial_clearance_depth_template_weights: Any = None
+	srsa_axial_init_error_xy_range: Any = None
+	srsa_axial_init_error_z_range: Any = None
+	srsa_axial_init_error_yaw_range: Any = None
+	srsa_axial_visual_noise_xy_range: Any = None
+	srsa_axial_visual_noise_z_range: Any = None
+	srsa_axial_yaw_requirement: Optional[bool] = None
+	srsa_axial_reference_radius: Optional[float] = None
+	srsa_axial_reference_depth: Optional[float] = None
 	srsa_if_sbc: Optional[bool] = None
 	srsa_if_logging_eval: bool = False
 	srsa_eval_filename: Optional[str] = None
@@ -96,9 +130,37 @@ class Config:
 	offline_filter_mode: str = "all"
 	offline_bc_steps: int = 50_000
 	offline_wm_steps: int = 100_000
+	offline_rl_steps: int = 0
 	offline_log_freq: int = 200
 	offline_save_freq: int = 5_000
 	offline_eval_freq: int = 0
+
+	# policy rollout collection for offline RL
+	collect_assembly_ids: Any = None
+	collect_source_assembly_id: Optional[str] = "00186"
+	collect_exclude_source_assembly: bool = True
+	collect_episodes_per_task: int = 100
+	collect_output_dir: Optional[str] = None
+	collect_manifest_fp: Optional[str] = None
+	collect_overwrite: bool = False
+	collect_mpc: Optional[bool] = None
+	collect_max_env_steps: Optional[int] = None
+	collect_match_checkpoint: bool = True
+	collect_expected_obs_dim: Optional[int] = None
+	collect_spawn_per_assembly: bool = True
+	collect_worker_assembly_id: Optional[str] = None
+
+	# batch evaluation
+	batch_eval_assembly_ids: Any = None
+	batch_eval_episodes_per_task: int = 100
+	batch_eval_output_dir: Optional[str] = None
+	batch_eval_summary_fp: Optional[str] = None
+	batch_eval_spawn_per_assembly: bool = True
+	batch_eval_worker_assembly_id: Optional[str] = None
+	batch_eval_worker_task_id: Optional[int] = None
+	batch_eval_overwrite: bool = False
+	batch_eval_mpc: Optional[bool] = None
+	batch_eval_max_env_steps: Optional[int] = None
 
 	# training
 	steps: int = 100_000_000
@@ -360,6 +422,7 @@ def make_axial_task_vec(cfg, item=None):
 	The vector intentionally excludes initial pose error, visual noise, task_id, and assembly_id.
 	"""
 	explicit = _first_value(
+		_get_value(item, "task_vec", None),
 		_get_value(item, "task_vec_6", None),
 		_get_value(item, "axial_task_vec", None),
 		_get_value(item, "axial_task_vec_6", None),
@@ -506,7 +569,10 @@ def parse_cfg(cfg):
 		if cfg.task == 'soup':
 			cfg.task = 'isaaclab-srsa-assembly'
 		if cfg.isaaclab_env_id == 'Isaac-AutoMate-Assembly-Direct-v0':
-			cfg.isaaclab_env_id = 'Assembly-Direct-v0'
+			if cfg.get('srsa_sparse_reward', False):
+				cfg.isaaclab_env_id = 'Assembly-Sparse-Sil-v0' if cfg.get('srsa_sil', False) else 'Assembly-Sparse-v0'
+			else:
+				cfg.isaaclab_env_id = 'Assembly-Direct-Sil-v0' if cfg.get('srsa_sil', False) else 'Assembly-Direct-v0'
 		if cfg.isaaclab_task_package is None:
 			cfg.isaaclab_task_package = 'SRSA.tasks'
 

@@ -1,0 +1,106 @@
+{
+  "manifest": "/home/gpuserver/hx/github/Newt/data/offline_manifest_policy_rollouts_from_00186.json",
+  "output": "/home/gpuserver/hx/github/Newt/data/offline_policy_rollouts_from_00186_compact.pt",
+  "fields": [
+    "action",
+    "done",
+    "episode",
+    "episode_failure_final",
+    "episode_return_final",
+    "episode_return_running",
+    "episode_success_final",
+    "next_obs",
+    "obs",
+    "reward",
+    "step_id",
+    "success_episode",
+    "task",
+    "terminal_failure",
+    "terminal_success",
+    "terminated",
+    "truncated"
+  ],
+  "num_tasks": 5,
+  "task_map": [
+    {
+      "task_id": 0,
+      "task_name": "isaaclab-srsa-assembly-00141",
+      "assembly_id": "00141",
+      "source_fp": "/home/gpuserver/hx/github/Newt/logs/isaaclab-srsa-assembly/1/srsa_00186_direct_eval_collect/20260520_164600_asm-00186/data/policy_rollouts_from_00186/00141/policy_eval_rollouts.pt",
+      "num_transitions": 37000,
+      "num_episodes": 500,
+      "action_dim": 6,
+      "obs_shape": [
+        24
+      ]
+    },
+    {
+      "task_id": 1,
+      "task_name": "isaaclab-srsa-assembly-00211",
+      "assembly_id": "00211",
+      "source_fp": "/home/gpuserver/hx/github/Newt/logs/isaaclab-srsa-assembly/1/srsa_00186_direct_eval_collect/20260520_200926_asm-00186/data/policy_rollouts_from_00186/00211/policy_eval_rollouts.pt",
+      "num_transitions": 37000,
+      "num_episodes": 500,
+      "action_dim": 6,
+      "obs_shape": [
+        24
+      ]
+    },
+    {
+      "task_id": 2,
+      "task_name": "isaaclab-srsa-assembly-00426",
+      "assembly_id": "00426",
+      "source_fp": "/home/gpuserver/hx/github/Newt/logs/isaaclab-srsa-assembly/1/srsa_00186_direct_eval_collect/20260520_200926_asm-00186/data/policy_rollouts_from_00186/00426/policy_eval_rollouts.pt",
+      "num_transitions": 37000,
+      "num_episodes": 500,
+      "action_dim": 6,
+      "obs_shape": [
+        24
+      ]
+    },
+    {
+      "task_id": 3,
+      "task_name": "isaaclab-srsa-assembly-00638",
+      "assembly_id": "00638",
+      "source_fp": "/home/gpuserver/hx/github/Newt/logs/isaaclab-srsa-assembly/1/srsa_00186_direct_eval_collect/20260520_200926_asm-00186/data/policy_rollouts_from_00186/00638/policy_eval_rollouts.pt",
+      "num_transitions": 37000,
+      "num_episodes": 500,
+      "action_dim": 6,
+      "obs_shape": [
+        24
+      ]
+    },
+    {
+      "task_id": 4,
+      "task_name": "isaaclab-srsa-assembly-00783",
+      "assembly_id": "00783",
+      "source_fp": "/home/gpuserver/hx/github/Newt/logs/isaaclab-srsa-assembly/1/srsa_00186_direct_eval_collect/20260520_200926_asm-00186/data/policy_rollouts_from_00186/00783/policy_eval_rollouts.pt",
+      "num_transitions": 37000,
+      "num_episodes": 500,
+      "action_dim": 6,
+      "obs_shape": [
+        24
+      ]
+    }
+  ],
+  "num_transitions": 185000,
+  "obs_shape": [
+    24
+  ],
+  "action_shape": [
+    6
+  ],
+  "reward_shape": [],
+  "num_episodes": 2500,
+  "num_done": 2500,
+  "obs_dtype": "torch.float32",
+  "action_dtype": "torch.float32",
+  "reward_dtype": "torch.float32",
+  "final_success_mean": 0.532800018787384,
+  "episode_failure_final_min": 0.0,
+  "episode_failure_final_max": 1.0,
+  "terminal_failure_count": 1168,
+  "terminal_success_count": 1332,
+  "episode_return_final_min": 211.1818389892578,
+  "episode_return_final_max": 618.2952270507812
+}

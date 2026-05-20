@@ -24,19 +24,22 @@ cd /home/gpuserver/hx/github/Newt
 /home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/train.py \
   isaaclab_backend=srsa \
   task=isaaclab-srsa-assembly \
-  assembly_id=00186 \
+  assembly_id=01125 \
   srsa_dir=/home/gpuserver/hx/github/srsa \
-  num_envs=200 \
+  srsa_sparse_reward=true \
+  srsa_if_sbc=false \
+  num_envs=300 \
   gpu_id=0 \
   multiproc=true \
   num_gpus=2 \
-  steps=10000000 \
+  steps=6000000 \
   model_size=S \
   batch_size=1024 \
-  buffer_size=10000000 \
+  buffer_size=1000000 \
   horizon=3 \
   utd=0.075 \
   use_demos=false \
+  compile=true \
   enable_wandb=false \
   save_agent=true \
   save_best=true \
@@ -46,6 +49,20 @@ cd /home/gpuserver/hx/github/Newt
   isaaclab_use_canonical_obs=true \
   isaaclab_disable_imitation_reward=true \
   srsa_task_family_name=normal_fit \
+  srsa_task_param_obs=false \
+  srsa_task_param_obs_mode=task_vec \
+  srsa_enable_axial_task_param_sampler=true \
+  srsa_axial_fixed_plug_scale=true \
+  srsa_axial_clearance_base=0.000114 \
+  'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
+  srsa_axial_clearance_jitter_ratio=0.10 \
+  srsa_axial_depth_base=0.015 \
+  srsa_axial_depth_jitter_ratio=0.10 \
+  'srsa_axial_init_error_xy_range="0.009,0.0010"' \
+  'srsa_axial_init_error_z_range="0.0010,0.0020"' \
+  'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.001"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.0005"' \
   srsa_enable_flange_force_sensor=true \
   isaaclab_canonical_append_force=true \
   isaaclab_canonical_append_task_params=false \
@@ -67,6 +84,8 @@ cd /home/gpuserver/hx/github/Newt
   isaaclab_backend=srsa \
   task=isaaclab-srsa-assembly \
   assembly_id=00783 \
+  srsa_sparse_reward=true \
+  srsa_if_sbc=false \
   num_envs=1 \
   steps=1 \
   eval_episodes=1 \
@@ -84,6 +103,20 @@ cd /home/gpuserver/hx/github/Newt
   isaaclab_use_canonical_obs=true \
   isaaclab_disable_imitation_reward=true \
   srsa_task_family_name=normal_fit \
+  srsa_task_param_obs=false \
+  srsa_task_param_obs_mode=task_vec \
+  srsa_enable_axial_task_param_sampler=true \
+  srsa_axial_fixed_plug_scale=true \
+  srsa_axial_clearance_base=0.000114 \
+  'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
+  srsa_axial_clearance_jitter_ratio=0.10 \
+  srsa_axial_depth_base=0.015 \
+  srsa_axial_depth_jitter_ratio=0.10 \
+  'srsa_axial_init_error_xy_range="0.005,0.0010"' \
+  'srsa_axial_init_error_z_range="0.00,0.005"' \
+  'srsa_axial_init_error_yaw_range="-0.15,0.15"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.001"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.0005"' \
   srsa_enable_flange_force_sensor=true \
   isaaclab_canonical_append_force=true \
   isaaclab_canonical_append_task_params=false \
@@ -146,6 +179,14 @@ Newt 侧的任务名。用于日志目录和 synthetic task metadata。
 
 SRSA 仓库路径。wrapper 会把 `source/SRSA` 和 `rl_games_sil` 加进 `sys.path`。
 
+`srsa_sparse_reward=true`
+
+对应 SRSA launcher 的 `--sparse`。默认会把 SRSA env id 从 `Assembly-Direct-v0` 切到 `Assembly-Sparse-v0`。
+
+`srsa_if_sbc=false`
+
+对应 SRSA launcher 的 `--no_sbc`，关闭 SBC curriculum。
+
 `num_envs`
 
 并行环境数量。训练吞吐主要由它决定。例如 `num_envs=200` 时，一轮 74 step episode 会推进 `14800` 个 global steps。
@@ -198,7 +239,10 @@ SRSA 仓库路径。wrapper 会把 `source/SRSA` 和 `rl_games_sil` 加进 `sys.
 
 `isaaclab_canonical_append_task_params=true`
 
-仅建议用于 debug 或 ablation。打开后 observation 会额外拼 SRSA 的 9 维 task param tensor。
+仅建议用于 debug 或 ablation。打开后 observation 会按 `srsa_task_param_obs_mode` 额外拼任务参数：
+
+- `task_vec`: 6 维 Newt/SRSA 共享 task vector
+- `legacy`: 9 维 legacy task param tensor
 
 ### 视觉误差
 
@@ -266,7 +310,37 @@ SRSA 内置 fit family。当前可用常见值：
 - `tight_fit`
 - `baseline`
 
-wrapper 会从 SRSA runtime 的 `current_task_params` 生成当前任务的 `task_vec_6`。
+wrapper 会优先读取 SRSA runtime 的 `current_task_vec`；如果旧环境没有该字段，再从 `current_task_params` 生成当前任务的 `task_vec_6`。在线训练时 replay buffer 也会保存每个 episode 实际采样到的 `current_task_vec`，因此 reset-time sampler 产生的连续任务参数会真正进入 AxialTaskEncoder。
+
+### SRSA reset-time sampler
+
+新 SRSA 训练参数通过 `srsa_*` Hydra 参数透传为 `SRSA_*` 环境变量。当前推荐配置与 `/home/gpuserver/hx/github/srsa/train.sh` 对齐：
+
+```bash
+srsa_enable_axial_task_param_sampler=true
+srsa_task_param_obs_mode=task_vec
+srsa_axial_fixed_plug_scale=true
+srsa_axial_clearance_base=0.000114
+'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"'
+srsa_axial_clearance_jitter_ratio=0.10
+srsa_axial_depth_base=0.015
+srsa_axial_depth_jitter_ratio=0.10
+'srsa_axial_init_error_xy_range="0.005,0.0010"'
+'srsa_axial_init_error_z_range="0.00,0.005"'
+'srsa_axial_init_error_yaw_range="-0.15,0.15"'
+'srsa_axial_visual_noise_xy_range="0.0,0.001"'
+'srsa_axial_visual_noise_z_range="0.0,0.0005"'
+```
+
+联合模板格式是：
+
+```text
+"gamma_c:gamma_H;gamma_c:gamma_H;..."
+```
+
+其中 `gamma_c` 乘到 `srsa_axial_clearance_base`，`gamma_H` 乘到 `srsa_axial_depth_base`。jitter 会在每个模板附近做连续扰动。
+
+带逗号或分号的 Hydra override 推荐用上面这种单引号包住整段、双引号包住值的写法，避免被 Hydra 解析成 sweep。
 
 也可以显式覆盖几何参数：
 
@@ -414,6 +488,165 @@ logs/<task>/<seed>/<exp_name>/<run_id>/
 ```
 
 manifest 中如果提供 `task_vec_6` 或几何字段，会用于构造每个 task 的 axial task vector。
+
+## 用 00186 checkpoint 迁移测试其他 assembly id 并采集 offline RL 数据
+
+新增入口：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/collect_eval_rollouts.py \
+  checkpoint=logs/isaaclab-automate-assembly/1/default/20260516_225547_asm-00186/models/best.pt \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  num_envs=200 \
+  gpu_id=0 \
+  model_size=L \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=false \
+  isaaclab_disable_imitation_reward=true \
+  srsa_task_family_name=normal_fit \
+  srsa_enable_flange_force_sensor=false \
+  isaaclab_canonical_append_force=false \
+  isaaclab_canonical_append_task_params=false \
+  isaaclab_canonical_use_visual_noise=false \
+  task_conditioning=id_embedding \
+  collect_assembly_ids="[00141,00211,00426,00638,00783]" \
+  collect_episodes_per_task=500 \
+  collect_source_assembly_id=00186 \
+  collect_match_checkpoint=true \
+  collect_spawn_per_assembly=true \
+  collect_overwrite=true \
+  enable_wandb=false \
+  exp_name=srsa_00186_direct_eval_collect
+```
+
+如果 checkpoint 是旧的 `isaaclab-automate-assembly` 模型，脚本会在
+`collect_match_checkpoint=true` 时自动从 checkpoint 推断并覆盖：
+
+- `model_size=L`
+- `task_conditioning=id_embedding`
+- `isaaclab_use_canonical_obs=false`
+- checkpoint 需要的 raw policy obs 维度，当前为 `24D`
+
+多目标 id 采集默认使用 `collect_spawn_per_assembly=true`，每个
+`assembly_id` 会单独启动一个 Python/IsaacSim 进程，避免 IsaacSim 在同一进程里反复销毁和重建环境时卡住。
+
+也可以直接从已有 manifest 读取目标 id；脚本会自动排除 `collect_source_assembly_id=00186`：
+
+```bash
+offline_manifest_fp=data/offline_manifest_rollout_out.json
+```
+
+每个目标 id 会保存：
+
+```text
+logs/<task>/<seed>/<exp_name>/<run_id>/data/policy_rollouts_from_00186/<assembly_id>/policy_eval_rollouts.pt
+logs/<task>/<seed>/<exp_name>/<run_id>/data/policy_rollouts_from_00186/offline_manifest_eval_rollouts.json
+```
+
+下一阶段 offline RL 可以直接使用采集出的 manifest：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/offline_train.py \
+  offline_manifest_fp=/path/to/offline_manifest_eval_rollouts.json \
+  offline_export_overwrite=true \
+  task=isaaclab-srsa-assembly \
+  task_conditioning=axial_params \
+  model_size=S \
+  batch_size=1024 \
+  horizon=3 \
+  enable_wandb=false \
+  exp_name=offline_from_00186_policy_rollouts
+```
+
+如果要用当前采集数据继续微调旧 `isaaclab-automate-assembly` Newt checkpoint，使用：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/offline_train.py \
+  checkpoint=logs/isaaclab-automate-assembly/1/default/20260516_225547_asm-00186/models/best.pt \
+  offline_manifest_fp=data/offline_manifest_policy_rollouts_from_00186.json \
+  offline_export_fp=data/offline_policy_rollouts_from_00186_compact.pt \
+  offline_export_overwrite=false \
+  task=isaaclab-srsa-assembly \
+  model_size=L \
+  task_conditioning=id_embedding \
+  learn_task_emb=true \
+  batch_size=512 \
+  horizon=3 \
+  compile=false \
+  gpu_id=0 \
+  offline_gpu_id=0 \
+  offline_bc_steps=10000 \
+  offline_wm_steps=50000 \
+  offline_rl_steps=50000 \
+  offline_log_freq=200 \
+  offline_save_freq=5000 \
+  enable_wandb=false \
+  save_agent=true \
+  exp_name=offline_rl_from_00186_policy_rollouts
+```
+
+这个流程会从旧 checkpoint 继续：
+
+- `bc`: 用采集动作做行为克隆 warm-up
+- `wm`: 更新 latent dynamics / reward / Q，同时保留 BC prior
+- `rl`: 打开 Max-Q policy update，进行离线 RL 微调
+
+当前已合成的数据入口：
+
+```text
+data/offline_manifest_policy_rollouts_from_00186.json
+data/offline_policy_rollouts_from_00186_compact.pt
+```
+
+离线 RL 微调完成后，对 manifest 中不同任务批量测试：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/batch_eval_tasks.py \
+  checkpoint=logs/isaaclab-srsa-assembly/1/offline_rl_from_00186_policy_rollouts/<run_id>/models/final.pt \
+  offline_manifest_fp=data/offline_manifest_policy_rollouts_from_00186.json \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  num_envs=200 \
+  gpu_id=0 \
+  model_size=L \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=false \
+  isaaclab_disable_imitation_reward=true \
+  srsa_task_family_name=normal_fit \
+  srsa_enable_flange_force_sensor=false \
+  isaaclab_canonical_append_force=false \
+  isaaclab_canonical_append_task_params=false \
+  isaaclab_canonical_use_visual_noise=false \
+  task_conditioning=id_embedding \
+  learn_task_emb=true \
+  batch_eval_episodes_per_task=100 \
+  batch_eval_spawn_per_assembly=true \
+  batch_eval_overwrite=true \
+  enable_wandb=false \
+  exp_name=batch_eval_offline_rl_from_00186
+```
+
+如果只想测其中几个任务，加：
+
+```bash
+batch_eval_assembly_ids="[00141,00211]"
+```
+
+结果会保存为：
+
+```text
+logs/isaaclab-srsa-assembly/1/batch_eval_offline_rl_from_00186/<run_id>/batch_eval/<checkpoint_name>/batch_eval_summary.json
+logs/isaaclab-srsa-assembly/1/batch_eval_offline_rl_from_00186/<run_id>/batch_eval/<checkpoint_name>/batch_eval_summary.csv
+```
 
 ## 常见现象
 

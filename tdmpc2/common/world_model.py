@@ -161,15 +161,51 @@ class WorldModel(nn.Module):
 				f"expected broadcastable to {(*x_batch_shape, context_dim)}."
 			)
 
+	def _is_task_vec(self, task):
+		return (
+			task is not None and
+			torch.is_tensor(task) and
+			task.is_floating_point() and
+			task.ndim > 0 and
+			task.shape[-1] == self.cfg.axial_task_vec_dim
+		)
+
+	def task_ids_for_shape(self, task, batch_shape, device=None):
+		device = device or (task.device if torch.is_tensor(task) else self._action_masks.device)
+		batch_shape = tuple(int(dim) for dim in batch_shape)
+		if self._is_task_vec(task):
+			task_ids = torch.zeros(task.shape[:-1], dtype=torch.long, device=device)
+		elif task is None:
+			if self._action_masks.shape[0] == 1:
+				return torch.zeros(batch_shape, device=device, dtype=torch.long)
+			raise ValueError("Task ids are required when using multi-task action metadata.")
+		else:
+			if isinstance(task, int):
+				task = torch.tensor([task], device=device)
+			task_ids = task.to(device, non_blocking=True).long()
+		if task_ids.ndim == 0:
+			task_ids = task_ids.view(1)
+		if task_ids.ndim == 1 and len(batch_shape) > 1:
+			if task_ids.shape[0] == batch_shape[0]:
+				task_ids = task_ids.view(task_ids.shape[0], *([1] * (len(batch_shape) - 1)))
+			elif task_ids.shape[0] == batch_shape[-1]:
+				task_ids = task_ids.view(*([1] * (len(batch_shape) - 1)), task_ids.shape[0])
+		while task_ids.ndim < len(batch_shape):
+			task_ids = task_ids.unsqueeze(-1)
+		try:
+			return task_ids.expand(*batch_shape).long()
+		except RuntimeError:
+			if task_ids.numel() == int(torch.tensor(batch_shape).prod().item()):
+				return task_ids.reshape(*batch_shape).long()
+			raise
+
+	def action_mask(self, task, x):
+		task_ids = self.task_ids_for_shape(task, x.shape[:-1], device=x.device)
+		return self._action_masks[task_ids]
+
 	def task_context(self, x, task):
 		if self._task_encoder is not None:
-			if (
-				task is not None and
-				torch.is_tensor(task) and
-				task.is_floating_point() and
-				task.ndim > 0 and
-				task.shape[-1] == self.cfg.axial_task_vec_dim
-			):
+			if self._is_task_vec(task):
 				task_vec = task.to(device=x.device, dtype=torch.float32, non_blocking=True)
 			else:
 				task_ids = self._broadcast_task_ids(task, x)
@@ -242,7 +278,7 @@ class WorldModel(nn.Module):
 		log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
 		eps = torch.randn_like(mean)
 
-		action_mask = self._action_masks[task]  # shape: (*batch_dims, action_dim)
+		action_mask = self.action_mask(task, mean)  # shape: (*batch_dims, action_dim)
 		while action_mask.ndim < mean.ndim:
 			action_mask = action_mask.unsqueeze(-2)  # Add sequence dim (or other mid-batch dim)
 		action_mask = action_mask.expand_as(mean)  # Ensure shape matches mean

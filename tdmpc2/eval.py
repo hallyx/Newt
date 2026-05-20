@@ -70,7 +70,8 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 		while completed < local_target:
 			use_mpc = trainer._step > 0 or trainer.cfg.finetune
 			torch.compiler.cudagraph_mark_step_begin()
-			action, _ = trainer.agent(obs, t0=episode_len == 0, step=trainer._step, eval_mode=True, task=trainer._tasks, mpc=use_mpc)
+			model_tasks = trainer._model_tasks()
+			action, _ = trainer.agent(obs, t0=episode_len == 0, step=trainer._step, eval_mode=True, task=model_tasks, mpc=use_mpc)
 			if trainer.cfg.rank == 0:
 				env_index = int(trainer.cfg.get('eval_zmq_env_index', 0))
 				action_publisher.send_action(

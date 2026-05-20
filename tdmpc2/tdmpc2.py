@@ -67,6 +67,61 @@ class TDMPC2(torch.nn.Module):
 			self.mppi = self._mppi
 			self.loss_fn = self._loss_fn
 
+	def _is_task_vec(self, task):
+		return (
+			task is not None and
+			torch.is_tensor(task) and
+			task.is_floating_point() and
+			task.ndim > 0 and
+			task.shape[-1] == int(self.cfg.get('axial_task_vec_dim', 6))
+		)
+
+	def _task_ids_for_shape(self, task, batch_shape):
+		batch_shape = tuple(int(dim) for dim in batch_shape)
+		if self._is_task_vec(task):
+			task_ids = torch.zeros(task.shape[:-1], dtype=torch.long, device=self.device)
+		elif task is None:
+			if len(self.discount) != 1:
+				raise ValueError("Task ids are required when using multi-task discrete metadata.")
+			return torch.zeros(batch_shape, dtype=torch.long, device=self.device)
+		else:
+			if not torch.is_tensor(task):
+				task = torch.tensor([task], device=self.device)
+			task_ids = task.to(self.device, non_blocking=True).long()
+		if task_ids.ndim == 0:
+			task_ids = task_ids.view(1)
+		if task_ids.ndim == 1 and len(batch_shape) > 1:
+			if task_ids.shape[0] == batch_shape[0]:
+				task_ids = task_ids.view(task_ids.shape[0], *([1] * (len(batch_shape) - 1)))
+			elif task_ids.shape[0] == batch_shape[-1]:
+				task_ids = task_ids.view(*([1] * (len(batch_shape) - 1)), task_ids.shape[0])
+		while task_ids.ndim < len(batch_shape):
+			task_ids = task_ids.unsqueeze(-1)
+		try:
+			return task_ids.expand(*batch_shape).long()
+		except RuntimeError:
+			if task_ids.numel() == int(torch.tensor(batch_shape).prod().item()):
+				return task_ids.reshape(*batch_shape).long()
+			raise
+
+	def _discount_for(self, task, batch_shape):
+		task_ids = self._task_ids_for_shape(task, batch_shape)
+		return self.discount[task_ids].unsqueeze(-1)
+
+	def _action_mask_for(self, task, batch_shape):
+		task_ids = self._task_ids_for_shape(task, batch_shape)
+		return self.model._action_masks[task_ids]
+
+	def _repeat_task_for_trajs(self, task, repeats):
+		if task is None:
+			return None
+		if not torch.is_tensor(task):
+			task = torch.tensor([task], device=self.device)
+		task = task.to(self.device, non_blocking=True)
+		if self._is_task_vec(task):
+			return task.unsqueeze(1).repeat(1, repeats, 1).reshape(-1, task.shape[-1])
+		return task.unsqueeze(1).repeat(1, repeats).reshape(-1)
+
 	def save(self, fp):
 		"""
 		Save state dict of the agent to filepath.
@@ -178,7 +233,7 @@ class TDMPC2(torch.nn.Module):
 			reward = math.two_hot_inv(self.model.reward(z, actions[:, t], task), self.cfg)
 			z = self.model.next(z, actions[:, t], task)
 			G = G + discount * reward
-			discount_update = self.discount[task].view(-1, 1, 1)
+			discount_update = self._discount_for(task, z.shape[:-1])
 			discount = discount * discount_update
 		action, _ = self.model.pi(z, task)
 		value = self.model.Q(z, action, task, return_type='avg')
@@ -188,7 +243,7 @@ class TDMPC2(torch.nn.Module):
 	def _sample_pi_trajs(self, z, task=None):
 		pi_actions = torch.empty(self.cfg.num_envs, self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 		_z = z.unsqueeze(1).repeat(1, self.cfg.num_pi_trajs, 1).view(self.cfg.num_envs * self.cfg.num_pi_trajs, -1)
-		_task = task.unsqueeze(1).repeat(1, self.cfg.num_pi_trajs).view(self.cfg.num_envs * self.cfg.num_pi_trajs)
+		_task = self._repeat_task_for_trajs(task, self.cfg.num_pi_trajs)
 		for t in range(self.cfg.horizon - 1):
 			a, _ = self.model.pi(_z, _task)
 			pi_actions[:, t] = a.view(self.cfg.num_envs, self.cfg.num_pi_trajs, self.cfg.action_dim)
@@ -205,7 +260,7 @@ class TDMPC2(torch.nn.Module):
 		actions = torch.empty(self.cfg.num_envs, self.cfg.horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
 		if self.cfg.num_pi_trajs > 0:
 			actions[:, :, :self.cfg.num_pi_trajs] = pi_actions
-		action_mask = self.model._action_masks[task].unsqueeze(1).unsqueeze(1)
+		action_mask = self._action_mask_for(task, (self.cfg.num_envs,)).unsqueeze(1).unsqueeze(1)
 
 		# Iterate MPPI
 		for _ in range(self.cfg.iterations):
@@ -374,7 +429,7 @@ class TDMPC2(torch.nn.Module):
 			torch.Tensor: TD-target.
 		"""
 		action, _ = self.model.pi(next_z, task)
-		discount = self.discount[task].unsqueeze(-1)
+		discount = self._discount_for(task, next_z.shape[:-1])
 		return reward + discount * self.model.Q(next_z, action, task, return_type='min', target=True)
 
 	def _loss_fn(self, obs, action, reward, task=None):
