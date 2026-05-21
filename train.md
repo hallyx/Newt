@@ -35,7 +35,7 @@ cd /home/gpuserver/hx/github/Newt
   steps=6000000 \
   model_size=S \
   batch_size=1024 \
-  buffer_size=1000000 \
+  buffer_size=6000000 \
   horizon=3 \
   utd=0.075 \
   use_demos=false \

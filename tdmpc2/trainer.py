@@ -1,6 +1,7 @@
 import os
 import datetime
 from collections import defaultdict, OrderedDict
+from contextlib import nullcontext
 from time import time
 
 import torch
@@ -10,7 +11,6 @@ from tqdm import tqdm
 from tensordict.tensordict import TensorDict
 
 from common import barrier
-from zmq_action_publisher import make_eval_zmq_publisher
 
 
 def split_by_rank(global_list, rank, world_size):
@@ -155,13 +155,19 @@ class Trainer():
 			extra=f"start target_eps={self.cfg.eval_episodes} envs={self.cfg.num_envs} guard_steps={eval_guard_steps}",
 			force=True,
 		)
-		with make_eval_zmq_publisher(self.cfg) as action_publisher:
+		use_eval_zmq = bool(self.cfg.get('eval_zmq_enabled', False)) and self.cfg.rank == 0
+		if use_eval_zmq:
+			from zmq_action_publisher import make_eval_zmq_publisher
+			publisher_context = make_eval_zmq_publisher(self.cfg)
+		else:
+			publisher_context = nullcontext(None)
+		with publisher_context as action_publisher:
 			while (episodes_completed < self.cfg.eval_episodes).any():
 				use_mpc = self._step > 0 or self.cfg.finetune
 				torch.compiler.cudagraph_mark_step_begin()
 				model_tasks = self._model_tasks()
 				action, _ = self.agent(obs, t0=episode_len==0, step=self._step, eval_mode=True, task=model_tasks, mpc=use_mpc)
-				if self.cfg.rank == 0:
+				if action_publisher is not None:
 					env_index = int(self.cfg.get('eval_zmq_env_index', 0))
 					action_publisher.send_action(
 						action,
@@ -176,7 +182,7 @@ class Trainer():
 				episode_reward += reward
 				episode_len += 1
 
-				if self.cfg.rank == 0:
+				if action_publisher is not None:
 					env_index = int(self.cfg.get('eval_zmq_env_index', 0))
 					if bool(done[env_index].item()):
 						action_publisher.send_done(

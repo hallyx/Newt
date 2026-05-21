@@ -29,7 +29,7 @@ class ZMQActionPublisher:
 		self.env_index = int(env_index)
 		self.period = 1.0 / float(rate) if rate and rate > 0.0 else 0.0
 		self.action_scale = float(action_scale)
-		self.send_done = bool(send_done)
+		self._send_done = bool(send_done)
 		self._context = None
 		self._socket = None
 		self._seq = 0
@@ -128,7 +128,7 @@ class ZMQActionPublisher:
 		self._seq += 1
 
 	def send_done(self, *, step: int, episode_step: Optional[int] = None, task_id: Optional[int] = None):
-		if not self.send_done:
+		if not self._send_done:
 			return
 		self.send_action(
 			[0.0] * 6,
