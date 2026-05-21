@@ -342,6 +342,50 @@ srsa_axial_depth_jitter_ratio=0.10
 
 带逗号或分号的 Hydra override 推荐用上面这种单引号包住整段、双引号包住值的写法，避免被 Hydra 解析成 sweep。
 
+### 用 assembly_id + 参数模板选择 SRSA 参数
+
+当前仓库提供了一个离散参数模板表：
+
+```text
+data/srsa_axial_task_templates.json
+```
+
+它不再把 `00186` 这种 SRSA id 写成模板 id，而是按两步解析：
+
+- `assembly_id=00186`: 从 SRSA mesh 几何 CSV 中选择对应 id 的几何 proxy。
+- `srsa_task_template_id=2`: 从模板表中选择 clearance/depth 方案。
+
+默认 mesh CSV：
+
+```text
+/home/gpuserver/hx/github/srsa/outputs/mesh_geometry_params/srsa_mesh_geometry_params.csv
+```
+
+单任务训练或 eval 可以这样选：
+
+```bash
+assembly_id=00186
+srsa_task_template_fp=data/srsa_axial_task_templates.json
+srsa_task_template_id=2
+```
+
+新命令里也可以写 `srsa_param_template_id=2`，它是 `srsa_task_template_id` 的别名，更不容易和 `assembly_id=00186` 混淆。
+
+如果模板来自采集脚本生成的 manifest，也可以继续使用：
+
+```bash
+offline_manifest_fp=/path/to/offline_manifest_eval_rollouts.json
+eval_task_id=1
+```
+
+解析配置时会把 `assembly_id + srsa_task_template_id` 展开为：
+
+- SRSA 运行时参数：`srsa_plug_diameter`、`srsa_hole_diameter`、`srsa_clearance`、`srsa_insertion_depth`
+- SRSA sampler 参数：固定 `scale / clearance / depth` ranges
+- 模型侧 `task_vec_6`
+
+采集脚本现在也会把运行时的 `srsa_params` 与 `srsa_sampler` 一起写入 manifest，后续仍可用 `offline_manifest_fp + eval_task_id` 复现实验参数。
+
 也可以显式覆盖几何参数：
 
 ```bash
@@ -605,6 +649,12 @@ data/offline_policy_rollouts_from_00186_compact.pt
 
 离线 RL 微调完成后，对 manifest 中不同任务批量测试：
 
+更完整的 eval 参数说明、仿真/真机命令和排查 checklist 见：
+
+```text
+docs/eval.md
+```
+
 ```bash
 /home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/batch_eval_tasks.py \
   checkpoint=logs/isaaclab-srsa-assembly/1/offline_rl_from_00186_policy_rollouts/<run_id>/models/final.pt \
@@ -640,6 +690,129 @@ data/offline_policy_rollouts_from_00186_compact.pt
 ```bash
 batch_eval_assembly_ids="[00141,00211]"
 ```
+
+单任务 eval 也可以直接用 manifest 中的 `task_id` 选择参数模板：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=/path/to/checkpoint.pt \
+  offline_manifest_fp=data/offline_manifest_policy_rollouts_from_00186.json \
+  eval_task_id=1 \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  task_conditioning=axial_params \
+  eval_task_template_exact=true
+```
+
+`eval_task_template_exact=true` 会把模板里的 `task_vec_6` 解码成固定的 SRSA sampler 参数，使模型侧
+`task_id -> task_vec_6` 和环境侧几何/深度参数保持一致。若要手动补充或覆盖，优先直接更新 manifest
+中的该 `task_id` 条目；临时测试可以传 `axial_task_vec_6="[...]"` 或对应的 `srsa_*` 参数。
+
+### 区分仿真 eval 和真机 eval
+
+仿真 eval 使用 Isaac/SRSA 环境闭环计算 observation、action、reward 和 success：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=/path/to/checkpoint.pt \
+  eval_mode=sim \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=00186 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=3 \
+  num_envs=1 \
+  eval_trials=10 \
+  model_size=S \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  task_conditioning=axial_params \
+  enable_wandb=false \
+  exp_name=eval_sim
+```
+
+真机 eval 现在有两种模式：
+
+- `eval_real_mode=closed_loop`: 真机侧发送最新 canonical obs，Newt 按 `17D/14D obs + task_vec_6 -> 6D action` 闭环推理并控制机械臂。
+- `eval_real_mode=stream`: 旧 smoke test。Newt 仍创建一个 SRSA/Isaac 环境用于产生策略输入，同时把选中 env 的 6D action 发送给真机侧 receiver。
+
+最新结构控制机械臂应优先用 `closed_loop`：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=/path/to/checkpoint.pt \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://<robot-host>:5556 \
+  eval_real_steps=74 \
+  eval_zmq_server=tcp://<robot-host>:5555 \
+  eval_zmq_rate=10 \
+  eval_zmq_action_scale=0.05 \
+  eval_zmq_action_frame=socket \
+  'eval_zmq_action_order="dx,dy,dz,droll,dpitch,dyaw"' \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=00186 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=2 \
+  num_envs=1 \
+  model_size=S \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  isaaclab_canonical_append_task_params=false \
+  task_conditioning=axial_params \
+  enable_wandb=false \
+  exp_name=eval_real_closed_loop
+```
+
+真机侧每步发送：
+
+```text
+{"obs": [17 floats], "task_vec_6": [6 floats], "episode_step": 0, "done": false}
+```
+
+`stream` 模式仍可用于低速检查 action 链路：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=/path/to/checkpoint.pt \
+  eval_mode=real \
+  eval_real_mode=stream \
+  eval_zmq_server=tcp://<robot-host>:5555 \
+  eval_zmq_env_index=0 \
+  eval_zmq_rate=10 \
+  eval_zmq_action_scale=0.25 \
+  eval_zmq_send_done=true \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=00186 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=3 \
+  num_envs=1 \
+  eval_trials=1 \
+  model_size=S \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  task_conditioning=axial_params \
+  enable_wandb=false \
+  exp_name=eval_real_zmq
+```
+
+真机首次测试建议把 `eval_zmq_action_scale` 设小，例如 `0.05` 或 `0.10`，确认方向、坐标系和限幅无误后再提高。机器人侧必须把 Newt 的 6D action 作为归一化末端增量处理，并保留速度、位移、力、碰撞和 workspace 限幅；真机 success 需要由真机侧日志或外部记录确认。
 
 结果会保存为：
 

@@ -448,6 +448,19 @@ def api_model_conversion(target_state_dict, source_state_dict):
 			pad_tensor = torch.zeros(source_state_dict[key].shape[0], pad, device=source_state_dict[key].device)
 			source_state_dict[key] = torch.cat([source_state_dict[key], pad_tensor], dim=1)
 
+	for key in ['_dynamics.0.weight', 'module._dynamics.0.weight']:
+		if key in target_state_dict and key in source_state_dict and \
+				target_state_dict[key].shape != source_state_dict[key].shape:
+			pad = target_state_dict[key].shape[1] - source_state_dict[key].shape[1]
+			if pad > 0 and target_state_dict[key].shape[0] == source_state_dict[key].shape[0]:
+				pad_tensor = torch.zeros(
+					source_state_dict[key].shape[0],
+					pad,
+					device=source_state_dict[key].device,
+					dtype=source_state_dict[key].dtype,
+				)
+				source_state_dict[key] = torch.cat([source_state_dict[key], pad_tensor], dim=1)
+
 	# rgb_encoder_key = '_encoder.rgb.0.weight'
 	# for rgb_key in [rgb_encoder_key, 'module.' + rgb_encoder_key]:
 	# 	if rgb_key in target_state_dict and rgb_key not in source_state_dict:
@@ -479,6 +492,9 @@ def api_model_conversion(target_state_dict, source_state_dict):
 
 	for key in target_state_dict.keys():
 		if key.endswith('_task_vecs') or '._task_encoder.' in key or key.startswith('_task_encoder.'):
+			if key not in source_state_dict or source_state_dict[key].shape != target_state_dict[key].shape:
+				source_state_dict[key] = target_state_dict[key]
+		if '._contact_encoder.' in key or key.startswith('_contact_encoder.'):
 			if key not in source_state_dict or source_state_dict[key].shape != target_state_dict[key].shape:
 				source_state_dict[key] = target_state_dict[key]
 

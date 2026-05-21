@@ -1,0 +1,71 @@
+{
+  "schema": "newt.srsa_mesh_param_templates.v1",
+  "description": "SRSA axial parameter templates. Select geometry by assembly_id, then select one clearance/depth template by srsa_param_template_id or srsa_task_template_id.",
+  "mesh_geometry": {
+    "fp": "outputs/mesh_geometry_params/srsa_mesh_geometry_params.csv",
+    "plug_diameter_column": "plug_xy_bbox_max",
+    "hole_diameter_column": "socket_xy_bbox_max",
+    "clearance_base_column": "plug_to_socket_surface_dist_p05",
+    "clearance_mode": "radial",
+    "depth_base_column": "plug_bbox_z",
+    "reference_radius_column": "plug_xy_radius_p95_from_centroid",
+    "reference_depth_column": "plug_bbox_z"
+  },
+  "parameter_templates": [
+    {
+      "template_id": 0,
+      "template_name": "c0.5-d0.5",
+      "clearance_multiplier": 0.5,
+      "depth_multiplier": 0.5,
+      "task_type_id": 0,
+      "task_family_name": "normal_fit",
+      "task_family_id": 1,
+      "success_pos_tol": 0.015,
+      "yaw_requirement": false
+    },
+    {
+      "template_id": 1,
+      "template_name": "c0.5-d1.0",
+      "clearance_multiplier": 0.5,
+      "depth_multiplier": 1.0,
+      "task_type_id": 0,
+      "task_family_name": "normal_fit",
+      "task_family_id": 1,
+      "success_pos_tol": 0.015,
+      "yaw_requirement": false
+    },
+    {
+      "template_id": 2,
+      "template_name": "c1.0-d1.0",
+      "clearance_multiplier": 1.0,
+      "depth_multiplier": 1.0,
+      "task_type_id": 0,
+      "task_family_name": "normal_fit",
+      "task_family_id": 1,
+      "success_pos_tol": 0.015,
+      "yaw_requirement": false
+    },
+    {
+      "template_id": 3,
+      "template_name": "c2.0-d1.5",
+      "clearance_multiplier": 2.0,
+      "depth_multiplier": 1.5,
+      "task_type_id": 0,
+      "task_family_name": "normal_fit",
+      "task_family_id": 1,
+      "success_pos_tol": 0.015,
+      "yaw_requirement": false
+    },
+    {
+      "template_id": 4,
+      "template_name": "c4.0-d2.0",
+      "clearance_multiplier": 4.0,
+      "depth_multiplier": 2.0,
+      "task_type_id": 0,
+      "task_family_name": "normal_fit",
+      "task_family_id": 1,
+      "success_pos_tol": 0.015,
+      "yaw_requirement": false
+    }
+  ]
+}

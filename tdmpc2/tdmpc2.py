@@ -33,6 +33,8 @@ class TDMPC2(torch.nn.Module):
 			optim_groups.append({'params': self.model._task_encoder.parameters()})
 		if getattr(self.model, '_task_emb', None) is not None and self.model._task_emb.weight.requires_grad:
 			optim_groups.append({'params': self.model._task_emb.parameters()})
+		if getattr(self.model, '_contact_encoder', None) is not None:
+			optim_groups.append({'params': self.model._contact_encoder.parameters()})
 		self.optim = torch.optim.Adam(optim_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
 		if self.cfg.lr_schedule:
@@ -161,6 +163,22 @@ class TDMPC2(torch.nn.Module):
 			state_dict[prefix+"_action_masks"] = self.model._action_masks
 
 		state_dict = api_model_conversion(self.model.state_dict(), state_dict)
+		target_state = self.model.state_dict()
+		for key in ("_task_vecs", "_action_masks"):
+			if key not in target_state:
+				continue
+			for source_key in (key, f"module.{key}"):
+				if source_key not in state_dict:
+					continue
+				if tuple(state_dict[source_key].shape) == tuple(target_state[key].shape):
+					continue
+				if self.cfg.rank == 0:
+					print(
+						f"Using current {key} from config instead of checkpoint metadata: "
+						f"checkpoint_shape={tuple(state_dict[source_key].shape)} "
+						f"current_shape={tuple(target_state[key].shape)}."
+					)
+				state_dict[source_key] = target_state[key]
 		try:
 			self.model.load_state_dict(state_dict)
 		except Exception:

@@ -24,7 +24,7 @@ from termcolor import colored
 from common import set_seed
 from common import MODEL_SIZE
 from common.world_model import WorldModel
-from config import Config, make_axial_task_vec, parse_cfg, safe_run_token
+from config import Config, SRSA_SAMPLER_CFG_KEYS, make_axial_task_vec, parse_cfg, safe_run_token
 from envs import make_env
 from offline_io import load_offline_manifest, summarize_compact_dataset
 from tdmpc2 import TDMPC2
@@ -317,6 +317,37 @@ def _read_json(path: Path):
 		return json.load(f)
 
 
+def _json_safe(value):
+	if torch.is_tensor(value):
+		value = value.detach().cpu()
+		if value.numel() == 1:
+			return float(value.item())
+		return value.tolist()
+	if isinstance(value, dict):
+		return {key: _json_safe(item) for key, item in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_json_safe(item) for item in value]
+	if isinstance(value, Path):
+		return str(value)
+	return value
+
+
+def _srsa_sampler_config(cfg):
+	config = {}
+	for field in SRSA_SAMPLER_CFG_KEYS:
+		value = cfg.get(field, None)
+		if value is not None:
+			config[field] = _json_safe(value)
+	return config
+
+
+def _current_srsa_task_params(env):
+	params = getattr(env.unwrapped, "current_task_params", None)
+	if not isinstance(params, dict) or len(params) == 0:
+		return None
+	return _json_safe(params)
+
+
 def _override_value(value):
 	if isinstance(value, bool):
 		return "true" if value else "false"
@@ -338,6 +369,20 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 		"srsa_sparse_reward",
 		"srsa_sil",
 		"srsa_if_sbc",
+		"srsa_task_template_fp",
+		"srsa_task_template_id",
+		"srsa_param_template_id",
+		"srsa_mesh_geometry_fp",
+		"srsa_mesh_geometry_task_id",
+		"srsa_mesh_plug_diameter_column",
+		"srsa_mesh_hole_diameter_column",
+		"srsa_mesh_clearance_column",
+		"srsa_mesh_clearance_mode",
+		"srsa_mesh_clearance_scale",
+		"srsa_mesh_depth_column",
+		"srsa_mesh_depth_scale",
+		"srsa_mesh_reference_radius_column",
+		"srsa_mesh_reference_depth_column",
 		"num_envs",
 		"gpu_id",
 		"model_size",
@@ -399,6 +444,8 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 		"seed",
 		"eval_hang_guard_factor",
 		"progress_log_interval_sec",
+		"eval_task_template_exact",
+		"eval_task_template_print",
 	]
 	overrides = []
 	for field in fields:
@@ -474,6 +521,8 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 					attrs=["bold"],
 				))
 		task_vec = _current_task_vec_6(cfg, env)
+		task_params = _current_srsa_task_params(env)
+		srsa_sampler = _srsa_sampler_config(cfg)
 		agent = _make_agent(cfg)
 		target_episodes = int(cfg.get('collect_episodes_per_task', cfg.get('eval_trials', 100)) or 100)
 		if target_episodes <= 0:
@@ -611,6 +660,8 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 			"source_assembly_id": cfg.get('collect_source_assembly_id', None),
 			"output": str(output_fp),
 			"task_vec_6": task_vec,
+			"srsa_params": task_params,
+			"srsa_sampler": srsa_sampler,
 			"num_envs": int(cfg.num_envs),
 			"episodes_requested": target_episodes,
 			"episodes_collected": len(episode_returns),
@@ -626,7 +677,7 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 			"green",
 			attrs=["bold"],
 		))
-		return {
+		entry = {
 			"task_id": int(task_id),
 			"task_name": f"{cfg.task}-{assembly_id}",
 			"assembly_id": assembly_id,
@@ -640,6 +691,11 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 			"failure_count": int(sum(1 for value in episode_successes if value <= 0.5)),
 			"success_rate": metadata["episode_success_mean"],
 		}
+		if task_params:
+			entry["srsa_params"] = task_params
+		if srsa_sampler:
+			entry["srsa_sampler"] = srsa_sampler
+		return entry
 	finally:
 		env.close()
 

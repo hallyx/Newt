@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from common import layers, math, init
 from models.axial_task_encoder import AxialTaskEncoder
+from models.contact_history_encoder import ContactHistoryEncoder
 from tensordict import TensorDict
 
 
@@ -18,6 +19,8 @@ class WorldModel(nn.Module):
 		self._multitask = cfg.num_global_tasks is not None and cfg.num_global_tasks > 1
 		self._task_emb = None
 		self._task_encoder = None
+		self._contact_encoder = None
+		self._contact_context_dim = 0
 		self._task_conditioning = str(cfg.get('task_conditioning', 'axial_params')).lower()
 		if self._task_conditioning in {'axial', 'axial_params', 'param', 'param_only'}:
 			self._task_conditioning = 'axial_params'
@@ -61,8 +64,26 @@ class WorldModel(nn.Module):
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.action_dims), cfg.action_dim))
 			for i in range(len(cfg.action_dims)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
+		if bool(cfg.get('contact_history_enabled', False)):
+			self._contact_context_dim = int(cfg.get('contact_context_dim', 64))
+			self._contact_encoder = ContactHistoryEncoder(
+				history_len=int(cfg.get('contact_history_len', 4)),
+				context_dim=self._contact_context_dim,
+				force_dim=int(cfg.get('contact_force_dim', 6)),
+				action_dim=int(cfg.get('contact_action_dim', 6)),
+				ee_delta_dim=int(cfg.get('contact_ee_delta_dim', 6)),
+				hidden_dim=int(cfg.get('contact_history_hidden_dim', 128)),
+				num_layers=int(cfg.get('contact_history_layers', 2)),
+				use_ee_delta=bool(cfg.get('contact_history_use_ee_delta', True)),
+			)
+			if cfg.rank == 0:
+				print(
+					'Using ContactHistoryEncoder for dynamics conditioning: '
+					f'H={cfg.get("contact_history_len", 4)} -> {self._contact_context_dim}D.'
+				)
 		self._encoder = layers.enc(cfg)
-		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+		dynamics_in_dim = cfg.latent_dim + cfg.action_dim + cfg.task_dim + self._contact_context_dim
+		self._dynamics = layers.mlp(dynamics_in_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.QOnlineTargetEnsemble(cfg)
@@ -80,6 +101,8 @@ class WorldModel(nn.Module):
 		modules = []
 		if self._task_encoder is not None:
 			modules.append(('Axial task encoder', self._task_encoder))
+		if self._contact_encoder is not None:
+			modules.append(('Contact history encoder', self._contact_encoder))
 		modules.extend([
 			('Encoder', self._encoder),
 			('Dynamics', self._dynamics),
@@ -229,6 +252,49 @@ class WorldModel(nn.Module):
 			return x
 		return torch.cat([x, context], dim=-1)
 
+	def contact_context(
+		self,
+		x,
+		contact_context=None,
+		force_history=None,
+		action_history=None,
+		ee_delta_history=None,
+	):
+		if self._contact_encoder is None:
+			return None
+		if contact_context is not None:
+			contact_context = contact_context.to(device=x.device, dtype=torch.float32, non_blocking=True)
+			return self._expand_task_context(contact_context, x)
+		if force_history is None and action_history is None and ee_delta_history is None:
+			return x.new_zeros(*x.shape[:-1], self._contact_context_dim)
+		if force_history is None or action_history is None:
+			raise ValueError("force_history and action_history are required when contact history conditioning is used.")
+		force_history = force_history.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		action_history = action_history.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		if ee_delta_history is not None:
+			ee_delta_history = ee_delta_history.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		context = self._contact_encoder(force_history, action_history, ee_delta_history)
+		return self._expand_task_context(context, x)
+
+	def contact_emb(
+		self,
+		x,
+		contact_context=None,
+		force_history=None,
+		action_history=None,
+		ee_delta_history=None,
+	):
+		context = self.contact_context(
+			x,
+			contact_context=contact_context,
+			force_history=force_history,
+			action_history=action_history,
+			ee_delta_history=ee_delta_history,
+		)
+		if context is None:
+			return x
+		return torch.cat([x, context], dim=-1)
+
 	def encode(self, obs, task):
 		"""
 		Encodes an observation into its latent representation.
@@ -249,11 +315,27 @@ class WorldModel(nn.Module):
 		
 		return out
 
-	def next(self, z, a, task):
+	def next(
+		self,
+		z,
+		a,
+		task,
+		contact_context=None,
+		force_history=None,
+		action_history=None,
+		ee_delta_history=None,
+	):
 		"""
 		Predicts the next latent state given the current latent state and action.
 		"""
 		z = self.task_emb(z, task)
+		z = self.contact_emb(
+			z,
+			contact_context=contact_context,
+			force_history=force_history,
+			action_history=action_history,
+			ee_delta_history=ee_delta_history,
+		)
 		z = torch.cat([z, a], dim=-1)
 		return self._dynamics(z)
 

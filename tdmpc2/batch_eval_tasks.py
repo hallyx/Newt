@@ -21,7 +21,7 @@ from hydra.core.config_store import ConfigStore
 from termcolor import colored
 
 from common import set_seed
-from config import Config, parse_cfg, safe_run_token
+from config import Config, apply_eval_task_template, parse_cfg, safe_run_token
 from collect_eval_rollouts import (
 	_adapt_obs_to_checkpoint,
 	_apply_checkpoint_compat,
@@ -98,6 +98,20 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"srsa_sparse_reward",
 		"srsa_sil",
 		"srsa_if_sbc",
+		"srsa_task_template_fp",
+		"srsa_task_template_id",
+		"srsa_param_template_id",
+		"srsa_mesh_geometry_fp",
+		"srsa_mesh_geometry_task_id",
+		"srsa_mesh_plug_diameter_column",
+		"srsa_mesh_hole_diameter_column",
+		"srsa_mesh_clearance_column",
+		"srsa_mesh_clearance_mode",
+		"srsa_mesh_clearance_scale",
+		"srsa_mesh_depth_column",
+		"srsa_mesh_depth_scale",
+		"srsa_mesh_reference_radius_column",
+		"srsa_mesh_reference_depth_column",
 		"srsa_task_param_obs",
 		"srsa_task_param_obs_mode",
 		"srsa_newt_obs",
@@ -159,6 +173,8 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"seed",
 		"eval_hang_guard_factor",
 		"progress_log_interval_sec",
+		"eval_task_template_exact",
+		"eval_task_template_print",
 	]
 	overrides = []
 	for field in fields:
@@ -211,6 +227,8 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 	assembly_id = _normalize_assembly_id(entry["assembly_id"])
 	task_id = int(entry["task_id"])
 	cfg.assembly_id = assembly_id
+	cfg.eval_task_id = task_id
+	cfg = apply_eval_task_template(cfg, entry)
 	set_seed(cfg.seed)
 	torch.cuda.set_device(cfg.device_id)
 	task_output_dir = output_dir / assembly_id
@@ -392,11 +410,22 @@ def launch(cfg: Config):
 	if cfg.get('batch_eval_worker_assembly_id', None) is not None:
 		if cfg.get('batch_eval_worker_task_id', None) is None:
 			raise ValueError("`batch_eval_worker_task_id` is required when `batch_eval_worker_assembly_id` is set.")
-		entries = [{
-			"assembly_id": _normalize_assembly_id(cfg.batch_eval_worker_assembly_id),
-			"task_id": int(cfg.batch_eval_worker_task_id),
-			"task_name": f"{cfg.task}-{_normalize_assembly_id(cfg.batch_eval_worker_assembly_id)}",
-		}]
+		worker_task_id = int(cfg.batch_eval_worker_task_id)
+		worker_assembly_id = _normalize_assembly_id(cfg.batch_eval_worker_assembly_id)
+		entries = []
+		if cfg.get('offline_manifest_fp', None):
+			for entry in load_offline_manifest(cfg.offline_manifest_fp):
+				if int(entry["task_id"]) == worker_task_id:
+					entry = dict(entry)
+					entry["assembly_id"] = _normalize_assembly_id(entry.get("assembly_id", worker_assembly_id))
+					entries = [entry]
+					break
+		if not entries:
+			entries = [{
+				"assembly_id": worker_assembly_id,
+				"task_id": worker_task_id,
+				"task_name": f"{cfg.task}-{worker_assembly_id}",
+			}]
 	else:
 		entries = _resolve_eval_entries(cfg)
 	output_dir = _resolve_output_dir(cfg)

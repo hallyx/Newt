@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Any
 
+import csv
 import datetime
 import json
 import math
@@ -51,6 +52,21 @@ class Config:
 	srsa_dir: str = "/home/gpuserver/hx/github/srsa"
 	srsa_sparse_reward: bool = False
 	srsa_sil: bool = False
+	srsa_task_template_fp: Optional[str] = None
+	srsa_task_template_id: Optional[int] = None
+	srsa_task_template_applied_id: Optional[int] = None
+	srsa_param_template_id: Optional[int] = None
+	srsa_mesh_geometry_fp: Optional[str] = None
+	srsa_mesh_geometry_task_id: Optional[str] = None
+	srsa_mesh_plug_diameter_column: Optional[str] = None
+	srsa_mesh_hole_diameter_column: Optional[str] = None
+	srsa_mesh_clearance_column: Optional[str] = None
+	srsa_mesh_clearance_mode: Optional[str] = None
+	srsa_mesh_clearance_scale: float = 1.0
+	srsa_mesh_depth_column: Optional[str] = None
+	srsa_mesh_depth_scale: float = 1.0
+	srsa_mesh_reference_radius_column: Optional[str] = None
+	srsa_mesh_reference_depth_column: Optional[str] = None
 	srsa_task_family_name: Optional[str] = None
 	srsa_task_family_id: Optional[int] = None
 	srsa_plug_diameter: Optional[float] = None
@@ -114,6 +130,26 @@ class Config:
 	eval_task_id: Optional[int] = None
 	eval_freq: Optional[int] = None
 	skip_initial_eval: bool = False
+	eval_task_template_exact: bool = True
+	eval_task_template_print: bool = True
+	eval_mode: str = "sim"
+	eval_zmq_enabled: bool = False
+	eval_zmq_server: str = "tcp://localhost:5555"
+	eval_zmq_env_index: int = 0
+	eval_zmq_rate: float = 0.0
+	eval_zmq_action_scale: float = 1.0
+	eval_zmq_send_done: bool = True
+	eval_real_mode: str = "stream"
+	eval_real_obs_server: str = "tcp://localhost:5556"
+	eval_real_obs_connect: bool = True
+	eval_real_obs_timeout_ms: int = 1000
+	eval_real_obs_key: str = "obs"
+	eval_real_task_vec_key: str = "task_vec_6"
+	eval_real_done_key: str = "done"
+	eval_real_use_msg_task_vec: bool = True
+	eval_real_steps: Optional[int] = None
+	eval_zmq_action_frame: str = "socket"
+	eval_zmq_action_order: str = "dx,dy,dz,droll,dpitch,dyaw"
 
 	# offline training
 	offline_only: bool = False
@@ -149,6 +185,19 @@ class Config:
 	collect_expected_obs_dim: Optional[int] = None
 	collect_spawn_per_assembly: bool = True
 	collect_worker_assembly_id: Optional[str] = None
+
+	# real-robot human-in-the-loop rollout collection
+	hil_collect_episodes: int = 10
+	hil_collect_output_fp: Optional[str] = None
+	hil_collect_manifest_fp: Optional[str] = None
+	hil_collect_overwrite: bool = False
+	hil_collect_mpc: Optional[bool] = None
+	hil_collect_max_steps: Optional[int] = None
+	hil_collect_reward_key: str = "reward"
+	hil_collect_success_key: str = "success"
+	hil_collect_action_keys: str = "executed_action,actual_action,applied_action,intervene_action"
+	hil_collect_intervened_key: str = "intervened"
+	hil_collect_require_actual_action: bool = False
 
 	# batch evaluation
 	batch_eval_assembly_ids: Any = None
@@ -235,6 +284,15 @@ class Config:
 	axial_target_insertion_depth: Optional[float] = None
 	axial_scale_ratio: Optional[float] = None
 	axial_yaw_requirement: bool = False
+	contact_history_enabled: bool = False
+	contact_history_len: int = 4
+	contact_force_dim: int = 6
+	contact_action_dim: int = 6
+	contact_ee_delta_dim: int = 6
+	contact_history_use_ee_delta: bool = True
+	contact_context_dim: int = 64
+	contact_history_hidden_dim: int = 128
+	contact_history_layers: int = 2
 	num_q: int = 5
 	simnorm_dim: int = 8
 	disable_task_emb: bool = False
@@ -297,9 +355,16 @@ def safe_run_token(value, fallback="na"):
 def make_run_id(cfg):
 	stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 	parts = [stamp]
-	if cfg.get('offline_manifest_fp', None):
-		if cfg.get('eval_task_id', None) is not None:
-			parts.append(f"tid-{int(cfg.eval_task_id)}")
+	template_fp = cfg.get('offline_manifest_fp', None) or cfg.get('srsa_task_template_fp', None)
+	if template_fp:
+		assembly_id = cfg.get('assembly_id', None)
+		if assembly_id:
+			parts.append(f"asm-{safe_run_token(assembly_id)}")
+		task_id = cfg.get('eval_task_id', None)
+		if task_id is None:
+			task_id = cfg.get('srsa_task_template_id', None)
+		if task_id is not None:
+			parts.append(f"tid-{int(task_id)}")
 		else:
 			num_tasks = int(cfg.get('num_global_tasks', 0) or 0)
 			if num_tasks > 0:
@@ -316,6 +381,8 @@ def make_run_id(cfg):
 AXIAL_TASK_CONDITIONING_MODES = {"axial", "axial_params", "param", "param_only"}
 ID_TASK_CONDITIONING_MODES = {"id", "id_embedding", "language", "language_embedding"}
 NO_TASK_CONDITIONING_MODES = {"none", "disabled"}
+SIM_EVAL_MODES = {"sim", "simulation", "isaac", "isaaclab"}
+REAL_EVAL_MODES = {"real", "robot", "hardware"}
 
 AXIAL_TASK_TYPE_IDS = {
 	"peg_in_hole": 0,
@@ -351,6 +418,10 @@ def uses_id_task_embedding(cfg):
 
 def uses_no_task_conditioning(cfg):
 	return task_conditioning_mode(cfg) in NO_TASK_CONDITIONING_MODES
+
+
+def eval_mode(cfg):
+	return str(cfg.get('eval_mode', 'sim')).strip().lower()
 
 
 def _get_value(source, key, default=None):
@@ -459,8 +530,18 @@ def make_axial_task_vec(cfg, item=None):
 		SRSA_BASE_HOLE_DIAMETER,
 	))
 	male_radius = max(0.5 * float(male_diameter), 1.0e-8)
-	reference_radius = max(float(cfg.get("axial_reference_radius", male_radius)), 1.0e-8)
-	reference_depth = max(float(cfg.get("axial_reference_depth", 1.0)), 1.0e-8)
+	reference_radius = max(float(_first_value(
+		_get_value(item, "reference_radius", None),
+		cfg.get("srsa_axial_reference_radius", None),
+		cfg.get("axial_reference_radius", None),
+		male_radius,
+	)), 1.0e-8)
+	reference_depth = max(float(_first_value(
+		_get_value(item, "reference_depth", None),
+		cfg.get("srsa_axial_reference_depth", None),
+		cfg.get("axial_reference_depth", None),
+		1.0,
+	)), 1.0e-8)
 
 	radial_clearance = _optional_float(_get_value(item, "radial_clearance", None))
 	if radial_clearance is None:
@@ -545,7 +626,8 @@ def make_isaaclab_task_info(cfg):
 def make_offline_manifest_task_info(cfg, manifest_tasks):
 	"""Create task metadata from an offline multitask manifest."""
 	info = {}
-	for item in manifest_tasks:
+	for raw_item in manifest_tasks:
+		item = _merge_template_params(raw_item)
 		task_name = item.get('task_name', f"{cfg.task}-{item.get('assembly_id', item['task_id'])}")
 		embedding = item.get('text_embedding')
 		if embedding is None:
@@ -559,6 +641,502 @@ def make_offline_manifest_task_info(cfg, manifest_tasks):
 		if 'discount_factor' in item:
 			info[task_name]['discount_factor'] = float(item['discount_factor'])
 	return info
+
+
+def _load_manifest_tasks(manifest_fp):
+	with open(Path(manifest_fp).expanduser().resolve(), "r", encoding="utf-8") as f:
+		manifest = json.load(f)
+	manifest_tasks = manifest.get("tasks") if isinstance(manifest, dict) else manifest
+	if not isinstance(manifest_tasks, list) or len(manifest_tasks) == 0:
+		raise ValueError(f"Offline manifest at {manifest_fp} must contain a non-empty 'tasks' list.")
+	return sorted(manifest_tasks, key=lambda item: int(item["task_id"]))
+
+
+def _load_template_tasks(cfg):
+	template_fp = _cfg_value(cfg, "offline_manifest_fp", None)
+	if template_fp:
+		return _load_manifest_tasks(template_fp)
+	template_fp = _cfg_value(cfg, "srsa_task_template_fp", None)
+	if not template_fp:
+		return None
+	return _load_srsa_task_template_tasks(cfg, template_fp)
+
+
+def _set_cfg_value(cfg, key, value):
+	if hasattr(cfg, key):
+		setattr(cfg, key, value)
+	else:
+		cfg[key] = value
+
+
+def _cfg_value(cfg, key, default=None):
+	if hasattr(cfg, 'get'):
+		return cfg.get(key, default)
+	return getattr(cfg, key, default)
+
+
+def _normalize_srsa_assembly_id(value):
+	if value is None:
+		return None
+	text = str(value).strip()
+	if len(text) == 0:
+		return None
+	return text.zfill(5) if text.isdigit() else text
+
+
+def _resolve_existing_path(path_value, *, cfg=None, base_dir=None):
+	path = Path(str(path_value)).expanduser()
+	if path.is_absolute():
+		return path
+	candidates = []
+	if base_dir is not None:
+		candidates.append(Path(base_dir) / path)
+	try:
+		candidates.append(Path(hydra.utils.get_original_cwd()) / path)
+	except Exception:
+		candidates.append(Path.cwd() / path)
+	srsa_dir = _cfg_value(cfg, "srsa_dir", None) if cfg is not None else None
+	if srsa_dir:
+		candidates.append(Path(str(srsa_dir)).expanduser() / path)
+	candidates.append(path)
+	for candidate in candidates:
+		candidate = candidate.expanduser()
+		if candidate.exists():
+			return candidate.resolve()
+	return candidates[0].expanduser().resolve()
+
+
+def _load_json_document(fp, *, cfg=None):
+	path = _resolve_existing_path(fp, cfg=cfg)
+	with open(path, "r", encoding="utf-8") as f:
+		return json.load(f), path
+
+
+def _mesh_option(cfg, mesh_cfg, cfg_suffix, json_key, default):
+	value = _cfg_value(cfg, f"srsa_mesh_{cfg_suffix}", None)
+	if value is not None:
+		return value
+	if isinstance(mesh_cfg, dict) and mesh_cfg.get(json_key, None) is not None:
+		return mesh_cfg[json_key]
+	return default
+
+
+def _read_mesh_geometry_row(cfg, mesh_cfg, template_path):
+	assembly_id = _normalize_srsa_assembly_id(
+		_first_value(
+			_cfg_value(cfg, "srsa_mesh_geometry_task_id", None),
+			_cfg_value(cfg, "assembly_id", None),
+			mesh_cfg.get("default_assembly_id", None) if isinstance(mesh_cfg, dict) else None,
+		)
+	)
+	if assembly_id is None:
+		raise ValueError("SRSA mesh geometry templates require assembly_id or srsa_mesh_geometry_task_id.")
+	mesh_fp = _first_value(
+		_cfg_value(cfg, "srsa_mesh_geometry_fp", None),
+		mesh_cfg.get("fp", None) if isinstance(mesh_cfg, dict) else None,
+		mesh_cfg.get("csv", None) if isinstance(mesh_cfg, dict) else None,
+	)
+	if mesh_fp is None:
+		raise ValueError("SRSA mesh geometry templates require srsa_mesh_geometry_fp or mesh_geometry.fp.")
+	mesh_path = _resolve_existing_path(mesh_fp, cfg=cfg, base_dir=template_path.parent)
+	with open(mesh_path, "r", encoding="utf-8", newline="") as f:
+		for row in csv.DictReader(f):
+			if _normalize_srsa_assembly_id(row.get("assembly_id")) == assembly_id:
+				return row, assembly_id, mesh_path
+	raise ValueError(f"assembly_id={assembly_id} was not found in mesh geometry CSV: {mesh_path}")
+
+
+def _float_row_value(row, key, *, default=None):
+	if key is None:
+		if default is None:
+			raise ValueError("Missing mesh geometry column name.")
+		return float(default)
+	if key not in row:
+		raise ValueError(f"Mesh geometry CSV does not contain column {key!r}.")
+	raw = row[key]
+	if raw is None or str(raw).strip() == "":
+		if default is None:
+			raise ValueError(f"Mesh geometry column {key!r} is empty.")
+		return float(default)
+	return float(raw)
+
+
+def _diametral_clearance_from_mesh(value, column, mode):
+	mode = str(mode or "auto").strip().lower()
+	if mode not in {"auto", "diametral", "radial"}:
+		raise ValueError("srsa_mesh_clearance_mode must be auto, diametral, or radial.")
+	if mode == "radial":
+		return 2.0 * float(value)
+	if mode == "diametral":
+		return float(value)
+	column_text = str(column or "").lower()
+	if "radial" in column_text or "surface_dist" in column_text:
+		return 2.0 * float(value)
+	return float(value)
+
+
+def _template_multiplier(template, key, index, default):
+	for name in (key, f"{key}_multiplier", f"{key}_gamma"):
+		if isinstance(template, dict) and template.get(name, None) is not None:
+			return float(template[name])
+	pair = _first_value(
+		template.get("clearance_depth_template", None) if isinstance(template, dict) else None,
+		template.get("template", None) if isinstance(template, dict) else None,
+		template.get("multipliers", None) if isinstance(template, dict) else None,
+	)
+	if isinstance(pair, str):
+		parts = [part.strip() for part in re.split(r"[:,]", pair) if part.strip()]
+		if len(parts) == 2:
+			return float(parts[index])
+	if isinstance(pair, (list, tuple)) and len(pair) == 2:
+		return float(pair[index])
+	return float(default)
+
+
+def _fixed_pair_from_float(value):
+	value = float(value)
+	return f"{value:.12g},{value:.12g}"
+
+
+def _build_mesh_template_entry(cfg, manifest, template, row, assembly_id, mesh_path):
+	mesh_cfg = manifest.get("mesh_geometry", {}) if isinstance(manifest, dict) else {}
+	plug_col = _mesh_option(cfg, mesh_cfg, "plug_diameter_column", "plug_diameter_column", "plug_xy_bbox_max")
+	hole_col = _mesh_option(cfg, mesh_cfg, "hole_diameter_column", "hole_diameter_column", "socket_xy_bbox_max")
+	clearance_col = _mesh_option(cfg, mesh_cfg, "clearance_column", "clearance_base_column", "plug_to_socket_surface_dist_p05")
+	clearance_mode = _mesh_option(cfg, mesh_cfg, "clearance_mode", "clearance_mode", "auto")
+	depth_col = _mesh_option(cfg, mesh_cfg, "depth_column", "depth_base_column", "plug_bbox_z")
+	reference_radius_col = _mesh_option(
+		cfg, mesh_cfg, "reference_radius_column", "reference_radius_column", "plug_xy_radius_p95_from_centroid"
+	)
+	reference_depth_col = _mesh_option(cfg, mesh_cfg, "reference_depth_column", "reference_depth_column", depth_col)
+
+	plug_diameter = _float_row_value(row, plug_col)
+	mesh_hole_diameter = _float_row_value(row, hole_col)
+	raw_clearance = _float_row_value(row, clearance_col)
+	clearance_base = _diametral_clearance_from_mesh(raw_clearance, clearance_col, clearance_mode)
+	clearance_base = max(0.0, clearance_base * float(_cfg_value(cfg, "srsa_mesh_clearance_scale", 1.0)))
+	depth_base = max(0.0, _float_row_value(row, depth_col) * float(_cfg_value(cfg, "srsa_mesh_depth_scale", 1.0)))
+	reference_radius = max(1.0e-8, _float_row_value(row, reference_radius_col, default=0.5 * plug_diameter))
+	reference_depth = max(1.0e-8, _float_row_value(row, reference_depth_col, default=depth_base or 0.015))
+	clearance_multiplier = _template_multiplier(template, "clearance", 0, 1.0)
+	depth_multiplier = _template_multiplier(template, "depth", 1, 1.0)
+	diametral_clearance = max(0.0, clearance_base * clearance_multiplier)
+	radial_clearance = 0.5 * diametral_clearance
+	target_depth = max(0.0, depth_base * depth_multiplier)
+	hole_diameter = plug_diameter + diametral_clearance
+	task_id = int(template.get("template_id", template.get("task_id", 0)))
+	scale_ratio = plug_diameter / max(SRSA_BASE_PLUG_DIAMETER, 1.0e-8)
+	template_name = template.get("template_name", template.get("task_name", f"c{clearance_multiplier:g}-d{depth_multiplier:g}"))
+
+	entry = {
+		"task_id": task_id,
+		"template_id": task_id,
+		"assembly_id": assembly_id,
+		"task_name": f"srsa-{assembly_id}-{template_name}",
+		"action_dim": int(template.get("action_dim", _cfg_value(cfg, "isaaclab_action_dim", 6))),
+		"max_episode_steps": int(template.get("max_episode_steps", _cfg_value(cfg, "isaaclab_max_episode_steps", 75) - 1)),
+		"mesh_geometry": {
+			"csv": str(mesh_path),
+			"plug_diameter_column": plug_col,
+			"hole_diameter_column": hole_col,
+			"clearance_base_column": clearance_col,
+			"clearance_mode": clearance_mode,
+			"depth_base_column": depth_col,
+			"reference_radius_column": reference_radius_col,
+			"reference_depth_column": reference_depth_col,
+			"mesh_hole_diameter": mesh_hole_diameter,
+			"raw_clearance_proxy": raw_clearance,
+			"clearance_base_diametral": clearance_base,
+			"depth_base": depth_base,
+		},
+		"srsa_params": {
+			"task_family_name": template.get("task_family_name", "normal_fit"),
+			"task_family_id": int(template.get("task_family_id", 1)),
+			"task_type_id": int(template.get("task_type_id", 0)),
+			"plug_diameter": plug_diameter,
+			"hole_diameter": hole_diameter,
+			"mesh_hole_diameter": mesh_hole_diameter,
+			"clearance": diametral_clearance,
+			"diametral_clearance": diametral_clearance,
+			"radial_clearance": radial_clearance,
+			"clearance_ratio": diametral_clearance / max(plug_diameter, 1.0e-8),
+			"clearance_multiplier": clearance_multiplier,
+			"insertion_depth": target_depth,
+			"target_insertion_depth": target_depth,
+			"depth_multiplier": depth_multiplier,
+			"success_pos_tol": float(template.get("success_pos_tol", 0.015)),
+			"scale_ratio": scale_ratio,
+			"yaw_requirement": bool(template.get("yaw_requirement", False)),
+			"reference_radius": reference_radius,
+			"reference_depth": reference_depth,
+		},
+		"srsa_sampler": {
+			"srsa_enable_axial_task_param_sampler": True,
+			"srsa_axial_task_type_id": int(template.get("task_type_id", 0)),
+			"srsa_axial_fixed_plug_scale": False,
+			"srsa_axial_scale_range": _fixed_pair_from_float(scale_ratio),
+			"srsa_axial_clearance_base": clearance_base,
+			"srsa_axial_clearance_depth_templates": f"{clearance_multiplier:.12g}:{depth_multiplier:.12g}",
+			"srsa_axial_clearance_jitter_ratio": 0.0,
+			"srsa_axial_depth_base": depth_base,
+			"srsa_axial_depth_jitter_ratio": 0.0,
+			"srsa_axial_reference_radius": reference_radius,
+			"srsa_axial_reference_depth": reference_depth,
+			"srsa_axial_yaw_requirement": bool(template.get("yaw_requirement", False)),
+		},
+	}
+	entry["task_vec_6"] = make_axial_task_vec(cfg, _merge_template_params(entry))
+	return entry
+
+
+def _load_srsa_task_template_tasks(cfg, template_fp):
+	manifest, template_path = _load_json_document(template_fp, cfg=cfg)
+	if isinstance(manifest, dict) and isinstance(manifest.get("tasks"), list):
+		return sorted(manifest["tasks"], key=lambda item: int(item["task_id"]))
+	if not isinstance(manifest, dict):
+		raise ValueError(f"SRSA task template file at {template_fp} must be a JSON object.")
+	templates = manifest.get("parameter_templates", manifest.get("templates", None))
+	if not isinstance(templates, list) or len(templates) == 0:
+		raise ValueError(
+			f"SRSA task template file at {template_fp} must contain either 'tasks' or non-empty 'parameter_templates'."
+		)
+	row, assembly_id, mesh_path = _read_mesh_geometry_row(cfg, manifest.get("mesh_geometry", {}) or {}, template_path)
+	entries = [_build_mesh_template_entry(cfg, manifest, template, row, assembly_id, mesh_path) for template in templates]
+	return sorted(entries, key=lambda item: int(item["task_id"]))
+
+
+SRSA_SAMPLER_CFG_KEYS = (
+	"srsa_enable_axial_task_param_sampler",
+	"srsa_axial_task_type_id",
+	"srsa_axial_scale_range",
+	"srsa_axial_fixed_plug_scale",
+	"srsa_axial_clearance_range",
+	"srsa_axial_clearance_ratio_range",
+	"srsa_axial_clearance_base",
+	"srsa_axial_clearance_anchor_multipliers",
+	"srsa_axial_clearance_anchors",
+	"srsa_axial_clearance_jitter_ratio",
+	"srsa_axial_clearance_anchor_weights",
+	"srsa_axial_clearance_depth_template_multipliers",
+	"srsa_axial_clearance_depth_templates",
+	"srsa_axial_clearance_depth_template_weights",
+	"srsa_axial_depth_range",
+	"srsa_axial_target_depth_range",
+	"srsa_axial_depth_base",
+	"srsa_axial_depth_anchor_multipliers",
+	"srsa_axial_depth_anchors",
+	"srsa_axial_depth_jitter_ratio",
+	"srsa_axial_depth_anchor_weights",
+	"srsa_axial_init_error_xy_range",
+	"srsa_axial_init_error_z_range",
+	"srsa_axial_init_error_yaw_range",
+	"srsa_axial_visual_noise_xy_range",
+	"srsa_axial_visual_noise_z_range",
+	"srsa_axial_yaw_requirement",
+	"srsa_axial_reference_radius",
+	"srsa_axial_reference_depth",
+)
+
+
+def _sampler_source_keys(cfg_key):
+	keys = [cfg_key]
+	if cfg_key.startswith("srsa_"):
+		keys.append(cfg_key[len("srsa_"):])
+	if cfg_key.startswith("srsa_axial_"):
+		keys.append(cfg_key[len("srsa_axial_"):])
+	if cfg_key == "srsa_enable_axial_task_param_sampler":
+		keys.append("enable_axial_task_param_sampler")
+	if cfg_key == "srsa_axial_task_type_id":
+		keys.extend(["task_type_id", "task_type_id_float"])
+	return tuple(dict.fromkeys(keys))
+
+
+def _template_section(item, key):
+	if not isinstance(item, dict):
+		return None
+	section = item.get(key, None)
+	return section if isinstance(section, dict) else None
+
+
+def _template_value(item, *keys):
+	for key in keys:
+		if isinstance(item, dict) and key in item and item[key] is not None:
+			return item[key]
+	params = item.get("srsa_params", None) if isinstance(item, dict) else None
+	if isinstance(params, dict):
+		for key in keys:
+			if key in params and params[key] is not None:
+				return params[key]
+	return None
+
+
+def _merge_template_params(item):
+	merged = dict(item)
+	params = merged.get("srsa_params", None)
+	if isinstance(params, dict):
+		for key, value in params.items():
+			merged.setdefault(key, value)
+	return merged
+
+
+def _apply_template_sampler_config(cfg, item):
+	for section in (_template_section(item, "srsa_sampler"), item):
+		if not isinstance(section, dict):
+			continue
+		for cfg_key in SRSA_SAMPLER_CFG_KEYS:
+			for source_key in _sampler_source_keys(cfg_key):
+				if source_key in section and section[source_key] is not None:
+					_set_cfg_value(cfg, cfg_key, section[source_key])
+					break
+
+
+def _set_from_template_if_empty(cfg, item, cfg_key, *template_keys):
+	if _cfg_value(cfg, cfg_key, None) is not None:
+		return
+	value = _template_value(item, *template_keys)
+	if value is not None:
+		_set_cfg_value(cfg, cfg_key, value)
+
+
+def _set_from_template(cfg, item, cfg_key, *template_keys):
+	value = _template_value(item, *template_keys)
+	if value is not None:
+		_set_cfg_value(cfg, cfg_key, value)
+
+
+def _fixed_pair(value):
+	value = float(value)
+	return f"{value:.12g},{value:.12g}"
+
+
+def _apply_exact_axial_task_vec_to_sampler(cfg, task_vec):
+	task_vec = _parse_vector(task_vec, expected_dim=int(_cfg_value(cfg, "axial_task_vec_dim", 6)))
+	reference_radius = float(_cfg_value(
+		cfg,
+		"srsa_axial_reference_radius",
+		_cfg_value(cfg, "axial_reference_radius", SRSA_BASE_PLUG_DIAMETER * 0.5),
+	) or _cfg_value(cfg, "axial_reference_radius", SRSA_BASE_PLUG_DIAMETER * 0.5))
+	reference_depth = float(_cfg_value(
+		cfg,
+		"srsa_axial_reference_depth",
+		_cfg_value(cfg, "axial_reference_depth", 0.015),
+	) or _cfg_value(cfg, "axial_reference_depth", 0.015))
+	scale = math.exp(float(task_vec[1]))
+	radial_clearance = float(task_vec[2]) * max(reference_radius, 1.0e-8)
+	diametral_clearance = 2.0 * max(0.0, radial_clearance)
+	target_depth = float(task_vec[4]) * max(reference_depth, 1.0e-8)
+
+	_set_cfg_value(cfg, "axial_task_vec_6", task_vec)
+	_set_cfg_value(cfg, "srsa_enable_axial_task_param_sampler", True)
+	_set_cfg_value(cfg, "srsa_axial_task_type_id", int(round(float(task_vec[0]))))
+	_set_cfg_value(cfg, "srsa_axial_fixed_plug_scale", False)
+	_set_cfg_value(cfg, "srsa_axial_scale_range", _fixed_pair(scale))
+	_set_cfg_value(cfg, "srsa_axial_clearance_range", _fixed_pair(diametral_clearance))
+	_set_cfg_value(cfg, "srsa_axial_clearance_ratio_range", None)
+	_set_cfg_value(cfg, "srsa_axial_clearance_base", diametral_clearance)
+	_set_cfg_value(cfg, "srsa_axial_clearance_anchor_multipliers", None)
+	_set_cfg_value(cfg, "srsa_axial_clearance_anchors", None)
+	_set_cfg_value(cfg, "srsa_axial_clearance_anchor_weights", None)
+	_set_cfg_value(cfg, "srsa_axial_clearance_depth_template_multipliers", None)
+	_set_cfg_value(cfg, "srsa_axial_clearance_depth_templates", None)
+	_set_cfg_value(cfg, "srsa_axial_clearance_depth_template_weights", None)
+	_set_cfg_value(cfg, "srsa_axial_clearance_jitter_ratio", 0.0)
+	_set_cfg_value(cfg, "srsa_axial_depth_range", _fixed_pair(target_depth))
+	_set_cfg_value(cfg, "srsa_axial_target_depth_range", _fixed_pair(target_depth))
+	_set_cfg_value(cfg, "srsa_axial_depth_base", target_depth)
+	_set_cfg_value(cfg, "srsa_axial_depth_anchor_multipliers", None)
+	_set_cfg_value(cfg, "srsa_axial_depth_anchors", None)
+	_set_cfg_value(cfg, "srsa_axial_depth_anchor_weights", None)
+	_set_cfg_value(cfg, "srsa_axial_depth_jitter_ratio", 0.0)
+	_set_cfg_value(cfg, "srsa_axial_yaw_requirement", bool(float(task_vec[5]) > 0.5))
+	return task_vec
+
+
+def _update_selected_task_vector(cfg, task_id, task_vec):
+	if task_id is None or task_vec is None:
+		return
+	task_vectors = _cfg_value(cfg, "task_vectors", None)
+	if not task_vectors:
+		_set_cfg_value(cfg, "task_vectors", [task_vec])
+		return
+	task_id = int(task_id)
+	if 0 <= task_id < len(task_vectors):
+		task_vectors[task_id] = task_vec
+	elif len(task_vectors) == 1:
+		task_vectors[0] = task_vec
+	_set_cfg_value(cfg, "task_vectors", task_vectors)
+
+
+def resolve_eval_task_template(cfg, entry=None):
+	if entry is not None:
+		return _merge_template_params(entry)
+	task_id = _cfg_value(cfg, "eval_task_id", None)
+	if task_id is None:
+		task_id = _cfg_value(cfg, "srsa_task_template_id", None)
+	template_tasks = _load_template_tasks(cfg)
+	if template_tasks is None or task_id is None:
+		return None
+	for item in template_tasks:
+		if int(item["task_id"]) == int(task_id):
+			return _merge_template_params(item)
+	raise ValueError(f"task_id={task_id} was not found in the configured SRSA task templates.")
+
+
+def apply_eval_task_template(cfg, entry=None):
+	"""
+	Apply a manifest/template task entry to eval-time SRSA config.
+
+	The selected task_id remains the model-side selector. When a template provides
+	task_vec_6 and eval_task_template_exact=true, the vector is decoded into fixed
+	SRSA sampler ranges so the environment and AxialTaskEncoder see the same task.
+	"""
+	template = resolve_eval_task_template(cfg, entry)
+	if template is None:
+		return cfg
+
+	task_id = int(template.get("task_id", _cfg_value(cfg, "eval_task_id", 0) or 0))
+	if entry is None and _cfg_value(cfg, "srsa_task_template_applied_id", None) == task_id:
+		return cfg
+	_set_cfg_value(cfg, "eval_task_id", task_id)
+	_set_cfg_value(cfg, "srsa_task_template_id", task_id)
+	if template.get("assembly_id", None) is not None:
+		_set_cfg_value(cfg, "assembly_id", str(template["assembly_id"]).zfill(5))
+
+	_set_from_template(cfg, template, "srsa_task_family_name", "task_family_name")
+	_set_from_template(cfg, template, "srsa_task_family_id", "task_family_id")
+	_set_from_template(cfg, template, "srsa_plug_diameter", "plug_diameter", "male_diameter")
+	_set_from_template(cfg, template, "srsa_hole_diameter", "hole_diameter", "female_diameter")
+	_set_from_template(cfg, template, "srsa_clearance", "clearance", "diametral_clearance")
+	_set_from_template(cfg, template, "srsa_clearance_ratio", "clearance_ratio")
+	_set_from_template(cfg, template, "srsa_insertion_depth", "insertion_depth", "target_insertion_depth")
+	_set_from_template(cfg, template, "srsa_success_pos_tol", "success_pos_tol")
+	_set_from_template(cfg, template, "srsa_axial_task_type_id", "task_type_id", "task_type_id_float")
+	_set_from_template(cfg, template, "srsa_axial_reference_radius", "reference_radius")
+	_set_from_template(cfg, template, "srsa_axial_reference_depth", "reference_depth")
+	_apply_template_sampler_config(cfg, template)
+
+	task_vec = _template_value(template, "task_vec", "task_vec_6", "axial_task_vec", "axial_task_vec_6")
+	if task_vec is not None and bool(_cfg_value(cfg, "eval_task_template_exact", True)):
+		task_vec = _apply_exact_axial_task_vec_to_sampler(cfg, task_vec)
+	elif task_vec is not None:
+		task_vec = _parse_vector(task_vec, expected_dim=int(_cfg_value(cfg, "axial_task_vec_dim", 6)))
+		_set_cfg_value(cfg, "axial_task_vec_6", task_vec)
+	else:
+		_set_cfg_value(cfg, "axial_task_vec_6", None)
+		task_vec = make_axial_task_vec(cfg, template)
+		_set_cfg_value(cfg, "axial_task_vec_6", task_vec)
+	_update_selected_task_vector(cfg, task_id, task_vec)
+
+	if bool(_cfg_value(cfg, "eval_task_template_print", True)) and int(_cfg_value(cfg, "rank", 0) or 0) == 0:
+		vec_text = ", ".join(f"{float(value):.6g}" for value in task_vec) if task_vec is not None else "n/a"
+		print(colored(
+			f"Applied eval task template: task_id={task_id} "
+			f"assembly_id={_cfg_value(cfg, 'assembly_id', None)} task_vec_6=[{vec_text}]",
+			"cyan",
+			attrs=["bold"],
+		))
+	_set_cfg_value(cfg, "srsa_task_template_applied_id", task_id)
+	return cfg
 
 
 def parse_cfg(cfg):
@@ -599,16 +1177,28 @@ def parse_cfg(cfg):
 			f"Unknown task_conditioning={cfg.task_conditioning!r}. "
 			"Use axial_params, id_embedding, or none."
 		)
+	mode = eval_mode(cfg)
+	if mode in REAL_EVAL_MODES:
+		cfg.eval_mode = "real"
+		cfg.eval_zmq_enabled = True
+	elif mode in SIM_EVAL_MODES:
+		cfg.eval_mode = "sim"
+	elif mode not in SIM_EVAL_MODES | REAL_EVAL_MODES:
+		raise ValueError(
+			f"Unknown eval_mode={cfg.eval_mode!r}. Use sim or real."
+		)
 
 	# Set defaults
 	manifest_tasks = None
+	if cfg.get('srsa_param_template_id', None) is not None:
+		cfg.srsa_task_template_id = int(cfg.srsa_param_template_id)
+	if cfg.get('srsa_task_template_id', None) is not None and cfg.get('eval_task_id', None) is None:
+		cfg.eval_task_id = int(cfg.srsa_task_template_id)
 	if cfg.offline_manifest_fp:
-		with open(Path(cfg.offline_manifest_fp).expanduser().resolve(), "r", encoding="utf-8") as f:
-			manifest = json.load(f)
-		manifest_tasks = manifest.get("tasks")
-		if not isinstance(manifest_tasks, list) or len(manifest_tasks) == 0:
-			raise ValueError(f"Offline manifest at {cfg.offline_manifest_fp} must contain a non-empty 'tasks' list.")
-		manifest_tasks = sorted(manifest_tasks, key=lambda item: int(item["task_id"]))
+		manifest_tasks = _load_manifest_tasks(cfg.offline_manifest_fp)
+	elif cfg.srsa_task_template_fp:
+		manifest_tasks = _load_template_tasks(cfg)
+	if manifest_tasks is not None:
 		task_ids = [int(item["task_id"]) for item in manifest_tasks]
 		expected = list(range(len(manifest_tasks)))
 		assert task_ids == expected, f'Offline manifest task ids must be consecutive starting at 0, got {task_ids}.'
@@ -669,6 +1259,9 @@ def parse_cfg(cfg):
 			cfg.discounts.append(discount_heuristic(cfg, task_info[task]['max_episode_steps']))
 		cfg.action_dims.append(task_info[task]['action_dim'])
 
+	if manifest_tasks is not None and cfg.get('eval_task_id', None) is not None:
+		cfg = apply_eval_task_template(cfg)
+
 	if cfg.eval_task_id is not None:
 		assert 0 <= cfg.eval_task_id < cfg.num_global_tasks, \
 			f'eval_task_id={cfg.eval_task_id} is out of range for {cfg.num_global_tasks} tasks.'
@@ -676,6 +1269,10 @@ def parse_cfg(cfg):
 		cfg.run_id = make_run_id(cfg)
 	else:
 		cfg.run_id = safe_run_token(cfg.run_id)
-	cfg.work_dir = Path(hydra.utils.get_original_cwd()) / 'logs' / cfg.task / str(cfg.seed) / cfg.exp_name / cfg.run_id
+	try:
+		original_cwd = Path(hydra.utils.get_original_cwd())
+	except ValueError:
+		original_cwd = Path.cwd()
+	cfg.work_dir = original_cwd / 'logs' / cfg.task / str(cfg.seed) / cfg.exp_name / cfg.run_id
 
 	return OmegaConf.to_object(cfg)

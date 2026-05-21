@@ -276,7 +276,7 @@ def export_multitask_compact_dataset(
 		episode_offset += int(unique_episode.numel())
 		data["task"] = torch.full_like(data["episode"], task_id, dtype=torch.int64)
 		chunks.append(data)
-		task_map.append({
+		task_meta = {
 			"task_id": task_id,
 			"task_name": task_name,
 			"assembly_id": entry.get("assembly_id"),
@@ -285,7 +285,11 @@ def export_multitask_compact_dataset(
 			"num_episodes": int(unique_episode.numel()),
 			"action_dim": int(data["action"].shape[-1]),
 			"obs_shape": list(data["obs"].shape[1:]),
-		})
+		}
+		for optional_key in ("task_vec_6", "srsa_params", "srsa_sampler"):
+			if optional_key in entry:
+				task_meta[optional_key] = entry[optional_key]
+		task_map.append(task_meta)
 
 	data = _concatenate_compact_data(chunks)
 	if TensorDict is not None:
