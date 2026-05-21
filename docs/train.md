@@ -244,6 +244,125 @@ SRSA 仓库路径。wrapper 会把 `source/SRSA` 和 `rl_games_sil` 加进 `sys.
 - `task_vec`: 6 维 Newt/SRSA 共享 task vector
 - `legacy`: 9 维 legacy task param tensor
 
+### ContactHistoryEncoder
+
+`contact_history_enabled=false`
+
+默认关闭。关闭时网络结构、checkpoint 兼容性和现有 train/eval 行为不变。
+
+`contact_history_enabled=true`
+
+启用模型侧 `ContactHistoryEncoder`。第一版是 MLP，不使用 Transformer。它把过去 `H` 步接触和运动历史编码成 `contact_context`，只拼进 latent dynamics：
+
+```text
+force_history:    (B, H, 6)
+action_history:   (B, H, 6)
+ee_delta_history: (B, H, 6)  # optional
+
+ContactHistoryEncoder -> contact_context: (B, contact_context_dim)
+
+dynamics input:
+z + action + task_context + contact_context
+```
+
+相关参数：
+
+```bash
+contact_history_enabled=true
+contact_history_len=4
+contact_context_dim=64
+contact_history_hidden_dim=128
+contact_history_layers=2
+contact_force_dim=6
+contact_action_dim=6
+contact_ee_delta_dim=6
+contact_history_use_ee_delta=true
+```
+
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/train.py \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=00186 \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  srsa_sparse_reward=true \
+  srsa_if_sbc=false \
+  num_envs=300 \
+  gpu_id=0 \
+  multiproc=true \
+  num_gpus=2 \
+  steps=6000000 \
+  model_size=S \
+  batch_size=1024 \
+  buffer_size=6000000 \
+  horizon=3 \
+  utd=0.075 \
+  use_demos=false \
+  compile=true \
+  enable_wandb=true \
+  save_agent=true \
+  save_best=true \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  isaaclab_disable_imitation_reward=true \
+  srsa_task_family_name=normal_fit \
+  srsa_task_param_obs=false \
+  srsa_task_param_obs_mode=task_vec \
+  srsa_enable_axial_task_param_sampler=true \
+  srsa_axial_fixed_plug_scale=true \
+  srsa_axial_clearance_base=0.000114 \
+  'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
+  srsa_axial_clearance_jitter_ratio=0.10 \
+  srsa_axial_depth_base=0.015 \
+  srsa_axial_depth_jitter_ratio=0.10 \
+  'srsa_axial_init_error_xy_range="0.015,0.020"' \
+  'srsa_axial_init_error_z_range="0.010,0.020"' \
+  'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.001"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.005"' \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  isaaclab_canonical_append_task_params=false \
+  srsa_vision_noise_xy_std=0.003 \
+  srsa_vision_noise_xy_jitter_std=0.0003 \
+  isaaclab_canonical_use_visual_noise=true \
+  task_conditioning=axial_params \
+  progress_log_interval_sec=30 \
+  skip_initial_eval=true \
+  eval_episodes=1 \
+  eval_freq=500000 \
+  exp_name=srsa_axial_online \
+  contact_history_enabled=true \
+  contact_history_len=4  \
+  contact_context_dim=64 \
+  contact_history_hidden_dim=128 \
+  contact_history_layers=2 \
+  contact_force_dim=6 \
+  contact_action_dim=6 \
+  contact_ee_delta_dim=6 \
+  contact_history_use_ee_delta=true
+
+当前实现状态：
+
+- `ContactHistoryEncoder` 和 `WorldModel.next(..., force_history=..., action_history=..., ee_delta_history=...)` 已接好。
+- 现有 replay/offline/eval 主流程如果不显式传 history，会自动使用零 `contact_context`，因此不会破坏旧路径。
+- 要让该模块真正学习到接触动态，需要后续在训练采样侧构造 history，并传给 dynamics rollout。
+
+第一版不需要改 SRSA 环境也可以验证：
+
+- `action_history`: Newt 已经知道过去策略输出的 6D action。
+- `ee_delta_history`: 可以从连续 canonical obs 的 TCP pose 差分得到。
+- `force_history`: 当前 17D obs 只有 `flange_force_obs[3]`，可先临时扩成 `[Fx,Fy,Fz,0,0,0]`。
+
+只有当你希望 `force_history` 是真实 6D wrench 时，才需要改 SRSA 环境，让它暴露类似：
+
+```text
+flange_wrench_obs[6] = [force_socket / force_scale, torque_socket / torque_scale]
+```
+
+推荐顺序是先用 Newt 侧 history buffer 验证训练链路，再决定是否把 SRSA 侧力/力矩观测升级为 6D。
+
 ### 视觉误差
 
 `srsa_vision_noise_xy_std`

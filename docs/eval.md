@@ -93,6 +93,40 @@ obs_space=(17,)
 runtime.flange_force_obs: shape=(num_envs, 3)
 ```
 
+### ContactHistoryEncoder checkpoint
+
+如果 checkpoint 使用了：
+
+```bash
+contact_history_enabled=true
+```
+
+模型侧 latent dynamics 会额外需要 `contact_context`：
+
+```text
+force_history:    (B, H, 6)
+action_history:   (B, H, 6)
+ee_delta_history: (B, H, 6)  # optional
+
+ContactHistoryEncoder -> contact_context: (B, contact_context_dim)
+```
+
+当前实现中，`WorldModel.next()` 已支持传入这些 history；如果 eval 主循环没有传 history，会使用零 `contact_context`。这保证 checkpoint 能跑通，但不会发挥接触历史的作用。
+
+真机闭环第一版可以不改 SRSA 环境：
+
+- `action_history` 由 Newt 记录过去发给机械臂的 6D action。
+- `ee_delta_history` 可由连续真机 canonical obs 的末端 pose 差分得到。
+- `force_history` 若暂时只有 3D 力，可填成 `[Fx,Fy,Fz,0,0,0]`。
+
+如果真机或 SRSA 侧能提供 6D wrench，推荐 observation/history 侧使用：
+
+```text
+[Fx,Fy,Fz,Tx,Ty,Tz] in socket frame
+```
+
+并保持和训练时相同的归一化比例。
+
 ### 旧 raw policy obs / id embedding checkpoint
 
 旧 `isaaclab-automate-assembly` checkpoint 常见配置：
@@ -570,6 +604,18 @@ SRSA 参数模板 JSON。用于没有 offline manifest 时按 `assembly_id + srs
 
 是否把 task params 拼进 observation。主方法一般保持 `false`，因为 task 参数通过 AxialTaskEncoder 进入模型。
 
+`contact_history_enabled`
+
+是否启用模型侧 ContactHistoryEncoder。只有 checkpoint 训练时启用了该模块，eval 才应打开。打开后 dynamics 会多拼 `contact_context`；如果当前 eval 路径没有传 history，会用零 context 兜底。
+
+`contact_history_len`
+
+ContactHistoryEncoder 使用的历史窗口长度 `H`，必须与 checkpoint 一致。
+
+`contact_context_dim`
+
+接触历史编码维度，必须与 checkpoint 一致。
+
 `task_conditioning`
 
 常用值：
@@ -665,6 +711,15 @@ raw.policy_obs: shape=(..., 24)
 - JSON 中是否有 `obs`，且长度等于 checkpoint observation 维度
 - 17D checkpoint 是否补齐 `flange_force_obs[3]`
 - `task_vec_6` 是否和当前装配任务一致，或 eval 命令是否正确选择了 `srsa_task_template_id`
+
+### ContactHistoryEncoder 没有效果
+
+检查：
+
+- checkpoint 是否确实用 `contact_history_enabled=true` 训练
+- eval/训练 rollout 是否真的传入了 `force_history/action_history/ee_delta_history`
+- 当前是否只是走零 `contact_context` 兜底
+- 3D force 是否按训练约定扩成 6D，或真机/SRSA 是否提供了同坐标系、同归一化的 6D wrench
 
 ### Checkpoint 加载失败
 
