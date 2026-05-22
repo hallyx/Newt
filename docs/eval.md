@@ -731,3 +731,18 @@ raw.policy_obs: shape=(..., 24)
 - `eval_task_id`
 - observation 维度
 - `action_dim`
+
+
+
+python3 tdmpc2/eval.py \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://192.168.10.37:5556 \
+  eval_real_obs_socket_type=sub \
+  eval_zmq_server=tcp://192.168.10.37:5555 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=00186 \
+  eval_real_use_msg_task_vec=false \
+  eval_real_socket_pos=[0.4906,-0.0346,0.329] \
+  eval_real_socket_quat_wxyz=[1.0,0.0,0.0,0.0] \
+  eval_real_force_scale=50.0

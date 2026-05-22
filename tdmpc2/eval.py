@@ -182,13 +182,16 @@ def eval_real_closed_loop(agent: TDMPC2, cfg, logger: Logger):
 	print(colored(
 		"Starting real closed-loop inference: "
 		f"obs_dim={obs_dim}, action_dim={cfg.action_dim}, max_steps={max_steps}, "
-		f"obs_endpoint={cfg.eval_real_obs_server}, action_endpoint={cfg.eval_zmq_server}.",
+		f"obs_endpoint={cfg.eval_real_obs_server} ({cfg.eval_real_obs_socket_type}), "
+		f"action_endpoint={cfg.eval_zmq_server}.",
 		"cyan",
 		attrs=["bold"],
 	))
 	print(colored(
-		"Robot observation layout must be canonical state: "
-		"[tcp_pos(3), tcp_quat_wxyz(4), tcp_linvel(3), tcp_angvel(3), gripper_width(1), optional force_obs(3)].",
+		"Robot observation can be either direct `obs` or libfranka robot_state. "
+		"Direct obs layout: [tcp_pos_socket(3), tcp_quat_wxyz(4), tcp_linvel_socket(3), "
+		"tcp_angvel_socket(3), gripper_width(1), optional force/wrench]. "
+		"libfranka mode needs --full-state plus socket pose calibration and force fields for force checkpoints.",
 		"cyan",
 		attrs=["bold"],
 	))
@@ -217,6 +220,8 @@ def eval_real_closed_loop(agent: TDMPC2, cfg, logger: Logger):
 				step=step_idx,
 				episode_step=episode_step,
 				task_id=task_id,
+				state_seq=message.get("seq", None),
+				state_timestamp=message.get("timestamp", None),
 			)
 			step_count += 1
 			elapsed_s = monotonic() - start_time

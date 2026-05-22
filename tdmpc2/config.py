@@ -141,6 +141,7 @@ class Config:
 	eval_zmq_send_done: bool = True
 	eval_real_mode: str = "stream"
 	eval_real_obs_server: str = "tcp://localhost:5556"
+	eval_real_obs_socket_type: str = "sub"
 	eval_real_obs_connect: bool = True
 	eval_real_obs_timeout_ms: int = 1000
 	eval_real_obs_key: str = "obs"
@@ -148,6 +149,14 @@ class Config:
 	eval_real_done_key: str = "done"
 	eval_real_use_msg_task_vec: bool = True
 	eval_real_steps: Optional[int] = None
+	eval_real_state_format: str = "auto"
+	eval_real_socket_pos: Any = None
+	eval_real_socket_quat_wxyz: Any = None
+	eval_real_socket_quat_xyzw: Any = None
+	eval_real_use_initial_pose_as_socket: bool = False
+	eval_real_gripper_width_default: float = 0.0
+	eval_real_force_scale: float = 50.0
+	eval_real_zero_missing_force: bool = True
 	eval_zmq_action_frame: str = "socket"
 	eval_zmq_action_order: str = "dx,dy,dz,droll,dpitch,dyaw"
 
