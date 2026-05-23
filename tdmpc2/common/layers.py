@@ -442,9 +442,23 @@ def api_model_conversion(target_state_dict, source_state_dict):
 	for key in ['_encoder.state.0.weight', 'module._encoder.state.0.weight']:
 		if key in target_state_dict and key in source_state_dict and \
 				target_state_dict[key].shape != source_state_dict[key].shape:
-			# rgb input in target but not in source, we should pad
+			if target_state_dict[key].shape[0] != source_state_dict[key].shape[0]:
+				raise ValueError(
+					f"Checkpoint encoder width does not match current model for {key}: "
+					f"checkpoint_shape={tuple(source_state_dict[key].shape)}, "
+					f"current_shape={tuple(target_state_dict[key].shape)}. "
+					"This usually means `model_size` is wrong; pass the same model_size used "
+					"for training, for example `model_size=S` for 128-wide encoder checkpoints."
+				)
+			# RGB input in target but not in source; pad only the input dimension.
 			pad = target_state_dict[key].shape[1] - source_state_dict[key].shape[1]
-			assert pad > 0, 'pad should be positive'
+			if pad <= 0:
+				raise ValueError(
+					f"Checkpoint encoder input dimension is larger than the current model for {key}: "
+					f"checkpoint_shape={tuple(source_state_dict[key].shape)}, "
+					f"current_shape={tuple(target_state_dict[key].shape)}. "
+					"Check observation settings such as canonical force/task fields."
+				)
 			pad_tensor = torch.zeros(source_state_dict[key].shape[0], pad, device=source_state_dict[key].device)
 			source_state_dict[key] = torch.cat([source_state_dict[key], pad_tensor], dim=1)
 

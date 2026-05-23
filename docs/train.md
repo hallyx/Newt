@@ -29,6 +29,7 @@ cd /home/gpuserver/hx/github/Newt
   srsa_sparse_reward=true \
   srsa_if_sbc=false \
   num_envs=300 \
+  isaaclab_gpu_collision_stack_size=268435456 \
   gpu_id=0 \
   multiproc=true \
   num_gpus=2 \
@@ -61,14 +62,16 @@ cd /home/gpuserver/hx/github/Newt
   'srsa_axial_init_error_xy_range="0.009,0.0010"' \
   'srsa_axial_init_error_z_range="0.0010,0.0020"' \
   'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"' \
-  'srsa_axial_visual_noise_xy_range="0.0,0.001"' \
-  'srsa_axial_visual_noise_z_range="0.0,0.0005"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.0"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.0"' \
   srsa_enable_flange_force_sensor=true \
   isaaclab_canonical_append_force=true \
   isaaclab_canonical_append_task_params=false \
-  srsa_vision_noise_xy_std=0.003 \
-  srsa_vision_noise_xy_jitter_std=0.0003 \
-  isaaclab_canonical_use_visual_noise=true \
+  srsa_vision_noise_xy_std=0.0 \
+  srsa_vision_noise_xy_jitter_std=0.0 \
+  srsa_vision_noise_z_std=0.0 \
+  srsa_vision_noise_z_jitter_std=0.0 \
+  isaaclab_canonical_use_visual_noise=false \
   task_conditioning=axial_params \
   progress_log_interval_sec=30 \
   skip_initial_eval=true \
@@ -115,11 +118,16 @@ cd /home/gpuserver/hx/github/Newt
   'srsa_axial_init_error_xy_range="0.005,0.0010"' \
   'srsa_axial_init_error_z_range="0.00,0.005"' \
   'srsa_axial_init_error_yaw_range="-0.15,0.15"' \
-  'srsa_axial_visual_noise_xy_range="0.0,0.001"' \
-  'srsa_axial_visual_noise_z_range="0.0,0.0005"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.0"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.0"' \
   srsa_enable_flange_force_sensor=true \
   isaaclab_canonical_append_force=true \
   isaaclab_canonical_append_task_params=false \
+  srsa_vision_noise_xy_std=0.0 \
+  srsa_vision_noise_xy_jitter_std=0.0 \
+  srsa_vision_noise_z_std=0.0 \
+  srsa_vision_noise_z_jitter_std=0.0 \
+  isaaclab_canonical_use_visual_noise=false \
   task_conditioning=axial_params \
   progress_log_interval_sec=10 \
   skip_initial_eval=true \
@@ -191,6 +199,39 @@ SRSA 仓库路径。wrapper 会把 `source/SRSA` 和 `rl_games_sil` 加进 `sys.
 
 并行环境数量。训练吞吐主要由它决定。例如 `num_envs=200` 时，一轮 74 step episode 会推进 `14800` 个 global steps。
 
+`isaaclab_gpu_collision_stack_size=268435456`
+
+PhysX GPU collision stack buffer 大小。接触密集装配任务在高并发 `num_envs` 下如果出现 `collisionStackSize buffer overflow`，说明接触缓存不够、PhysX 已经丢弃 contacts。日志会给出最小值，例如 `at least 70877712`；建议直接设成 `2**28 = 268435456`，如果还溢出再提高到 `536870912` 或降低 `num_envs`。
+
+### Action 维度
+
+SRSA 默认使用位置控制：
+
+```bash
+srsa_position_control_only=true
+srsa_policy_action_dim=3
+srsa_env_action_dim=6
+```
+
+Newt policy、world model、Q、replay buffer 都只使用 3D action：
+
+```text
+[dx, dy, dz]
+```
+
+SRSA 环境接口仍保持 6D，不需要改 SRSA 仓库。Newt 的 IsaacLab wrapper 会在 `env.step()` 前把 3D action 扩成：
+
+```text
+[dx, dy, dz, 0, 0, 0]
+```
+
+因此新的 3D checkpoint 和旧的 6D checkpoint 结构不同，不能直接互相加载。若要复现旧 6D action checkpoint，显式设置：
+
+```bash
+srsa_position_control_only=false
+isaaclab_action_dim=6
+```
+
 `gpu_id`
 
 训练和仿真使用的起始 GPU。
@@ -216,6 +257,17 @@ SRSA 仓库路径。wrapper 会把 `source/SRSA` 和 `rl_games_sil` 加进 `sys.
 `isaaclab_canonical_append_force=true`
 
 把 `flange_force_obs[3]` 拼进 canonical obs。推荐打开，主方法为 contact-aware world model。
+
+`isaaclab_canonical_zero_force=true`
+
+用于没有力传感器的对比实验。保持 17D checkpoint 的输入形状不变，但把 canonical obs 末尾的 force 3 维补成 0。无力传感器 eval 建议同时设置：
+
+```bash
+srsa_enable_flange_force_sensor=false
+isaaclab_canonical_append_force=true
+isaaclab_canonical_zero_force=true
+isaaclab_canonical_force_dim=3
+```
 
 `srsa_flange_force_sensor_body_name=panda_hand`
 
@@ -287,6 +339,7 @@ contact_history_use_ee_delta=true
   srsa_sparse_reward=true \
   srsa_if_sbc=false \
   num_envs=300 \
+  isaaclab_gpu_collision_stack_size=268435456 \
   gpu_id=0 \
   multiproc=true \
   num_gpus=2 \
@@ -319,14 +372,16 @@ contact_history_use_ee_delta=true
   'srsa_axial_init_error_xy_range="0.015,0.020"' \
   'srsa_axial_init_error_z_range="0.010,0.020"' \
   'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"' \
-  'srsa_axial_visual_noise_xy_range="0.0,0.001"' \
-  'srsa_axial_visual_noise_z_range="0.0,0.005"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.0"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.0"' \
   srsa_enable_flange_force_sensor=true \
   isaaclab_canonical_append_force=true \
   isaaclab_canonical_append_task_params=false \
-  srsa_vision_noise_xy_std=0.003 \
-  srsa_vision_noise_xy_jitter_std=0.0003 \
-  isaaclab_canonical_use_visual_noise=true \
+  srsa_vision_noise_xy_std=0.0 \
+  srsa_vision_noise_xy_jitter_std=0.0 \
+  srsa_vision_noise_z_std=0.0 \
+  srsa_vision_noise_z_jitter_std=0.0 \
+  isaaclab_canonical_use_visual_noise=false \
   task_conditioning=axial_params \
   progress_log_interval_sec=30 \
   skip_initial_eval=true \
@@ -341,6 +396,142 @@ contact_history_use_ee_delta=true
   contact_force_dim=6 \
   contact_action_dim=6 \
   contact_ee_delta_dim=6 \
+  contact_history_use_ee_delta=true
+
+
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/train.py \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=01125 \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  srsa_sparse_reward=false \
+  srsa_if_sbc=false \
+  num_envs=300 \
+  isaaclab_gpu_collision_stack_size=268435456 \
+  gpu_id=0 \
+  multiproc=true \
+  num_gpus=2 \
+  steps=6000000 \
+  model_size=S \
+  batch_size=1024 \
+  buffer_size=6000000 \
+  horizon=3 \
+  utd=0.075 \
+  use_demos=false \
+  compile=true \
+  enable_wandb=true \
+  save_agent=true \
+  save_best=true \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  isaaclab_disable_imitation_reward=false \
+  srsa_task_family_name=normal_fit \
+  srsa_task_param_obs=false \
+  srsa_task_param_obs_mode=task_vec \
+  srsa_enable_axial_task_param_sampler=true \
+  srsa_axial_fixed_plug_scale=true \
+  srsa_axial_clearance_base=0.000114 \
+  'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
+  srsa_axial_clearance_jitter_ratio=0.10 \
+  srsa_axial_depth_base=0.015 \
+  srsa_axial_depth_jitter_ratio=0.10 \
+  'srsa_axial_init_error_xy_range="0.00,0.001"' \
+  'srsa_axial_init_error_z_range="0.001,0.005"' \
+  'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.0"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.0"' \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  isaaclab_canonical_append_task_params=false \
+  srsa_vision_noise_xy_std=0.0 \
+  srsa_vision_noise_xy_jitter_std=0.0 \
+  srsa_vision_noise_z_std=0.0 \
+  srsa_vision_noise_z_jitter_std=0.0 \
+  isaaclab_canonical_use_visual_noise=false \
+  task_conditioning=axial_params \
+  progress_log_interval_sec=30 \
+  skip_initial_eval=true \
+  eval_episodes=1 \
+  eval_freq=300000 \
+  exp_name=srsa_axial_online \
+  contact_history_enabled=true \
+  contact_history_len=4  \
+  contact_context_dim=64 \
+  contact_history_hidden_dim=128 \
+  contact_history_layers=2 \
+  contact_force_dim=6 \
+  contact_action_dim=3 \
+  contact_ee_delta_dim=3 \
+  contact_history_use_ee_delta=true
+
+关闭误差部分：
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/train.py \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=01125 \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  srsa_sparse_reward=false \
+  isaaclab_disable_imitation_reward=false \
+  srsa_if_sbc=false \
+  num_envs=350 \
+  isaaclab_gpu_collision_stack_size=268435456 \
+  gpu_id=0 \
+  multiproc=true \
+  num_gpus=2 \
+  steps=7000000 \
+  model_size=S \
+  batch_size=1024 \
+  buffer_size=10000000 \
+  horizon=3 \
+  utd=0.075 \
+  use_demos=false \
+  compile=true \
+  enable_wandb=true \
+  save_agent=true \
+  save_best=true \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  srsa_task_family_name=normal_fit \
+  srsa_task_param_obs=false \
+  srsa_task_param_obs_mode=task_vec \
+  srsa_enable_axial_task_param_sampler=true \
+  srsa_axial_fixed_plug_scale=true \
+  srsa_axial_clearance_base=0.000114 \
+  'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
+  srsa_axial_clearance_jitter_ratio=0.10 \
+  srsa_axial_depth_base=0.015 \
+  srsa_axial_depth_jitter_ratio=0.10 \
+  'srsa_axial_init_error_xy_range="0.00,0.00"' \
+  'srsa_axial_init_error_z_range="0.00,0.00"' \
+  'srsa_axial_init_error_yaw_range="-0.0,0.0"' \
+  'srsa_axial_visual_noise_xy_range="0.0,0.0"' \
+  'srsa_axial_visual_noise_z_range="0.0,0.0"' \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  isaaclab_canonical_append_task_params=false \
+  srsa_vision_noise_xy_std=0.0 \
+  srsa_vision_noise_xy_jitter_std=0.0 \
+  srsa_vision_noise_z_std=0.0 \
+  srsa_vision_noise_z_jitter_std=0.0 \
+  isaaclab_canonical_use_visual_noise=false \
+  task_conditioning=axial_params \
+  progress_log_interval_sec=30 \
+  skip_initial_eval=true \
+  eval_episodes=1 \
+  eval_freq=300000 \
+  exp_name=srsa_axial_online \
+  contact_history_enabled=true \
+  contact_history_len=4  \
+  contact_context_dim=64 \
+  contact_history_hidden_dim=128 \
+  contact_history_layers=2 \
+  contact_force_dim=6 \
+  contact_action_dim=3 \
+  contact_ee_delta_dim=3 \
   contact_history_use_ee_delta=true
 
 当前实现状态：
@@ -381,9 +572,9 @@ Z 方向视觉定位误差标准差，单位是米。
 
 每步 jitter 的 Z 标准差，单位是米。
 
-`isaaclab_canonical_use_visual_noise=true`
+`isaaclab_canonical_use_visual_noise`
 
-canonical obs 构造时用带视觉误差的 socket frame。注意：visual noise 不进入 AxialTaskEncoder，只影响 state observation。
+是否在 canonical obs 构造时使用带视觉误差的 socket frame。注意：visual noise 不进入 AxialTaskEncoder，只影响 state observation。
 
 ### 任务参数与 AxialTaskEncoder
 
@@ -447,8 +638,8 @@ srsa_axial_depth_jitter_ratio=0.10
 'srsa_axial_init_error_xy_range="0.005,0.0010"'
 'srsa_axial_init_error_z_range="0.00,0.005"'
 'srsa_axial_init_error_yaw_range="-0.15,0.15"'
-'srsa_axial_visual_noise_xy_range="0.0,0.001"'
-'srsa_axial_visual_noise_z_range="0.0,0.0005"'
+'srsa_axial_visual_noise_xy_range="0.0,0.0"'
+'srsa_axial_visual_noise_z_range="0.0,0.0"'
 ```
 
 联合模板格式是：
@@ -872,7 +1063,8 @@ batch_eval_assembly_ids="[00141,00211]"
   eval_zmq_server=tcp://<robot-host>:5555 \
   eval_zmq_rate=10 \
   eval_zmq_action_scale=0.05 \
-  eval_zmq_action_frame=socket \
+  eval_zmq_action_frame=world \
+  eval_zmq_command_frame=world \
   'eval_zmq_action_order="dx,dy,dz,droll,dpitch,dyaw"' \
   isaaclab_backend=srsa \
   task=isaaclab-srsa-assembly \
@@ -889,6 +1081,9 @@ batch_eval_assembly_ids="[00141,00211]"
   isaaclab_canonical_append_force=true \
   isaaclab_canonical_append_task_params=false \
   task_conditioning=axial_params \
+  eval_trace_enabled=true \
+  eval_trace_steps=20 \
+  eval_trace_fp=traces/real_00186.jsonl \
   enable_wandb=false \
   exp_name=eval_real_closed_loop
 ```
@@ -897,6 +1092,37 @@ batch_eval_assembly_ids="[00141,00211]"
 
 ```text
 {"obs": [17 floats], "task_vec_6": [6 floats], "episode_step": 0, "done": false}
+```
+
+需要对比 sim2real 的机械臂操作时，开启 `eval_trace_enabled=true`。真机闭环默认写 `data/real_closed_loop_trace.jsonl`，仿真 `eval_trials` 路径默认写 `data/sim_trace.jsonl`；文件里第一行是 metadata，后面每行记录一次推理的 `obs/action/task/action_info`。如果 action 通过 ZMQ 发出，还会记录缩放后的 `sent_action`；仿真还包含 `next_obs/reward/done`，真机还包含 observation 消息的 `seq/timestamp`。
+
+仿真侧示例：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=/path/to/checkpoint.pt \
+  eval_mode=sim \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=00186 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=2 \
+  num_envs=1 \
+  eval_trials=1 \
+  model_size=S \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  task_conditioning=axial_params \
+  eval_trace_enabled=true \
+  eval_trace_steps=20 \
+  eval_trace_fp=traces/sim_00186.jsonl \
+  enable_wandb=false \
+  exp_name=eval_sim_trace
 ```
 
 `stream` 模式仍可用于低速检查 action 链路：
@@ -931,7 +1157,7 @@ batch_eval_assembly_ids="[00141,00211]"
   exp_name=eval_real_zmq
 ```
 
-真机首次测试建议把 `eval_zmq_action_scale` 设小，例如 `0.05` 或 `0.10`，确认方向、坐标系和限幅无误后再提高。机器人侧必须把 Newt 的 6D action 作为归一化末端增量处理，并保留速度、位移、力、碰撞和 workspace 限幅；真机 success 需要由真机侧日志或外部记录确认。
+真机首次测试建议把 `eval_zmq_action_scale` 设小，例如 `0.05` 或 `0.10`，确认方向、坐标系和限幅无误后再提高。机器人侧必须把 Newt 的 6D action 作为归一化末端增量处理，并保留速度、位移、力、碰撞和 workspace 限幅；当前 SRSA/IsaacLab checkpoint 的 action 是 SRSA 原生 world/env frame fingertip delta，不是 socket-frame action，因此不要再做 socket -> TCP 的二次转换。真机 success 需要由真机侧日志或外部记录确认。
 
 结果会保存为：
 
@@ -976,10 +1202,16 @@ skip_initial_eval=true eval_freq=0
 
 ```text
 Axial task encoder ... -> 64D
-Q-functions ... in_features=454
+Q-functions ... in_features=451
 ```
 
 其中：
+
+```text
+451 = latent_dim 384 + action_dim 3 + task_dim 64
+```
+
+如果显式切回旧的 6D action 口径，则对应为：
 
 ```text
 454 = latent_dim 384 + action_dim 6 + task_dim 64

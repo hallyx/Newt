@@ -22,9 +22,14 @@ class ZMQActionPublisher:
 		env_index: int = 0,
 		rate: float = 0.0,
 		action_scale: float = 1.0,
+		max_trans_delta: Optional[float] = None,
+		max_rot_delta: Optional[float] = None,
+		warmup_steps: int = 0,
+		send_timeout_ms: int = 0,
 		send_done: bool = True,
 		enabled: bool = True,
 		action_frame: str = "socket",
+		command_frame: Optional[str] = None,
 		action_order: Optional[list[str]] = None,
 	):
 		self.enabled = bool(enabled)
@@ -32,8 +37,13 @@ class ZMQActionPublisher:
 		self.env_index = int(env_index)
 		self.period = 1.0 / float(rate) if rate and rate > 0.0 else 0.0
 		self.action_scale = float(action_scale)
+		self.max_trans_delta = None if max_trans_delta is None else abs(float(max_trans_delta))
+		self.max_rot_delta = None if max_rot_delta is None else abs(float(max_rot_delta))
+		self.warmup_steps = max(int(warmup_steps), 0)
+		self.send_timeout_ms = max(int(send_timeout_ms), 0)
 		self._send_done = bool(send_done)
 		self.action_frame = str(action_frame)
+		self.command_frame = str(command_frame) if command_frame is not None else self.action_frame
 		self.action_order = list(action_order or ["dx", "dy", "dz", "droll", "dpitch", "dyaw"])
 		self._context = None
 		self._socket = None
@@ -54,6 +64,7 @@ class ZMQActionPublisher:
 		self._socket = self._context.socket(zmq.PUSH)
 		self._socket.setsockopt(zmq.SNDHWM, 1)
 		self._socket.setsockopt(zmq.LINGER, 0)
+		self._socket.setsockopt(zmq.SNDTIMEO, self.send_timeout_ms)
 		self._socket.connect(server)
 
 	def close(self):
@@ -87,6 +98,17 @@ class ZMQActionPublisher:
 			return (value * self.action_scale).tolist()
 		return [float(x) * self.action_scale for x in value]
 
+	def _shape_delta(self, delta: list[float], step: int) -> list[float]:
+		tensor = torch.as_tensor(delta, dtype=torch.float32).reshape(-1)
+		if self.warmup_steps > 0:
+			scale = min(max(int(step) + 1, 0), self.warmup_steps) / float(self.warmup_steps)
+			tensor = tensor * scale
+		if self.max_trans_delta is not None:
+			tensor[:3] = tensor[:3].clamp(-self.max_trans_delta, self.max_trans_delta)
+		if self.max_rot_delta is not None:
+			tensor[3:6] = tensor[3:6].clamp(-self.max_rot_delta, self.max_rot_delta)
+		return tensor.tolist()
+
 	def _maybe_sleep_for_rate(self):
 		if self.period <= 0.0:
 			return
@@ -107,10 +129,20 @@ class ZMQActionPublisher:
 		state_seq: Optional[int] = None,
 		state_timestamp: Optional[float] = None,
 		done: bool = False,
+		preprocessed: bool = False,
+		raw_action: Optional[list[float]] = None,
 	):
 		if not self.enabled or self._socket is None:
-			return
-		delta = self._select_action(action)
+			return None
+		if preprocessed:
+			delta = action.detach().reshape(-1).to("cpu", dtype=torch.float32).tolist() if torch.is_tensor(action) else [float(x) for x in action]
+			raw_delta = list(raw_action) if raw_action is not None else list(delta)
+		else:
+			delta = self._select_action(action)
+			raw_delta = list(delta)
+			delta = self._shape_delta(delta, step)
+		if len(delta) == 3:
+			delta = [*delta, 0.0, 0.0, 0.0]
 		if len(delta) != 6:
 			raise ValueError(f"Expected a 6D action for ZMQ robot control, got {len(delta)}D.")
 		self._maybe_sleep_for_rate()
@@ -120,6 +152,8 @@ class ZMQActionPublisher:
 			"command": {
 				"type": "cartesian_delta",
 				"delta": delta,
+				"frame": self.command_frame,
+				"policy_frame": self.action_frame,
 				"state_seq": None if state_seq is None else int(state_seq),
 				"state_timestamp": None if state_timestamp is None else float(state_timestamp),
 			},
@@ -128,19 +162,25 @@ class ZMQActionPublisher:
 			"gripper_toggle": False,
 			"slow_mode": False,
 			"action": delta,
+			"raw_action": raw_delta,
 			"step": int(step),
 			"episode_step": None if episode_step is None else int(episode_step),
 			"task_id": None if task_id is None else int(task_id),
 			"done": bool(done),
 			"source": "newt_eval",
-			"action_frame": self.action_frame,
+			"action_frame": self.command_frame,
+			"command_frame": self.command_frame,
+			"policy_action_frame": self.action_frame,
 			"action_order": self.action_order,
 		}
 		try:
-			self._socket.send_json(message, flags=self._zmq.NOBLOCK)
+			flags = self._zmq.NOBLOCK if self.send_timeout_ms <= 0 else 0
+			self._socket.send_json(message, flags=flags)
+			message["send_ok"] = True
 		except self._zmq.Again:
-			pass
+			message["send_ok"] = False
 		self._seq += 1
+		return message
 
 	def send_done(
 		self,
@@ -153,7 +193,7 @@ class ZMQActionPublisher:
 	):
 		if not self._send_done:
 			return
-		self.send_action(
+		return self.send_action(
 			[0.0] * 6,
 			step=step,
 			episode_step=episode_step,
@@ -174,9 +214,14 @@ def make_eval_zmq_publisher(cfg) -> ZMQActionPublisher:
 		env_index=cfg.get("eval_zmq_env_index", 0),
 		rate=cfg.get("eval_zmq_rate", 0.0),
 		action_scale=cfg.get("eval_zmq_action_scale", 1.0),
+		max_trans_delta=cfg.get("eval_zmq_max_trans_delta", None),
+		max_rot_delta=cfg.get("eval_zmq_max_rot_delta", None),
+		warmup_steps=cfg.get("eval_zmq_warmup_steps", 0),
+		send_timeout_ms=cfg.get("eval_zmq_send_timeout_ms", 0),
 		send_done=cfg.get("eval_zmq_send_done", True),
 		enabled=enabled,
 		action_frame=cfg.get("eval_zmq_action_frame", "socket"),
+		command_frame=cfg.get("eval_zmq_command_frame", None),
 		action_order=action_order,
 	)
 
@@ -208,6 +253,9 @@ class ZMQObservationReceiver:
 		socket_pos=None,
 		socket_quat_wxyz=None,
 		socket_quat_xyzw=None,
+		socket_euler_xyz=None,
+		socket_euler_degrees: bool = False,
+		tcp_offset_ee=None,
 		use_initial_pose_as_socket: bool = False,
 		gripper_width_default: float = 0.0,
 		force_scale: float = 50.0,
@@ -228,7 +276,13 @@ class ZMQObservationReceiver:
 		self.force_scale = float(force_scale)
 		self.zero_missing_force = bool(zero_missing_force)
 		self._socket_pos = self._coerce_vector(socket_pos, 3, "eval_real_socket_pos")
-		self._socket_quat = self._coerce_quat(socket_quat_wxyz, socket_quat_xyzw)
+		self._socket_quat = self._coerce_quat_or_euler(
+			socket_quat_wxyz,
+			socket_quat_xyzw,
+			socket_euler_xyz,
+			socket_euler_degrees,
+		)
+		self._tcp_offset_ee = self._coerce_vector(tcp_offset_ee, 3, "eval_real_tcp_offset_ee")
 		self._prev_pos = None
 		self._prev_quat = None
 		self._prev_time = None
@@ -297,11 +351,14 @@ class ZMQObservationReceiver:
 		return message
 
 	def obs_tensor(self, message: dict, *, obs_dim: int, device) -> torch.Tensor:
-		obs = message.get(self.obs_key, None)
-		if obs is None:
-			obs = message.get("observation", message.get("state", None))
-		if obs is None:
+		if self.state_format in {"libfranka", "robot_state"}:
 			obs = self._build_obs_from_robot_state(message, obs_dim)
+		else:
+			obs = message.get(self.obs_key, None)
+			if obs is None:
+				obs = message.get("observation", message.get("state", None))
+			if obs is None:
+				obs = self._build_obs_from_robot_state(message, obs_dim)
 		obs = torch.as_tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
 		if self.zero_missing_force and obs.shape[-1] == 14 and int(obs_dim) > 14:
 			pad = torch.zeros((1, int(obs_dim) - 14), dtype=obs.dtype, device=obs.device)
@@ -348,6 +405,40 @@ class ZMQObservationReceiver:
 		else:
 			return None
 		return cls._normalize_quat(quat)
+
+	@classmethod
+	def _euler_xyz_to_quat(cls, euler_xyz, *, degrees: bool = False, name: str = "euler_xyz"):
+		roll, pitch, yaw = cls._coerce_vector(euler_xyz, 3, name).unbind()
+		if degrees:
+			scale = math.pi / 180.0
+			roll = roll * scale
+			pitch = pitch * scale
+			yaw = yaw * scale
+		cr, sr = torch.cos(roll * 0.5), torch.sin(roll * 0.5)
+		cp, sp = torch.cos(pitch * 0.5), torch.sin(pitch * 0.5)
+		cy, sy = torch.cos(yaw * 0.5), torch.sin(yaw * 0.5)
+		return cls._normalize_quat(torch.stack([
+			cr * cp * cy + sr * sp * sy,
+			sr * cp * cy - cr * sp * sy,
+			cr * sp * cy + sr * cp * sy,
+			cr * cp * sy - sr * sp * cy,
+		]))
+
+	@classmethod
+	def _coerce_quat_or_euler(cls, quat_wxyz, quat_xyzw, euler_xyz, euler_degrees: bool):
+		num_rotation_inputs = sum(value is not None for value in (quat_wxyz, quat_xyzw, euler_xyz))
+		if num_rotation_inputs > 1:
+			raise ValueError(
+				"Provide only one of eval_real_socket_quat_wxyz, "
+				"eval_real_socket_quat_xyzw, or eval_real_socket_euler_xyz."
+			)
+		if euler_xyz is not None:
+			return cls._euler_xyz_to_quat(
+				euler_xyz,
+				degrees=euler_degrees,
+				name="eval_real_socket_euler_xyz",
+			)
+		return cls._coerce_quat(quat_wxyz, quat_xyzw)
 
 	@staticmethod
 	def _normalize_quat(quat):
@@ -433,6 +524,8 @@ class ZMQObservationReceiver:
 			matrix = torch.as_tensor(matrix, dtype=torch.float64).reshape(4, 4).T
 			pos = matrix[:3, 3]
 			quat = self._matrix_to_quat(matrix[:3, :3])
+			if self._tcp_offset_ee is not None:
+				pos = pos + matrix[:3, :3] @ self._tcp_offset_ee
 			return pos, quat
 
 		pos = message.get("tcp_pos", message.get("position", ee.get("position", None)))
@@ -444,13 +537,17 @@ class ZMQObservationReceiver:
 		pos = self._coerce_vector(pos, 3, "end_effector.position")
 		quat_xyzw = message.get("tcp_quat_xyzw", ee.get("orientation_quat_xyzw", None))
 		quat_wxyz = message.get("tcp_quat_wxyz", ee.get("orientation_quat_wxyz", None))
-		if quat_wxyz is None and quat_xyzw is None:
+		euler_xyz = message.get("tcp_euler_xyz", ee.get("orientation_euler_xyz", None))
+		if quat_wxyz is None and quat_xyzw is None and euler_xyz is None:
 			raise KeyError(
 				"Real closed-loop canonical obs needs TCP orientation. "
 				"Run libfranka zmq_cartesian_teleop_server.py with --full-state, "
-				"or include end_effector.orientation_quat_xyzw / tcp_quat_wxyz."
+				"or include end_effector.orientation_quat_xyzw / tcp_quat_wxyz / orientation_euler_xyz."
 			)
-		return pos, self._coerce_quat(quat_wxyz, quat_xyzw)
+		quat = self._coerce_quat_or_euler(quat_wxyz, quat_xyzw, euler_xyz, False)
+		if self._tcp_offset_ee is not None:
+			pos = pos + self._quat_to_matrix(quat) @ self._tcp_offset_ee
+		return pos, quat
 
 	def _extract_socket_pose(self, message: dict, tcp_pos, tcp_quat):
 		socket = message.get("socket", message.get("target_socket", message.get("target", None)))
@@ -458,8 +555,14 @@ class ZMQObservationReceiver:
 			pos = socket.get("position", socket.get("pos", None))
 			quat_wxyz = socket.get("quat_wxyz", socket.get("orientation_quat_wxyz", None))
 			quat_xyzw = socket.get("quat_xyzw", socket.get("orientation_quat_xyzw", None))
-			if pos is not None and (quat_wxyz is not None or quat_xyzw is not None):
-				return self._coerce_vector(pos, 3, "socket.position"), self._coerce_quat(quat_wxyz, quat_xyzw)
+			euler_xyz = socket.get("euler_xyz", socket.get("orientation_euler_xyz", None))
+			if pos is not None and (quat_wxyz is not None or quat_xyzw is not None or euler_xyz is not None):
+				return self._coerce_vector(pos, 3, "socket.position"), self._coerce_quat_or_euler(
+					quat_wxyz,
+					quat_xyzw,
+					euler_xyz,
+					False,
+				)
 		if self._socket_pos is not None and self._socket_quat is not None:
 			return self._socket_pos, self._socket_quat
 		if self.use_initial_pose_as_socket:
@@ -602,6 +705,9 @@ def make_eval_zmq_observation_receiver(cfg) -> ZMQObservationReceiver:
 		socket_pos=cfg.get("eval_real_socket_pos", None),
 		socket_quat_wxyz=cfg.get("eval_real_socket_quat_wxyz", None),
 		socket_quat_xyzw=cfg.get("eval_real_socket_quat_xyzw", None),
+		socket_euler_xyz=cfg.get("eval_real_socket_euler_xyz", None),
+		socket_euler_degrees=cfg.get("eval_real_socket_euler_degrees", False),
+		tcp_offset_ee=cfg.get("eval_real_tcp_offset_ee", None),
 		use_initial_pose_as_socket=cfg.get("eval_real_use_initial_pose_as_socket", False),
 		gripper_width_default=cfg.get("eval_real_gripper_width_default", 0.0),
 		force_scale=cfg.get("eval_real_force_scale", 50.0),

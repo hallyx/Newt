@@ -42,6 +42,21 @@ torch.set_float32_matmul_precision('high')
 cs = ConfigStore.instance()
 cs.store(name="config", node=Config)
 
+SUCCESS_DIAGNOSTIC_KEYS = (
+	"official_success",
+	"current_official_success",
+	"process_success",
+	"episode_process_success",
+	"terminal_process_success",
+	"dual_success",
+	"depth_fraction",
+	"lateral_error",
+	"orientation_error",
+	"yaw_error",
+	"keypoint_error",
+	"jam",
+)
+
 
 def _parse_assembly_ids(raw) -> list[str]:
 	if raw is None:
@@ -112,6 +127,9 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"srsa_mesh_depth_scale",
 		"srsa_mesh_reference_radius_column",
 		"srsa_mesh_reference_depth_column",
+		"srsa_position_control_only",
+		"srsa_policy_action_dim",
+		"srsa_env_action_dim",
 		"srsa_task_param_obs",
 		"srsa_task_param_obs_mode",
 		"srsa_newt_obs",
@@ -153,6 +171,7 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"mpc",
 		"isaaclab_headless",
 		"isaaclab_use_canonical_obs",
+		"isaaclab_gpu_collision_stack_size",
 		"isaaclab_disable_imitation_reward",
 		"srsa_task_family_name",
 		"srsa_enable_flange_force_sensor",
@@ -262,6 +281,7 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 		returns = []
 		lengths = []
 		successes = []
+		success_diagnostics = {key: [] for key in SUCCESS_DIAGNOSTIC_KEYS}
 		completed = 0
 		env_steps = 0
 		start_time = monotonic()
@@ -297,7 +317,8 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 				obs = _adapt_obs_to_checkpoint(raw_obs, expected_obs_dim)
 				next_return = episode_return + reward
 				next_len = episode_len + 1
-				success_tensor = info.get('final_info', {}).get('success', None) if isinstance(info, dict) else None
+				final_info = info.get('final_info', {}) if isinstance(info, dict) else {}
+				success_tensor = final_info.get('success', None)
 				for env_index in range(cfg.num_envs):
 					if not bool(done[env_index].item()):
 						continue
@@ -309,6 +330,10 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 					returns.append(float(next_return[env_index].detach().item()))
 					lengths.append(int(next_len[env_index].detach().item()))
 					successes.append(success)
+					for metric_key in SUCCESS_DIAGNOSTIC_KEYS:
+						if metric_key in final_info:
+							value = torch.nan_to_num(final_info[metric_key][env_index], nan=0.0)
+							success_diagnostics[metric_key].append(float(value.detach().item()))
 					completed += 1
 				episode_return = torch.where(done, torch.zeros_like(next_return), next_return)
 				episode_len = torch.where(done, torch.zeros_like(next_len), next_len)
@@ -343,6 +368,9 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 			"mpc": bool(use_mpc),
 			"env_steps": int(env_steps),
 		}
+		for metric_key, values in success_diagnostics.items():
+			if values:
+				metrics[f"episode_{metric_key}"] = _mean(values)
 		_write_json(result_fp, metrics)
 		print(colored(
 			f"Saved eval metrics for assembly_id={assembly_id}: success={metrics['episode_success']:.4f} "
@@ -365,6 +393,10 @@ def _write_summary(summary_fp: Path, results: list[dict]):
 		"episode_length": _mean([item["episode_length"] for item in ordered]),
 		"tasks": ordered,
 	}
+	for metric_key in SUCCESS_DIAGNOSTIC_KEYS:
+		values = [item[f"episode_{metric_key}"] for item in ordered if f"episode_{metric_key}" in item]
+		if values:
+			summary[f"episode_{metric_key}"] = _mean(values)
 	_write_json(summary_fp, summary)
 	csv_fp = summary_fp.with_suffix(".csv")
 	with open(csv_fp, "w", encoding="utf-8", newline="") as f:
@@ -376,6 +408,13 @@ def _write_summary(summary_fp: Path, results: list[dict]):
 				"task_name",
 				"episodes",
 				"episode_success",
+				"episode_official_success",
+				"episode_terminal_process_success",
+				"episode_process_success",
+				"episode_dual_success",
+				"episode_depth_fraction",
+				"episode_lateral_error",
+				"episode_jam",
 				"episode_reward",
 				"episode_length",
 				"success_count",

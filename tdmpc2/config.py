@@ -40,9 +40,15 @@ class Config:
 	isaaclab_use_fabric: Optional[bool] = None
 	isaaclab_use_canonical_obs: bool = False
 	isaaclab_canonical_append_force: bool = False
+	isaaclab_canonical_zero_force: bool = False
+	isaaclab_canonical_force_dim: int = 3
 	isaaclab_canonical_append_task_params: bool = False
 	isaaclab_canonical_use_visual_noise: bool = False
 	isaaclab_action_dim: int = 6
+	isaaclab_gpu_collision_stack_size: Optional[int] = None
+	srsa_position_control_only: bool = True
+	srsa_policy_action_dim: int = 3
+	srsa_env_action_dim: int = 6
 	isaaclab_max_episode_steps: int = 75
 	isaaclab_force_cpu_softdtw: bool = False
 	isaaclab_disable_imitation_reward: bool = False
@@ -122,6 +128,19 @@ class Config:
 	srsa_flange_force_sensor_obs_frame: str = "socket"
 	srsa_flange_force_sensor_obs_scale: float = 50.0
 	srsa_flange_force_sensor_force_threshold: float = 1.0
+	srsa_eval_success_metric: str = "terminal_process"
+	srsa_process_success_depth_ratio: float = 0.85
+	srsa_process_success_lateral_tol_scale: float = 2.0
+	srsa_process_success_lateral_tol_min: float = 0.001
+	srsa_process_success_lateral_tol_max: Optional[float] = 0.003
+	srsa_process_success_orientation_tol_rad: float = 0.0872665
+	srsa_process_success_yaw_tol_rad: float = 0.0872665
+	srsa_process_success_keypoint_tol_scale: float = 2.0
+	srsa_process_success_keypoint_tol_min: float = 0.001
+	srsa_process_success_keypoint_tol_max: Optional[float] = 0.003
+	srsa_process_success_stable_steps: int = 3
+	srsa_process_success_require_official: bool = False
+	srsa_process_success_require_no_jam: bool = True
 
 	# evaluation
 	checkpoint: Optional[str] = None
@@ -138,6 +157,10 @@ class Config:
 	eval_zmq_env_index: int = 0
 	eval_zmq_rate: float = 0.0
 	eval_zmq_action_scale: float = 1.0
+	eval_zmq_max_trans_delta: Optional[float] = None
+	eval_zmq_max_rot_delta: Optional[float] = None
+	eval_zmq_warmup_steps: int = 0
+	eval_zmq_send_timeout_ms: int = 0
 	eval_zmq_send_done: bool = True
 	eval_real_mode: str = "stream"
 	eval_real_obs_server: str = "tcp://localhost:5556"
@@ -153,12 +176,25 @@ class Config:
 	eval_real_socket_pos: Any = None
 	eval_real_socket_quat_wxyz: Any = None
 	eval_real_socket_quat_xyzw: Any = None
+	eval_real_socket_euler_xyz: Any = None
+	eval_real_socket_euler_degrees: bool = False
+	eval_real_tcp_offset_ee: Any = None
 	eval_real_use_initial_pose_as_socket: bool = False
 	eval_real_gripper_width_default: float = 0.0
 	eval_real_force_scale: float = 50.0
 	eval_real_zero_missing_force: bool = True
+	eval_real_debug_log: bool = True
+	eval_real_debug_log_fp: Optional[str] = None
 	eval_zmq_action_frame: str = "socket"
+	eval_zmq_command_frame: Optional[str] = None
 	eval_zmq_action_order: str = "dx,dy,dz,droll,dpitch,dyaw"
+	eval_trace_enabled: bool = False
+	eval_trace_steps: int = 16
+	eval_trace_env_index: Optional[int] = None
+	eval_trace_fp: Optional[str] = None
+	eval_trace_include_next_obs: bool = True
+	eval_trace_include_action_info: bool = True
+	eval_trace_include_raw_msg: bool = False
 
 	# offline training
 	offline_only: bool = False
@@ -618,6 +654,27 @@ def is_isaaclab_task(cfg):
 	)
 
 
+def is_srsa_task(cfg):
+	"""Return True if the Isaac Lab task should use the SRSA adapter."""
+	task = getattr(cfg, 'task', '')
+	env_id = getattr(cfg, 'isaaclab_env_id', '')
+	return (
+		getattr(cfg, 'isaaclab_backend', 'auto') == 'srsa' or
+		getattr(cfg, 'isaaclab_task_package', None) == 'SRSA.tasks' or
+		task.startswith('isaaclab-srsa') or
+		env_id.startswith('Assembly-') or
+		env_id.startswith('Disassembly-')
+	)
+
+
+def srsa_policy_action_dim(cfg, fallback=None):
+	if is_srsa_task(cfg) and bool(getattr(cfg, 'srsa_position_control_only', True)):
+		return int(getattr(cfg, 'srsa_policy_action_dim', 3))
+	if fallback is not None:
+		return int(fallback)
+	return int(getattr(cfg, 'isaaclab_action_dim', 6))
+
+
 def make_isaaclab_task_info(cfg):
 	"""Create synthetic task metadata for Isaac Lab single-task training."""
 	embedding = [0.0] * max(int(cfg.task_dim), 0)
@@ -627,7 +684,7 @@ def make_isaaclab_task_info(cfg):
 			'text_embedding': embedding,
 			'task_vec_6': make_axial_task_vec(cfg, {'task_name': task}),
 			'max_episode_steps': int(cfg.isaaclab_max_episode_steps),
-			'action_dim': int(cfg.isaaclab_action_dim),
+			'action_dim': srsa_policy_action_dim(cfg),
 		}
 	return info
 
@@ -645,7 +702,7 @@ def make_offline_manifest_task_info(cfg, manifest_tasks):
 			'text_embedding': embedding,
 			'task_vec_6': make_axial_task_vec(cfg, item),
 			'max_episode_steps': int(item.get('max_episode_steps', cfg.isaaclab_max_episode_steps)),
-			'action_dim': int(item.get('action_dim', cfg.isaaclab_action_dim)),
+			'action_dim': srsa_policy_action_dim(cfg, item.get('action_dim', cfg.isaaclab_action_dim)),
 		}
 		if 'discount_factor' in item:
 			info[task_name]['discount_factor'] = float(item['discount_factor'])
@@ -748,6 +805,14 @@ def _read_mesh_geometry_row(cfg, mesh_cfg, template_path):
 	if mesh_fp is None:
 		raise ValueError("SRSA mesh geometry templates require srsa_mesh_geometry_fp or mesh_geometry.fp.")
 	mesh_path = _resolve_existing_path(mesh_fp, cfg=cfg, base_dir=template_path.parent)
+	if not mesh_path.exists():
+		raise FileNotFoundError(
+			f"SRSA mesh geometry CSV not found: {mesh_path}. "
+			"Set srsa_mesh_geometry_fp=/absolute/path/to/srsa_mesh_geometry_params.csv, "
+			"or copy the SRSA-exported CSV to the template mesh_geometry.fp path. "
+			"Use assembly_id for the SRSA mesh/task id, and srsa_param_template_id or "
+			"srsa_task_template_id for the clearance/depth parameter template id."
+		)
 	with open(mesh_path, "r", encoding="utf-8", newline="") as f:
 		for row in csv.DictReader(f):
 			if _normalize_srsa_assembly_id(row.get("assembly_id")) == assembly_id:
@@ -842,7 +907,7 @@ def _build_mesh_template_entry(cfg, manifest, template, row, assembly_id, mesh_p
 		"template_id": task_id,
 		"assembly_id": assembly_id,
 		"task_name": f"srsa-{assembly_id}-{template_name}",
-		"action_dim": int(template.get("action_dim", _cfg_value(cfg, "isaaclab_action_dim", 6))),
+		"action_dim": srsa_policy_action_dim(cfg, template.get("action_dim", _cfg_value(cfg, "isaaclab_action_dim", 6))),
 		"max_episode_steps": int(template.get("max_episode_steps", _cfg_value(cfg, "isaaclab_max_episode_steps", 75) - 1)),
 		"mesh_geometry": {
 			"csv": str(mesh_path),

@@ -46,8 +46,21 @@ def _build_canonical_obs(env, cfg=None) -> torch.Tensor:
 		tcp_angvel_socket,
 		gripper_width,
 	]
-	if cfg is not None and cfg.get('isaaclab_canonical_append_force', False) and hasattr(env, 'flange_force_obs'):
-		parts.append(env.flange_force_obs)
+	if cfg is not None and cfg.get('isaaclab_canonical_append_force', False):
+		force_obs = getattr(env, 'flange_force_obs', None)
+		if cfg.get('isaaclab_canonical_zero_force', False):
+			force_dim = (
+				int(force_obs.shape[-1])
+				if torch.is_tensor(force_obs) and force_obs.ndim > 0
+				else int(cfg.get('isaaclab_canonical_force_dim', 3))
+			)
+			force_obs = torch.zeros(
+				(*tcp_pos_socket.shape[:-1], force_dim),
+				dtype=tcp_pos_socket.dtype,
+				device=tcp_pos_socket.device,
+			)
+		if force_obs is not None:
+			parts.append(force_obs)
 	task_params = _get_srsa_task_param_obs_tensor(env, cfg)
 	if cfg is not None and cfg.get('isaaclab_canonical_append_task_params', False) and task_params is not None:
 		parts.append(task_params)
@@ -150,6 +163,18 @@ def _uses_srsa_backend(cfg):
 	)
 
 
+def _srsa_position_control_only(cfg):
+	return _uses_srsa_backend(cfg) and bool(cfg.get('srsa_position_control_only', True))
+
+
+def _srsa_policy_action_dim(cfg):
+	return int(cfg.get('srsa_policy_action_dim', 3))
+
+
+def _srsa_env_action_dim(cfg):
+	return int(cfg.get('srsa_env_action_dim', 6))
+
+
 def _bool_env(value):
 	return "1" if bool(value) else "0"
 
@@ -199,6 +224,272 @@ def _get_srsa_current_task_vec(env):
 			except (TypeError, ValueError, RuntimeError):
 				return None
 	return None
+
+
+def _normalize_srsa_eval_success_metric(metric):
+	normalized = str(metric or "official").strip().lower().replace("-", "_")
+	aliases = {
+		"automate": "official",
+		"auto_mate": "official",
+		"official_success": "official",
+		"current": "current_official",
+		"current_success": "current_official",
+		"current_official_success": "current_official",
+		"process_success": "process",
+		"episode_process_success": "episode_process",
+		"terminal": "terminal_process",
+		"terminal_success": "terminal_process",
+		"terminal_process_success": "terminal_process",
+		"strict": "terminal_process",
+		"strict_success": "terminal_process",
+		"dual_success": "dual",
+	}
+	normalized = aliases.get(normalized, normalized)
+	if normalized not in {"official", "current_official", "process", "episode_process", "terminal_process", "dual"}:
+		raise ValueError(
+			"srsa_eval_success_metric must be one of: official, current_official, "
+			"process, episode_process, terminal_process, dual."
+		)
+	return normalized
+
+
+def _env_vector(env, value, *, dtype=torch.float32, default=0.0):
+	num_envs = int(getattr(env, 'num_envs', 1))
+	device = getattr(env, 'device', None)
+	if value is None:
+		value = default
+	if torch.is_tensor(value):
+		tensor = value.detach().to(device=device, dtype=dtype)
+	else:
+		tensor = torch.as_tensor(value, device=device, dtype=dtype)
+	if tensor.ndim == 0:
+		tensor = tensor.reshape(1)
+	if tensor.shape[0] == 1 and num_envs > 1:
+		tensor = tensor.expand(num_envs, *tensor.shape[1:])
+	return tensor.reshape(num_envs, *tensor.shape[1:])
+
+
+def _task_param_vector(env, key, *, dtype=torch.float32, default=0.0):
+	params = getattr(env, 'current_task_param_tensors', None)
+	if isinstance(params, dict) and key in params:
+		return _env_vector(env, params[key], dtype=dtype, default=default).reshape(int(getattr(env, 'num_envs', 1)))
+	params = getattr(env, 'current_task_params', None)
+	if isinstance(params, dict) and key in params:
+		return _env_vector(env, params[key], dtype=dtype, default=default).reshape(int(getattr(env, 'num_envs', 1)))
+	return _env_vector(env, default, dtype=dtype, default=default).reshape(int(getattr(env, 'num_envs', 1)))
+
+
+def _task_or_attr_vector(env, key, attr_candidates, *, dtype=torch.float32, default=0.0):
+	params = getattr(env, 'current_task_param_tensors', None)
+	if isinstance(params, dict) and key in params:
+		return _env_vector(env, params[key], dtype=dtype, default=default).reshape(int(getattr(env, 'num_envs', 1)))
+	for attr in attr_candidates:
+		if hasattr(env, attr):
+			return _env_vector(env, getattr(env, attr), dtype=dtype, default=default).reshape(int(getattr(env, 'num_envs', 1)))
+	params = getattr(env, 'current_task_params', None)
+	if isinstance(params, dict) and key in params:
+		return _env_vector(env, params[key], dtype=dtype, default=default).reshape(int(getattr(env, 'num_envs', 1)))
+	return _env_vector(env, default, dtype=dtype, default=default).reshape(int(getattr(env, 'num_envs', 1)))
+
+
+def _clamped_tolerance(base, scale, min_value, max_value):
+	tol = base * float(scale)
+	if min_value is not None:
+		tol = torch.maximum(tol, torch.full_like(tol, float(min_value)))
+	if max_value is not None:
+		tol = torch.minimum(tol, torch.full_like(tol, float(max_value)))
+	return tol
+
+
+def _compute_srsa_current_official_success(env):
+	num_envs = int(getattr(env, 'num_envs', 1))
+	device = getattr(env, 'device', None)
+	zeros = torch.zeros((num_envs,), dtype=torch.bool, device=device)
+	required = ("held_pos", "fixed_pos", "keypoints_held", "keypoints_fixed")
+	if not all(hasattr(env, name) for name in required):
+		return zeros
+	try:
+		from isaaclab_tasks.direct.automate import automate_algo_utils as automate_algo
+
+		insertion_depth = _task_or_attr_vector(
+			env,
+			"insertion_depth",
+			("current_insertion_depth_tensor", "disassembly_dists", "current_insertion_depth"),
+			default=0.0,
+		)
+		close_error_thresh = _task_or_attr_vector(
+			env,
+			"success_pos_tol",
+			("current_close_error_thresh_tensor", "current_close_error_thresh"),
+			default=float(getattr(getattr(env, 'cfg_task', None), 'close_error_thresh', 0.015)),
+		)
+		return automate_algo.check_plug_inserted_in_socket(
+			env.held_pos,
+			env.fixed_pos,
+			insertion_depth,
+			env.keypoints_held,
+			env.keypoints_fixed,
+			close_error_thresh,
+			env.episode_length_buf,
+		).to(dtype=torch.bool)
+	except Exception:
+		if hasattr(env, 'ep_succeeded'):
+			return _env_vector(env, env.ep_succeeded, dtype=torch.bool, default=False).reshape(num_envs)
+		return zeros
+
+
+def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_success):
+	num_envs = int(getattr(env, 'num_envs', 1))
+	device = getattr(env, 'device', None)
+	zeros = torch.zeros((num_envs,), dtype=torch.float32, device=device)
+	false = torch.zeros((num_envs,), dtype=torch.bool, device=device)
+
+	current_official = _compute_srsa_current_official_success(env)
+	if hasattr(env, 'ep_succeeded'):
+		official = _env_vector(env, env.ep_succeeded, dtype=torch.bool, default=False).reshape(num_envs)
+	else:
+		official = current_official
+
+	target_depth = _task_or_attr_vector(
+		env,
+		"insertion_depth",
+		("current_insertion_depth_tensor", "disassembly_dists", "current_insertion_depth"),
+		default=0.0,
+	)
+	radial_clearance = _task_param_vector(env, "radial_clearance", default=0.0)
+	if torch.all(radial_clearance <= 0.0):
+		diametral_clearance = _task_param_vector(env, "clearance", default=0.0)
+		radial_clearance = 0.5 * diametral_clearance.clamp_min(0.0)
+
+	rel_socket = torch.zeros((num_envs, 3), dtype=torch.float32, device=device)
+	if all(hasattr(env, name) for name in ("held_pos", "fixed_pos", "fixed_quat")):
+		try:
+			import isaacsim.core.utils.torch as torch_utils
+
+			rel_socket = torch_utils.quat_apply(
+				torch_utils.quat_conjugate(env.fixed_quat),
+				env.held_pos - env.fixed_pos,
+			).to(dtype=torch.float32)
+		except Exception:
+			rel_socket = (env.held_pos - env.fixed_pos).to(dtype=torch.float32)
+
+	current_depth = (target_depth - rel_socket[:, 2]).clamp_min(0.0)
+	depth_fraction = current_depth / target_depth.clamp_min(1.0e-6)
+	height_window_ok = (rel_socket[:, 2] > 0.0) & (rel_socket[:, 2] < target_depth.clamp_min(1.0e-6))
+	depth_ok = height_window_ok & (depth_fraction >= float(cfg.get('srsa_process_success_depth_ratio', 0.85)))
+
+	lateral_error = torch.linalg.norm(rel_socket[:, :2], dim=-1)
+	lateral_tol = _clamped_tolerance(
+		radial_clearance,
+		cfg.get('srsa_process_success_lateral_tol_scale', 2.0),
+		cfg.get('srsa_process_success_lateral_tol_min', 0.001),
+		cfg.get('srsa_process_success_lateral_tol_max', 0.003),
+	)
+	lateral_ok = lateral_error <= lateral_tol
+
+	orientation_error = zeros.clone()
+	yaw_error = zeros.clone()
+	if all(hasattr(env, name) for name in ("held_quat", "fixed_quat")):
+		try:
+			import isaacsim.core.utils.torch as torch_utils
+
+			rel_quat = torch_utils.quat_mul(env.held_quat, torch_utils.quat_conjugate(env.fixed_quat))
+			rel_quat = torch.where(rel_quat[:, :1] < 0.0, -rel_quat, rel_quat)
+			rel_euler = torch.stack(torch_utils.get_euler_xyz(rel_quat), dim=1)
+			rel_euler = torch.atan2(torch.sin(rel_euler), torch.cos(rel_euler))
+			orientation_error = torch.amax(torch.abs(rel_euler[:, :2]), dim=-1).to(dtype=torch.float32)
+			yaw_error = torch.abs(rel_euler[:, 2]).to(dtype=torch.float32)
+		except Exception:
+			pass
+	orientation_ok = orientation_error <= float(cfg.get('srsa_process_success_orientation_tol_rad', 0.0872665))
+	yaw_required = _task_param_vector(env, "yaw_requirement_float", default=0.0) > 0.5
+	if cfg.get('srsa_axial_yaw_requirement', None) is not None:
+		yaw_required = torch.full_like(yaw_required, bool(cfg.get('srsa_axial_yaw_requirement', False)))
+	yaw_ok = (~yaw_required) | (yaw_error <= float(cfg.get('srsa_process_success_yaw_tol_rad', 0.0872665)))
+
+	keypoint_error = zeros.clone()
+	if all(hasattr(env, name) for name in ("keypoints_held", "keypoints_fixed")):
+		keypoint_error = torch.linalg.norm(env.keypoints_fixed - env.keypoints_held, dim=-1).mean(dim=-1).to(dtype=torch.float32)
+	keypoint_tol = _clamped_tolerance(
+		radial_clearance,
+		cfg.get('srsa_process_success_keypoint_tol_scale', 2.0),
+		cfg.get('srsa_process_success_keypoint_tol_min', 0.001),
+		cfg.get('srsa_process_success_keypoint_tol_max', 0.003),
+	)
+	keypoint_ok = keypoint_error <= keypoint_tol
+
+	contact = false
+	if hasattr(env, 'flange_force_flag'):
+		contact = _env_vector(env, env.flange_force_flag, dtype=torch.bool, default=False).reshape(num_envs)
+	jam_lateral_thresh = torch.maximum(radial_clearance, lateral_tol)
+	jam = contact & (~current_official) & (lateral_error > jam_lateral_thresh)
+
+	process = depth_ok & lateral_ok & orientation_ok & yaw_ok & keypoint_ok
+	if bool(cfg.get('srsa_process_success_require_no_jam', True)):
+		process = process & (~jam)
+	if bool(cfg.get('srsa_process_success_require_official', False)):
+		process = process & current_official
+
+	stable_steps = max(1, int(cfg.get('srsa_process_success_stable_steps', 3)))
+	process_streak = torch.where(process, process_streak + 1, torch.zeros_like(process_streak))
+	terminal_process = process & (process_streak >= stable_steps)
+	episode_process_success = episode_process_success | terminal_process
+	dual = official & terminal_process
+
+	return {
+		"success_metric": _normalize_srsa_eval_success_metric(cfg.get('srsa_eval_success_metric', 'official')),
+		"official_success": official,
+		"current_official_success": current_official,
+		"process_success": process,
+		"episode_process_success": episode_process_success,
+		"terminal_process_success": terminal_process,
+		"dual_success": dual,
+		"depth_ok": depth_ok,
+		"lateral_ok": lateral_ok,
+		"orientation_ok": orientation_ok,
+		"yaw_ok": yaw_ok,
+		"keypoint_ok": keypoint_ok,
+		"jam": jam,
+		"depth_fraction": depth_fraction,
+		"current_depth": current_depth,
+		"target_depth": target_depth,
+		"lateral_error": lateral_error,
+		"lateral_tol": lateral_tol,
+		"orientation_error": orientation_error,
+		"yaw_error": yaw_error,
+		"keypoint_error": keypoint_error,
+		"keypoint_tol": keypoint_tol,
+		"radial_clearance": radial_clearance,
+		"process_success_streak": process_streak.to(dtype=torch.float32),
+		"_process_success_streak": process_streak,
+	}
+
+
+def _select_srsa_success(metrics):
+	metric = metrics["success_metric"]
+	if metric == "official":
+		return metrics["official_success"]
+	if metric == "current_official":
+		return metrics["current_official_success"]
+	if metric == "process":
+		return metrics["process_success"]
+	if metric == "episode_process":
+		return metrics["episode_process_success"]
+	if metric == "terminal_process":
+		return metrics["terminal_process_success"]
+	if metric == "dual":
+		return metrics["dual_success"]
+	raise AssertionError(f"Unhandled SRSA success metric: {metric}")
+
+
+def _float_metric(value):
+	if torch.is_tensor(value):
+		if value.dtype == torch.bool:
+			return value.detach().to(dtype=torch.float32)
+		if value.dtype.is_floating_point:
+			return value.detach().to(dtype=torch.float32)
+		return value.detach().to(dtype=torch.float32)
+	return value
 
 
 def _configure_srsa_runtime_env(cfg):
@@ -377,6 +668,25 @@ def _configure_assembly_task(env_cfg, cfg):
 	task.fixed_asset.spawn.usd_path = f"{assembly_dir}/{task.fixed_asset_cfg.usd_path}"
 	task.held_asset.spawn.usd_path = f"{assembly_dir}/{task.held_asset_cfg.usd_path}"
 
+
+def _configure_physx_buffers(env_cfg, cfg):
+	value = cfg.get('isaaclab_gpu_collision_stack_size', None)
+	if value is None:
+		return
+	sim_cfg = getattr(env_cfg, 'sim', None)
+	physx_cfg = getattr(sim_cfg, 'physx', None)
+	if physx_cfg is None or not hasattr(physx_cfg, 'gpu_collision_stack_size'):
+		if int(getattr(cfg, 'rank', 0)) == 0:
+			print('[isaaclab-warning] Env config has no physx.gpu_collision_stack_size field; ignoring override.')
+		return
+	value = int(value)
+	if value <= 0:
+		return
+	physx_cfg.gpu_collision_stack_size = value
+	if int(getattr(cfg, 'rank', 0)) == 0:
+		print(f'[Rank {cfg.rank}] Set PhysX gpu_collision_stack_size={value}.')
+
+
 def _configure_soft_dtw(env, cfg):
 	env_unwrapped = env.unwrapped
 	cfg_task = getattr(env_unwrapped, 'cfg_task', None)
@@ -419,8 +729,12 @@ class IsaacLabWrapper(gym.Wrapper):
 		self._use_canonical_obs = bool(getattr(cfg, 'isaaclab_use_canonical_obs', False))
 		if self._use_canonical_obs:
 			canonical_dim = 14
-			if cfg.get('isaaclab_canonical_append_force', False) and hasattr(self.env.unwrapped, 'flange_force_obs'):
-				canonical_dim += int(self.env.unwrapped.flange_force_obs.shape[-1])
+			if cfg.get('isaaclab_canonical_append_force', False):
+				force = getattr(self.env.unwrapped, 'flange_force_obs', None)
+				if torch.is_tensor(force) and force.ndim > 0:
+					canonical_dim += int(force.shape[-1])
+				elif cfg.get('isaaclab_canonical_zero_force', False):
+					canonical_dim += int(cfg.get('isaaclab_canonical_force_dim', 3))
 			task_params = _get_srsa_task_param_obs_tensor(self.env.unwrapped, cfg)
 			if cfg.get('isaaclab_canonical_append_task_params', False) and task_params is not None:
 				canonical_dim += int(task_params.shape[-1])
@@ -432,10 +746,25 @@ class IsaacLabWrapper(gym.Wrapper):
 			)
 		else:
 			self.observation_space = self.env.unwrapped.single_observation_space['policy']
+		self._env_action_dim = int(self.env.unwrapped.single_action_space.shape[0])
+		self._position_control_only = _srsa_position_control_only(cfg)
+		self._policy_action_dim = _srsa_policy_action_dim(cfg) if self._position_control_only else self._env_action_dim
+		if self._position_control_only:
+			configured_env_action_dim = _srsa_env_action_dim(cfg)
+			if self._env_action_dim != configured_env_action_dim and int(getattr(self.cfg, 'rank', 0)) == 0:
+				print(
+					f"[isaaclab-warning] SRSA env action_dim={self._env_action_dim}, "
+					f"configured srsa_env_action_dim={configured_env_action_dim}; using env action_dim."
+				)
+			if not (0 < self._policy_action_dim <= self._env_action_dim):
+				raise ValueError(
+					f"Expected 0 < srsa_policy_action_dim <= env_action_dim, got "
+					f"{self._policy_action_dim} and {self._env_action_dim}."
+				)
 		self.action_space = gym.spaces.Box(
 			low=-1.0,
 			high=1.0,
-			shape=self.env.unwrapped.single_action_space.shape,
+			shape=(self._policy_action_dim,),
 			dtype=np.float32,
 		)
 		# AutoMate times out when episode_length_buf >= max_episode_length - 1.
@@ -445,12 +774,24 @@ class IsaacLabWrapper(gym.Wrapper):
 		self._debug_io_every = max(1, int(cfg.get('isaaclab_debug_io_every', 1)))
 		self._debug_step_index = 0
 		self._debug_reset_printed = False
+		self._srsa_process_success_streak = torch.zeros(
+			(self.cfg.num_envs,),
+			dtype=torch.int64,
+			device=self.env.unwrapped.device,
+		)
+		self._srsa_episode_process_success = torch.zeros(
+			(self.cfg.num_envs,),
+			dtype=torch.bool,
+			device=self.env.unwrapped.device,
+		)
+		self._warned_missing_ep_success = False
 		if self._debug_io and int(getattr(self.cfg, 'rank', 0)) == 0:
 			print(
 				"[isaaclab-debug] enabled "
 				f"steps={self._debug_io_steps} every={self._debug_io_every} "
 				f"canonical={self._use_canonical_obs} "
 				f"append_force={cfg.get('isaaclab_canonical_append_force', False)} "
+				f"zero_force={cfg.get('isaaclab_canonical_zero_force', False)} "
 				f"append_task_params={cfg.get('isaaclab_canonical_append_task_params', False)} "
 				f"task_param_mode={cfg.get('srsa_task_param_obs_mode', 'task_vec')} "
 				f"visual_noise={cfg.get('isaaclab_canonical_use_visual_noise', False)}"
@@ -486,7 +827,12 @@ class IsaacLabWrapper(gym.Wrapper):
 		]
 		if self.cfg.get('isaaclab_canonical_append_force', False):
 			force = getattr(env, 'flange_force_obs', None)
-			force_dim = int(force.shape[-1]) if torch.is_tensor(force) and force.ndim > 0 else max(0, min(3, obs_dim - offset))
+			if torch.is_tensor(force) and force.ndim > 0:
+				force_dim = int(force.shape[-1])
+			elif self.cfg.get('isaaclab_canonical_zero_force', False):
+				force_dim = int(self.cfg.get('isaaclab_canonical_force_dim', 3))
+			else:
+				force_dim = max(0, min(3, obs_dim - offset))
 			parts.append(("flange_force_obs", force_dim))
 		if self.cfg.get('isaaclab_canonical_append_task_params', False):
 			task_params = _get_srsa_task_param_obs_tensor(env, self.cfg)
@@ -545,7 +891,68 @@ class IsaacLabWrapper(gym.Wrapper):
 			print("[isaaclab-debug] " + _tensor_debug_summary("output.truncated", truncated))
 		if isinstance(info, dict) and 'success' in info:
 			print("[isaaclab-debug] " + _tensor_debug_summary("info.success", info['success']))
+			for key in ("official_success", "terminal_process_success", "depth_fraction", "lateral_error", "jam"):
+				if key in info:
+					print("[isaaclab-debug] " + _tensor_debug_summary(f"info.{key}", info[key]))
 		self._debug_runtime_tensors()
+
+	def _reset_srsa_success_state(self, env_ids=None):
+		if env_ids is None:
+			self._srsa_process_success_streak.zero_()
+			self._srsa_episode_process_success.zero_()
+			return
+		if torch.is_tensor(env_ids) and env_ids.numel() > 0:
+			self._srsa_process_success_streak[env_ids] = 0
+			self._srsa_episode_process_success[env_ids] = False
+
+	def _compute_success_info(self):
+		env = self.env.unwrapped
+		if _uses_srsa_backend(self.cfg):
+			metrics = _compute_srsa_success_metrics(
+				env,
+				self.cfg,
+				self._srsa_process_success_streak,
+				self._srsa_episode_process_success,
+			)
+			self._srsa_process_success_streak = metrics.pop("_process_success_streak")
+			self._srsa_episode_process_success = metrics["episode_process_success"].detach().clone()
+			success = _select_srsa_success(metrics).to(dtype=torch.float32)
+			info = {
+				key: _float_metric(value)
+				for key, value in metrics.items()
+				if key != "success_metric"
+			}
+			info["success"] = success
+			info["score"] = success.clone()
+			return info
+
+		if hasattr(env, 'ep_succeeded'):
+			success = env.ep_succeeded.clone().to(torch.float32)
+		else:
+			success = torch.zeros(self.cfg.num_envs, dtype=torch.float32, device=env.device)
+			if not self._warned_missing_ep_success and int(getattr(self.cfg, 'rank', 0)) == 0:
+				print("[isaaclab-warning] env has no ep_succeeded; reporting episode success as 0.")
+				self._warned_missing_ep_success = True
+		return {
+			"success": success,
+			"score": success.clone(),
+		}
+
+	def _final_info_for_done(self, success_info, done, final_obs):
+		final_info = {}
+		for key, value in success_info.items():
+			if not torch.is_tensor(value):
+				continue
+			tensor = _float_metric(value)
+			if tensor.ndim == 0 or tensor.shape[0] != self.cfg.num_envs:
+				continue
+			final_value = torch.full((self.cfg.num_envs,), float('nan'), dtype=torch.float32, device=done.device)
+			final_value[done] = tensor[done]
+			final_info[key] = final_value
+		return {
+			"final_observation": final_obs,
+			"final_info": final_info,
+		}
 
 	def rand_act(self):
 		return torch.rand(
@@ -554,6 +961,23 @@ class IsaacLabWrapper(gym.Wrapper):
 			device=self.env.unwrapped.device,
 		) * 2 - 1
 
+	def _expand_policy_action(self, action):
+		action = action.to(self.env.unwrapped.device, non_blocking=True)
+		if not self._position_control_only:
+			return action
+		if action.shape[-1] == self._env_action_dim:
+			env_action = action.clone()
+			env_action[..., self._policy_action_dim:] = 0.0
+			return env_action
+		if action.shape[-1] != self._policy_action_dim:
+			raise ValueError(
+				f"Expected SRSA position-control action dim {self._policy_action_dim} "
+				f"or env action dim {self._env_action_dim}, got {action.shape[-1]}."
+			)
+		pad_shape = (*action.shape[:-1], self._env_action_dim - self._policy_action_dim)
+		padding = torch.zeros(pad_shape, dtype=action.dtype, device=action.device)
+		return torch.cat([action, padding], dim=-1)
+
 	def _extract_obs(self, obs_dict):
 		if self._use_canonical_obs:
 			return _build_canonical_obs(self.env.unwrapped, self.cfg).detach().to(torch.float32)
@@ -561,6 +985,7 @@ class IsaacLabWrapper(gym.Wrapper):
 
 	def reset(self, **kwargs):
 		obs, _ = self.env.reset(**kwargs)
+		self._reset_srsa_success_state()
 		extracted_obs = self._extract_obs(obs)
 		info = {
 			'success': torch.zeros(self.cfg.num_envs, dtype=torch.float32, device=self.env.unwrapped.device)
@@ -570,7 +995,7 @@ class IsaacLabWrapper(gym.Wrapper):
 
 	def _step_with_final_obs(self, action):
 		env = self.env.unwrapped
-		action = action.to(env.device, non_blocking=True)
+		action = self._expand_policy_action(action)
 
 		if env.cfg.action_noise_model:
 			action = env._action_noise_model(action)
@@ -594,7 +1019,7 @@ class IsaacLabWrapper(gym.Wrapper):
 		env.reward_buf = env._get_rewards()
 
 		final_obs = None
-		episode_success = env.ep_succeeded.clone().to(torch.float32) if hasattr(env, 'ep_succeeded') else done.to(torch.float32)
+		success_info = self._compute_success_info()
 		if done.any():
 			final_obs_dict = env._get_observations()
 			final_obs = self._extract_obs(final_obs_dict)[done].clone()
@@ -602,6 +1027,7 @@ class IsaacLabWrapper(gym.Wrapper):
 		reset_env_ids = env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
 		if len(reset_env_ids) > 0:
 			env._reset_idx(reset_env_ids)
+			self._reset_srsa_success_state(reset_env_ids)
 			if env.sim.has_rtx_sensors() and env.cfg.num_rerenders_on_reset > 0:
 				for _ in range(env.cfg.num_rerenders_on_reset):
 					env.sim.render()
@@ -613,27 +1039,19 @@ class IsaacLabWrapper(gym.Wrapper):
 		if env.cfg.observation_noise_model:
 			env.obs_buf["policy"] = env._observation_noise_model(env.obs_buf["policy"])
 
-		return env.obs_buf, env.reward_buf, done, final_obs, episode_success
+		return env.obs_buf, env.reward_buf, done, final_obs, success_info
 
 	def step(self, action):
-		obs_dict, reward, done, final_obs, episode_success = self._step_with_final_obs(action)
+		obs_dict, reward, done, final_obs, success_info = self._step_with_final_obs(action)
 		obs = self._extract_obs(obs_dict)
 		reward = reward.detach().to(torch.float32)
 		done = done.detach()
 		terminated = torch.zeros_like(done)
 		truncated = done.clone()
 
-		info = {
-			'success': episode_success.detach(),
-		}
+		info = {key: value.detach() if torch.is_tensor(value) else value for key, value in success_info.items()}
 		if done.any():
-			success = torch.full((self.cfg.num_envs,), float('nan'), dtype=torch.float32, device=done.device)
-			success[done] = episode_success.detach()[done]
-			info['final_observation'] = final_obs
-			info['final_info'] = {
-				'success': success,
-				'score': success.clone(),
-			}
+			info.update(self._final_info_for_done(success_info, done, final_obs))
 		self._maybe_debug_io(
 			"step",
 			obs=obs,
@@ -710,6 +1128,7 @@ def make_env(cfg):
 		env_cfg.task_name = cfg.isaaclab_task_name
 	if cfg.isaaclab_env_id == "Isaac-AutoMate-Assembly-Direct-v0":
 		_configure_assembly_task(env_cfg, cfg)
+	_configure_physx_buffers(env_cfg, cfg)
 	render_mode = 'rgb_array' if (cfg.save_video or cfg.obs == 'rgb') else None
 	env = gym.make(cfg.isaaclab_env_id, cfg=env_cfg, render_mode=render_mode)
 	_configure_soft_dtw(env, cfg)

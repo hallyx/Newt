@@ -7,6 +7,7 @@ os.environ['TORCH_LOGS'] = "+recompiles"
 import warnings
 warnings.filterwarnings('ignore')
 
+import json
 from collections import defaultdict
 from pathlib import Path
 from time import monotonic
@@ -43,8 +44,168 @@ def setup(rank, world_size, port):
 	return port
 
 
+SUCCESS_DIAGNOSTIC_KEYS = (
+	"official_success",
+	"current_official_success",
+	"process_success",
+	"episode_process_success",
+	"terminal_process_success",
+	"dual_success",
+	"depth_fraction",
+	"lateral_error",
+	"orientation_error",
+	"yaw_error",
+	"keypoint_error",
+	"jam",
+)
+
+
 def empty_metrics():
-	return {'reward': [], 'length': [], 'success': [], 'score': []}
+	metrics = {'reward': [], 'length': [], 'success': [], 'score': []}
+	for key in SUCCESS_DIAGNOSTIC_KEYS:
+		metrics[key] = []
+	return metrics
+
+
+class EvalTraceRecorder:
+	"""
+	Write a small JSONL trace of inference inputs/outputs for sim2real debugging.
+	"""
+
+	def __init__(self, cfg, *, phase: str):
+		self.cfg = cfg
+		self.phase = phase
+		self.enabled = bool(cfg.get('eval_trace_enabled', False)) and int(cfg.get('rank', 0)) == 0
+		self.max_steps = max(0, int(cfg.get('eval_trace_steps', 16) or 0))
+		self.count = 0
+		self.env_index = cfg.get('eval_trace_env_index', None)
+		if self.env_index is None:
+			self.env_index = cfg.get('eval_zmq_env_index', 0)
+		self.env_index = int(self.env_index)
+		self.include_next_obs = bool(cfg.get('eval_trace_include_next_obs', True))
+		self.include_action_info = bool(cfg.get('eval_trace_include_action_info', True))
+		self.include_raw_msg = bool(cfg.get('eval_trace_include_raw_msg', False))
+		self._fh = None
+		self.fp = None
+		if not self.enabled or self.max_steps <= 0:
+			self.enabled = False
+			return
+		raw_fp = cfg.get('eval_trace_fp', None)
+		if raw_fp:
+			self.fp = Path(raw_fp).expanduser()
+			if not self.fp.is_absolute():
+				self.fp = Path(cfg.work_dir) / self.fp
+		else:
+			self.fp = Path(cfg.work_dir) / "data" / f"{phase}_trace.jsonl"
+		self.fp.parent.mkdir(parents=True, exist_ok=True)
+		self._fh = open(self.fp, "w", encoding="utf-8")
+		self._write({
+			"type": "metadata",
+			"phase": self.phase,
+			"env_index": self.env_index,
+			"max_steps": self.max_steps,
+			"checkpoint": cfg.get('checkpoint', None),
+			"eval_mode": cfg.get('eval_mode', None),
+			"eval_real_mode": cfg.get('eval_real_mode', None),
+			"obs_shape": cfg.get('obs_shape', None),
+			"action_dim": cfg.get('action_dim', None),
+			"task_conditioning": cfg.get('task_conditioning', None),
+			"eval_zmq_action_scale": cfg.get('eval_zmq_action_scale', None),
+			"eval_zmq_action_frame": cfg.get('eval_zmq_action_frame', None),
+			"eval_zmq_command_frame": cfg.get('eval_zmq_command_frame', None) or cfg.get('eval_zmq_action_frame', None),
+			"eval_zmq_action_order": cfg.get('eval_zmq_action_order', None),
+		})
+		print(colored(f"Recording eval trace to {self.fp}", "cyan", attrs=["bold"]))
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, exc_type, exc, tb):
+		self.close()
+
+	def close(self):
+		if self._fh is not None:
+			self._fh.close()
+			self._fh = None
+
+	def _write(self, record):
+		if self._fh is None:
+			return
+		self._fh.write(json.dumps(self._json_safe(record), ensure_ascii=True) + "\n")
+		self._fh.flush()
+
+	def _select_tensor(self, value):
+		value = value.detach().cpu()
+		if value.ndim >= 1 and value.shape[0] > self.env_index:
+			value = value[self.env_index]
+		if value.numel() == 1:
+			return value.item()
+		return value.tolist()
+
+	def _json_safe(self, value):
+		if torch.is_tensor(value):
+			return self._select_tensor(value)
+		if hasattr(value, "keys") and hasattr(value, "get"):
+			return {str(key): self._json_safe(value.get(key)) for key in value.keys()}
+		if isinstance(value, dict):
+			return {str(key): self._json_safe(item) for key, item in value.items()}
+		if isinstance(value, (list, tuple)):
+			return [self._json_safe(item) for item in value]
+		if isinstance(value, Path):
+			return str(value)
+		return value
+
+	def record(
+		self,
+		*,
+		step,
+		episode_step,
+		obs,
+		action,
+		task=None,
+		action_info=None,
+		sent_action=None,
+		next_obs=None,
+		reward=None,
+		done=None,
+		info=None,
+		source_message=None,
+	):
+		if not self.enabled or self.count >= self.max_steps:
+			return
+		record = {
+			"type": "inference_step",
+			"trace_index": self.count,
+			"phase": self.phase,
+			"step": int(step),
+			"episode_step": None if episode_step is None else int(episode_step),
+			"env_index": self.env_index,
+			"obs": obs,
+			"action": action,
+		}
+		if task is not None:
+			record["task"] = task
+		if self.include_action_info and action_info is not None:
+			record["action_info"] = action_info
+		if sent_action is not None:
+			record["sent_action"] = sent_action
+		if self.include_next_obs and next_obs is not None:
+			record["next_obs"] = next_obs
+		if reward is not None:
+			record["reward"] = reward
+		if done is not None:
+			record["done"] = done
+		if isinstance(info, dict):
+			for key in ("success", *SUCCESS_DIAGNOSTIC_KEYS):
+				if key in info:
+					record[key] = info[key]
+		if source_message is not None:
+			record["source_seq"] = source_message.get("seq", None)
+			record["source_timestamp"] = source_message.get("timestamp", None)
+			if self.include_raw_msg:
+				record["source_message"] = source_message
+		self._write(record)
+		self.count += 1
 
 
 def _real_eval_mode(cfg) -> str:
@@ -161,6 +322,210 @@ def _real_task_input(cfg, obs_receiver, message, device):
 	return torch.tensor([task_id], dtype=torch.long, device=device)
 
 
+def _to_jsonable(value):
+	if value is None:
+		return None
+	if torch.is_tensor(value):
+		value = value.detach().cpu()
+		if value.ndim == 0:
+			return value.item()
+		return value.tolist()
+	if isinstance(value, dict):
+		return {str(k): _to_jsonable(v) for k, v in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_to_jsonable(v) for v in value]
+	return value
+
+
+def _message_tcp_pos_base(message: dict):
+	ee = message.get("end_effector", {}) if isinstance(message.get("end_effector", {}), dict) else {}
+	pos = message.get("tcp_pos", message.get("position", ee.get("position", None)))
+	if pos is not None:
+		return _to_jsonable(pos)
+	matrix = message.get("O_T_EE", ee.get("O_T_EE", None))
+	if matrix is None:
+		return None
+	matrix = list(matrix)
+	if len(matrix) != 16:
+		return None
+	return [float(matrix[12]), float(matrix[13]), float(matrix[14])]
+
+
+def _make_real_debug_log(cfg):
+	if not bool(cfg.get("eval_real_debug_log", True)):
+		return None, None
+	fp = cfg.get("eval_real_debug_log_fp", None)
+	if fp is None:
+		fp = Path(cfg.work_dir) / "real_closed_loop_debug.jsonl"
+	else:
+		fp = Path(hydra.utils.to_absolute_path(str(fp))).expanduser()
+	fp.parent.mkdir(parents=True, exist_ok=True)
+	return fp, open(fp, "a", encoding="utf-8")
+
+
+def _quat_wxyz_to_matrix(quat: torch.Tensor) -> torch.Tensor:
+	quat = quat / quat.norm(dim=-1, keepdim=True).clamp_min(1.0e-12)
+	w, x, y, z = quat.unbind(dim=-1)
+	row0 = torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], dim=-1)
+	row1 = torch.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], dim=-1)
+	row2 = torch.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], dim=-1)
+	return torch.stack([row0, row1, row2], dim=-2)
+
+
+def _canonical_frame_name(frame: str) -> str:
+	frame = str(frame).strip().lower()
+	if frame in {"ee", "tcp", "end_effector"}:
+		return "tcp"
+	if frame in {"base", "world", "robot", "robot_base", "global"}:
+		return "base"
+	if frame in {"socket", "target", "hole"}:
+		return "socket"
+	return frame
+
+
+def _socket_rot_base_to_socket(obs: torch.Tensor, obs_receiver=None) -> torch.Tensor:
+	quat = getattr(obs_receiver, "_socket_quat", None)
+	if quat is None:
+		return torch.eye(3, dtype=obs.dtype, device=obs.device)
+	quat = torch.as_tensor(quat, dtype=obs.dtype, device=obs.device)
+	rot_socket_to_base = _quat_wxyz_to_matrix(quat.reshape(1, 4))[0]
+	return rot_socket_to_base.transpose(-1, -2)
+
+
+def _transform_action_vector(action: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+	if action.ndim > 1 and matrix.ndim == 2:
+		matrix = matrix.expand(action.shape[:-1] + matrix.shape)
+	return torch.einsum("...ij,...j->...i", matrix, action)
+
+
+def _real_action_for_command_frame(action: torch.Tensor, obs: torch.Tensor, cfg, obs_receiver=None) -> torch.Tensor:
+	policy_frame = _canonical_frame_name(cfg.get("eval_zmq_action_frame", "socket"))
+	command_frame = _canonical_frame_name(cfg.get("eval_zmq_command_frame", policy_frame))
+	if policy_frame == command_frame:
+		return action
+	if policy_frame not in {"socket", "tcp", "base"} or command_frame not in {"socket", "tcp", "base"}:
+		raise ValueError(
+			f"Unsupported real action frame conversion: {policy_frame!r} -> {command_frame!r}. "
+			"Supported frames are socket, tcp/ee/end_effector, and base/world."
+		)
+	if obs.shape[-1] < 7:
+		raise ValueError("Action frame conversion needs obs_tcp_quat_socket_wxyz in obs[3:7].")
+	rot_tcp_to_socket = _quat_wxyz_to_matrix(obs[..., 3:7])
+	rot_socket_to_tcp = rot_tcp_to_socket.transpose(-1, -2)
+	rot_base_to_socket = _socket_rot_base_to_socket(obs, obs_receiver)
+	rot_socket_to_base = rot_base_to_socket.transpose(-1, -2)
+
+	command = action.clone()
+	for start, stop in ((0, 3), (3, 6)):
+		part = action[..., start:stop]
+		if policy_frame == "socket":
+			part_socket = part
+		elif policy_frame == "tcp":
+			part_socket = _transform_action_vector(part, rot_tcp_to_socket)
+		else:
+			part_socket = _transform_action_vector(part, rot_base_to_socket)
+
+		if command_frame == "socket":
+			command[..., start:stop] = part_socket
+		elif command_frame == "tcp":
+			command[..., start:stop] = _transform_action_vector(part_socket, rot_socket_to_tcp)
+		else:
+			command[..., start:stop] = _transform_action_vector(part_socket, rot_socket_to_base)
+	return command
+
+
+def _shape_real_policy_action(action: torch.Tensor, step_idx: int, cfg) -> torch.Tensor:
+	scale = float(cfg.get("eval_zmq_action_scale", 1.0))
+	shaped = action * scale
+	warmup_steps = max(int(cfg.get("eval_zmq_warmup_steps", 0)), 0)
+	if warmup_steps > 0:
+		warmup_scale = min(max(int(step_idx) + 1, 0), warmup_steps) / float(warmup_steps)
+		shaped = shaped * warmup_scale
+	max_trans = cfg.get("eval_zmq_max_trans_delta", None)
+	if max_trans is not None:
+		shaped[..., :3] = shaped[..., :3].clamp(-abs(float(max_trans)), abs(float(max_trans)))
+	max_rot = cfg.get("eval_zmq_max_rot_delta", None)
+	if max_rot is not None:
+		shaped[..., 3:6] = shaped[..., 3:6].clamp(-abs(float(max_rot)), abs(float(max_rot)))
+	return shaped
+
+
+def _command_delta_to_socket(delta, obs_cpu: torch.Tensor, command_frame: str, obs_receiver=None):
+	if delta is None or len(delta) < 3:
+		return None
+	delta_tensor = torch.as_tensor(delta, dtype=obs_cpu.dtype).reshape(-1)
+	frame = _canonical_frame_name(command_frame)
+	if frame == "socket":
+		return delta_tensor[:3].tolist()
+	if frame == "tcp" and obs_cpu.numel() >= 7:
+		rot_tcp_to_socket = _quat_wxyz_to_matrix(obs_cpu[3:7].reshape(1, 4))[0]
+		return (rot_tcp_to_socket @ delta_tensor[:3]).tolist()
+	if frame == "base":
+		rot_base_to_socket = _socket_rot_base_to_socket(obs_cpu.reshape(1, -1), obs_receiver)
+		return (rot_base_to_socket @ delta_tensor[:3]).tolist()
+	return None
+
+
+def _write_real_debug_row(
+	handle,
+	*,
+	step_idx: int,
+	elapsed_s: float,
+	task_id: int,
+	message: dict,
+	obs: torch.Tensor,
+	action: torch.Tensor,
+	send_message: dict,
+	obs_receiver,
+	info,
+):
+	if handle is None:
+		return
+	obs_cpu = obs.detach().cpu().reshape(-1)
+	action_cpu = action.detach().cpu().reshape(-1)
+	sent_delta = send_message.get("delta") if isinstance(send_message, dict) else None
+	command_frame = send_message.get("action_frame") if isinstance(send_message, dict) else None
+	sent_delta_socket = _command_delta_to_socket(sent_delta, obs_cpu, command_frame, obs_receiver)
+	next_pos_socket = None
+	if sent_delta_socket is not None and obs_cpu.numel() >= 3:
+		next_pos_socket = (obs_cpu[:3] + torch.as_tensor(sent_delta_socket, dtype=obs_cpu.dtype)).tolist()
+	pi_std = None
+	if info is not None and info.get("pi_std", None) is not None:
+		pi_std = float(torch.as_tensor(info["pi_std"]).detach().cpu().reshape(-1)[0].item())
+	row = {
+		"step": int(step_idx),
+		"elapsed_s": float(elapsed_s),
+		"task_id": int(task_id),
+		"obs_seq": message.get("seq", None),
+		"obs_timestamp": message.get("timestamp", None),
+		"robot_time": message.get("robot_time", None),
+		"obs_period": message.get("period", None),
+		"robot_tcp_pos_base": _message_tcp_pos_base(message),
+		"tcp_offset_ee": _to_jsonable(getattr(obs_receiver, "_tcp_offset_ee", None)),
+		"socket_pos_base": _to_jsonable(getattr(obs_receiver, "_socket_pos", None)),
+		"socket_quat_wxyz": _to_jsonable(getattr(obs_receiver, "_socket_quat", None)),
+		"obs_tcp_pos_socket": _to_jsonable(obs_cpu[:3]),
+		"obs_tcp_quat_socket_wxyz": _to_jsonable(obs_cpu[3:7]) if obs_cpu.numel() >= 7 else None,
+		"obs_tcp_linvel_socket": _to_jsonable(obs_cpu[7:10]) if obs_cpu.numel() >= 10 else None,
+		"obs_tcp_angvel_socket": _to_jsonable(obs_cpu[10:13]) if obs_cpu.numel() >= 13 else None,
+		"obs_gripper_width": float(obs_cpu[13].item()) if obs_cpu.numel() >= 14 else None,
+		"obs_force_or_wrench": _to_jsonable(obs_cpu[14:]) if obs_cpu.numel() > 14 else [],
+		"policy_action": _to_jsonable(action_cpu),
+		"policy_action_frame": send_message.get("policy_action_frame") if isinstance(send_message, dict) else None,
+		"command_raw_delta": send_message.get("raw_action") if isinstance(send_message, dict) else None,
+		"command_delta_sent": sent_delta,
+		"command_frame": command_frame,
+		"command_delta_sent_socket_est": sent_delta_socket,
+		"command_send_ok": send_message.get("send_ok") if isinstance(send_message, dict) else None,
+		"estimated_next_tcp_pos_socket": next_pos_socket,
+		"pi_std": pi_std,
+		"message_has_direct_obs": "obs" in message,
+		"obs_meta": message.get("obs_meta", None),
+	}
+	handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+	handle.flush()
+
+
 @torch.no_grad()
 def eval_real_closed_loop(agent: TDMPC2, cfg, logger: Logger):
 	"""
@@ -196,54 +561,81 @@ def eval_real_closed_loop(agent: TDMPC2, cfg, logger: Logger):
 		attrs=["bold"],
 	))
 
-	with make_eval_zmq_publisher(cfg) as action_publisher, make_eval_zmq_observation_receiver(cfg) as obs_receiver:
-		message = obs_receiver.recv()
-		for step_idx in range(max_steps):
-			if obs_receiver.is_done(message):
-				action_publisher.send_done(step=step_idx, episode_step=step_idx, task_id=task_id)
-				break
-			obs = obs_receiver.obs_tensor(message, obs_dim=obs_dim, device=device)
-			model_tasks = _real_task_input(cfg, obs_receiver, message, device)
-			t0 = torch.tensor([step_idx == 0], dtype=torch.bool, device=device)
-			torch.compiler.cudagraph_mark_step_begin()
-			action, info = agent(
-				obs,
-				t0=t0,
-				step=1 if use_mpc else 0,
-				eval_mode=True,
-				task=model_tasks,
-				mpc=use_mpc,
-			)
-			episode_step = int(message.get("episode_step", step_idx))
-			action_publisher.send_action(
-				action,
-				step=step_idx,
-				episode_step=episode_step,
-				task_id=task_id,
-				state_seq=message.get("seq", None),
-				state_timestamp=message.get("timestamp", None),
-			)
-			step_count += 1
-			elapsed_s = monotonic() - start_time
-			if (
-				last_log is None or
-				elapsed_s - last_log >= float(cfg.get('progress_log_interval_sec', 30.0)) or
-				step_idx == max_steps - 1
-			):
-				last_log = elapsed_s
-				action_max = float(action.detach().abs().max().item())
-				pi_std = info.get("pi_std", None) if info is not None else None
-				pi_std_text = "n/a" if pi_std is None else f"{float(torch.as_tensor(pi_std).detach().cpu().item()):.4g}"
-				print(colored(
-					f"real progress step={step_count}/{max_steps} "
-					f"elapsed={elapsed_s:.1f}s action_abs_max={action_max:.4g} pi_std={pi_std_text}",
-					"cyan",
-					attrs=["bold"],
-				), flush=True)
-			if step_idx + 1 >= max_steps:
-				break
+	debug_log_fp, debug_log = _make_real_debug_log(cfg)
+	if debug_log_fp is not None:
+		print(colored(f"Real debug log: {debug_log_fp}", "cyan", attrs=["bold"]))
+	try:
+		with EvalTraceRecorder(cfg, phase="real_closed_loop") as trace, \
+			make_eval_zmq_publisher(cfg) as action_publisher, \
+			make_eval_zmq_observation_receiver(cfg) as obs_receiver:
+			if trace.enabled and trace.env_index != 0:
+				raise ValueError("Real closed-loop trace only supports eval_trace_env_index=0 because num_envs is forced to 1.")
 			message = obs_receiver.recv()
-		action_publisher.send_done(step=step_count, episode_step=step_count, task_id=task_id)
+			for step_idx in range(max_steps):
+				if obs_receiver.is_done(message):
+					action_publisher.send_done(step=step_idx, episode_step=step_idx, task_id=task_id)
+					break
+				obs = obs_receiver.obs_tensor(message, obs_dim=obs_dim, device=device)
+				model_tasks = _real_task_input(cfg, obs_receiver, message, device)
+				t0 = torch.tensor([step_idx == 0], dtype=torch.bool, device=device)
+				torch.compiler.cudagraph_mark_step_begin()
+				action, info = agent(
+					obs,
+					t0=t0,
+					step=1 if use_mpc else 0,
+					eval_mode=True,
+					task=model_tasks,
+					mpc=use_mpc,
+				)
+				policy_delta = _shape_real_policy_action(action, step_idx, cfg)
+				command_action = _real_action_for_command_frame(policy_delta, obs, cfg, obs_receiver)
+				episode_step = int(message.get("episode_step", step_idx))
+				send_message = action_publisher.send_action(
+					command_action,
+					step=step_idx,
+					episode_step=episode_step,
+					task_id=task_id,
+					state_seq=message.get("seq", None),
+					state_timestamp=message.get("timestamp", None),
+					preprocessed=True,
+					raw_action=policy_delta.detach().reshape(-1).to("cpu", dtype=torch.float32).tolist(),
+				) or {}
+				step_count += 1
+				elapsed_s = monotonic() - start_time
+				_write_real_debug_row(
+					debug_log,
+					step_idx=step_idx,
+					elapsed_s=elapsed_s,
+					task_id=task_id,
+					message=message,
+					obs=obs,
+					action=action,
+					send_message=send_message,
+					obs_receiver=obs_receiver,
+					info=info,
+				)
+				if (
+					last_log is None or
+					elapsed_s - last_log >= float(cfg.get('progress_log_interval_sec', 30.0)) or
+					step_idx == max_steps - 1
+				):
+					last_log = elapsed_s
+					action_max = float(action.detach().abs().max().item())
+					pi_std = info.get("pi_std", None) if info is not None else None
+					pi_std_text = "n/a" if pi_std is None else f"{float(torch.as_tensor(pi_std).detach().cpu().item()):.4g}"
+					print(colored(
+						f"real progress step={step_count}/{max_steps} "
+						f"elapsed={elapsed_s:.1f}s action_abs_max={action_max:.4g} pi_std={pi_std_text}",
+						"cyan",
+						attrs=["bold"],
+					), flush=True)
+				if step_idx + 1 >= max_steps:
+					break
+				message = obs_receiver.recv()
+			action_publisher.send_done(step=step_count, episode_step=step_count, task_id=task_id)
+	finally:
+		if debug_log is not None:
+			debug_log.close()
 
 	elapsed = monotonic() - start_time
 	return {
@@ -262,8 +654,9 @@ def eval_real_closed_loop(agent: TDMPC2, cfg, logger: Logger):
 def eval_by_trials(trainer: Trainer, total_trials: int):
 	"""
 	Evaluate for an exact total number of completed episodes across all envs.
-	This matches AutoMate's success definition by using final_info.success,
-	which is derived from ep_succeeded over the episode.
+	For SRSA, final_info.success is the configured wrapper success metric
+	(e.g. terminal_process by default), with official/process diagnostics
+	logged separately.
 	"""
 	local_target = total_trials
 	if trainer.cfg.world_size > 1:
@@ -276,19 +669,35 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	episode_reward = torch.zeros(trainer.cfg.num_envs, device=trainer._rollout_device)
 	episode_len = torch.zeros(trainer.cfg.num_envs, device=trainer._rollout_device)
 	completed = 0
+	trace_step = 0
 
 	if trainer.cfg.save_video:
 		trainer.logger.video.init(trainer.env, enabled=trainer.cfg.rank == 0)
 
-	with make_eval_zmq_publisher(trainer.cfg) as action_publisher:
+	with EvalTraceRecorder(trainer.cfg, phase="sim") as trace, make_eval_zmq_publisher(trainer.cfg) as action_publisher:
+		if trace.enabled and not (0 <= trace.env_index < trainer.cfg.num_envs):
+			raise ValueError(
+				f"eval_trace_env_index={trace.env_index} is out of range for num_envs={trainer.cfg.num_envs}."
+			)
 		while completed < local_target:
 			use_mpc = trainer._step > 0 or trainer.cfg.finetune
 			torch.compiler.cudagraph_mark_step_begin()
 			model_tasks = trainer._model_tasks()
-			action, _ = trainer.agent(obs, t0=episode_len == 0, step=trainer._step, eval_mode=True, task=model_tasks, mpc=use_mpc)
+			prev_obs = obs
+			trace_env_index = trace.env_index
+			trace_episode_step = int(episode_len[trace_env_index].item()) if trace.enabled else None
+			action, action_info = trainer.agent(
+				obs,
+				t0=episode_len == 0,
+				step=trainer._step,
+				eval_mode=True,
+				task=model_tasks,
+				mpc=use_mpc,
+			)
+			sent_message = None
 			if trainer.cfg.rank == 0:
 				env_index = int(trainer.cfg.get('eval_zmq_env_index', 0))
-				action_publisher.send_action(
+				sent_message = action_publisher.send_action(
 					action,
 					step=trainer._step,
 					episode_step=int(episode_len[env_index].item()),
@@ -299,6 +708,20 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 			done = terminated | truncated
 			episode_reward += reward
 			episode_len += 1
+			trace.record(
+				step=trace_step,
+				episode_step=trace_episode_step,
+				obs=prev_obs,
+				action=action,
+				task=model_tasks,
+				action_info=action_info,
+				sent_action=None if sent_message is None else sent_message.get("action", None),
+				next_obs=obs,
+				reward=reward,
+				done=done,
+				info=info,
+			)
+			trace_step += 1
 
 			if trainer.cfg.rank == 0:
 				env_index = int(trainer.cfg.get('eval_zmq_env_index', 0))
@@ -321,6 +744,10 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 					task_results[task_name]['length'].append(episode_len[i].item())
 					task_results[task_name]['success'].append(info['final_info']['success'][i].item())
 					task_results[task_name]['score'].append(info['final_info']['score'][i].item())
+					for metric_key in SUCCESS_DIAGNOSTIC_KEYS:
+						if metric_key in info['final_info']:
+							value = torch.nan_to_num(info['final_info'][metric_key][i], nan=0.0)
+							task_results[task_name][metric_key].append(value.item())
 					episode_reward[i] = 0.0
 					episode_len[i] = 0.0
 					completed += 1
@@ -363,6 +790,9 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 		metrics[f'{prefix}/episode_length'] = sum(values['length']) / task_count
 		metrics[f'{prefix}/episode_success'] = sum(values['success']) / task_count
 		metrics[f'{prefix}/episode_score'] = sum(values['score']) / task_count
+		for metric_key in SUCCESS_DIAGNOSTIC_KEYS:
+			if len(values[metric_key]) > 0:
+				metrics[f'{prefix}/episode_{metric_key}'] = sum(values[metric_key]) / len(values[metric_key])
 
 	if total_count == 0:
 		raise RuntimeError('No completed evaluation episodes were collected.')
@@ -371,6 +801,14 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	metrics['episode_length'] = sum(sum(v['length']) for v in task_results.values()) / total_count
 	metrics['episode_success'] = total_success / total_count
 	metrics['episode_score'] = sum(sum(v['score']) for v in task_results.values()) / total_count
+	for metric_key in SUCCESS_DIAGNOSTIC_KEYS:
+		metric_values = [
+			value
+			for task_values in task_results.values()
+			for value in task_values[metric_key]
+		]
+		if len(metric_values) > 0:
+			metrics[f'episode_{metric_key}'] = sum(metric_values) / len(metric_values)
 	metrics['eval_trials'] = total_count
 	return metrics
 
@@ -460,14 +898,23 @@ def evaluate(rank: int, cfg: dict):
 		if cfg.eval_trials is not None:
 			eval_metrics = eval_by_trials(trainer, cfg.eval_trials)
 		else:
+			if cfg.rank == 0 and cfg.eval_trace_enabled:
+				print(colored(
+					"`eval_trace_enabled=true` currently records sim eval only when `eval_trials` is set; "
+					"running Trainer.eval() without a trace file.",
+					'yellow',
+					attrs=['bold'],
+				))
 			eval_metrics = trainer.eval()
 		eval_metrics.update(trainer.common_metrics())
 		if cfg.task == 'soup':
 			trainer.logger.pprint_multitask(eval_metrics, cfg)
 		trainer.logger.log(eval_metrics, 'eval')
 		if cfg.rank == 0 and cfg.eval_trials is not None:
+			success_metric = str(cfg.get('srsa_eval_success_metric', 'success'))
 			print(colored(
-				f"AutoMate-style success over {int(eval_metrics['eval_trials'])} trials: {float(eval_metrics['episode_success']):.4f}",
+				f"Eval success ({success_metric}) over {int(eval_metrics['eval_trials'])} trials: "
+				f"{float(eval_metrics['episode_success']):.4f}",
 				'green',
 				attrs=['bold'],
 			))

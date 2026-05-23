@@ -4,11 +4,77 @@
 
 当前 eval 分两类：
 
-- `eval_mode=sim`: 仿真闭环评测。observation、action、reward、success 都来自 Isaac/SRSA 仿真环境。
+- `eval_mode=sim`: 仿真闭环评测。observation、action、reward 来自 Isaac/SRSA 仿真环境；Newt 会在 wrapper 侧同时记录 AutoMate 原始成功和更严格的 SRSA process 成功。
 - `eval_mode=real eval_real_mode=stream`: 真机 action 发送烟测。Newt 仍创建一个 SRSA/Isaac 环境用于策略输入和流程控制，同时把选中 env 的 6D action 通过 ZMQ 发给真机侧 receiver。
 - `eval_mode=real eval_real_mode=closed_loop`: 真机 observation 闭环推理。真机侧发送最新 canonical observation，Newt 推理 6D action，再通过 ZMQ 发给机械臂控制端。
 
 注意：`stream` 只适合检查动作链路，不是真机 observation 闭环。真机 success 需要看真机侧日志或外部记录。
+
+## Success 口径
+
+SRSA/AutoMate 原始 `ep_succeeded` 是 episode 内锁存信号：只要某一步满足原始插入判定，episode 结束时就会记为成功。这个判定主要检查高度窗口和 keypoint 平均距离，默认 `success_pos_tol=0.015`，对精密装配来说偏宽，因此可能出现画面上没有稳定插入但 `official_success=1` 的情况。
+
+Newt 现在在 IsaacLab wrapper 侧额外计算严格 SRSA process 指标。默认：
+
+```bash
+srsa_eval_success_metric=terminal_process
+```
+
+也就是 `episode_success` 使用终态稳定严格成功，而不是 AutoMate 锁存成功。日志中会同时输出：
+
+- `episode_success`: 当前主指标，默认等于 `episode_terminal_process_success`。
+- `episode_official_success`: AutoMate 原始锁存成功，适合和历史结果对齐。
+- `episode_process_success`: episode 内曾经满足严格 process 成功并达到稳定步数。
+- `episode_terminal_process_success`: episode 结束时满足严格 process 成功并连续稳定 `srsa_process_success_stable_steps` 步。
+- `episode_dual_success`: `official_success && terminal_process_success`。
+
+严格 process 默认条件：
+
+```bash
+srsa_process_success_depth_ratio=0.85
+srsa_process_success_lateral_tol_scale=2.0
+srsa_process_success_lateral_tol_min=0.001
+srsa_process_success_lateral_tol_max=0.003
+srsa_process_success_orientation_tol_rad=0.0872665
+srsa_process_success_yaw_tol_rad=0.0872665
+srsa_process_success_stable_steps=3
+srsa_process_success_require_no_jam=true
+```
+
+如果需要复现旧结果，可以显式设置：
+
+```bash
+srsa_eval_success_metric=official
+```
+
+## Action 口径
+
+SRSA 默认使用 Newt 侧 3D 位置控制：
+
+```bash
+srsa_position_control_only=true
+srsa_policy_action_dim=3
+srsa_env_action_dim=6
+```
+
+此时 checkpoint 的 policy/world model action 维度是 3：
+
+```text
+[dx, dy, dz]
+```
+
+Newt wrapper 会在发送给 SRSA 环境前补零成 6D：
+
+```text
+[dx, dy, dz, 0, 0, 0]
+```
+
+ZMQ 真机发送也会把 3D action 补成 6D delta，其中旋转三维为 0。旧的 6D checkpoint 需要用旧口径评测：
+
+```bash
+srsa_position_control_only=false
+isaaclab_action_dim=6
+```
 
 ## 入口选择
 
@@ -91,6 +157,15 @@ debug 时应看到：
 ```text
 obs_space=(17,)
 runtime.flange_force_obs: shape=(num_envs, 3)
+```
+
+做“没有力传感器”的 ablation 时，保持 17D 输入形状，但把最后 3 维 force 置 0：
+
+```bash
+srsa_enable_flange_force_sensor=false
+isaaclab_canonical_append_force=true
+isaaclab_canonical_zero_force=true
+isaaclab_canonical_force_dim=3
 ```
 
 ### ContactHistoryEncoder checkpoint
@@ -272,6 +347,41 @@ cd /home/gpuserver/hx/github/Newt
 cd /home/gpuserver/hx/github/Newt
 
 /home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260522_223602_asm-01125/models/best.pt \
+  eval_mode=sim \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  assembly_id=01125 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=2 \
+  num_envs=10 \
+  eval_trials=50 \
+  model_size=S \
+  horizon=2 \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=false \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  isaaclab_canonical_append_task_params=false \
+  task_conditioning=axial_params \
+  enable_wandb=false \
+  exp_name=eval_sim_17d \
+  eval_trace_enabled=true \
+  eval_trace_steps=20 \
+  contact_history_enabled=true \
+  contact_context_dim=64 \
+  contact_history_len=4 \
+  contact_force_dim=6 \
+  contact_action_dim=3 \
+  contact_ee_delta_dim=3 \
+  contact_history_use_ee_delta=true
+  eval_trace_fp=traces/sim_01125.jsonl
+
+```
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
   checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260521_105015_asm-01125/models/best.pt \
   eval_mode=sim \
   isaaclab_backend=srsa \
@@ -279,22 +389,27 @@ cd /home/gpuserver/hx/github/Newt
   srsa_dir=/home/gpuserver/hx/github/srsa \
   assembly_id=01125 \
   srsa_task_template_fp=data/srsa_axial_task_templates.json \
-  srsa_task_template_id=3 \
-  num_envs=100 \
-  eval_trials=500 \
+  srsa_task_template_id=2 \
+  num_envs=10 \
+  eval_trials=50 \
   model_size=S \
-  horizon=3 \
+  horizon=2 \
   compile=false \
   mpc=true \
-  isaaclab_headless=true \
+  isaaclab_headless=false \
   isaaclab_use_canonical_obs=true \
-  srsa_enable_flange_force_sensor=true \
+  srsa_enable_flange_force_sensor=false \
   isaaclab_canonical_append_force=true \
+  isaaclab_canonical_zero_force=true \
+  isaaclab_canonical_force_dim=3 \
   isaaclab_canonical_append_task_params=false \
   task_conditioning=axial_params \
+  eval_trace_enabled=true \
+  eval_trace_steps=20 \
+  eval_trace_fp=traces/no_force_01125.jsonl \
   enable_wandb=false \
-  exp_name=eval_sim_17d
-```
+  exp_name=eval_sim_17d_no_force_sensor
+
 
 ### 带 Debug 输出的 Eval
 
@@ -333,6 +448,60 @@ isaaclab_debug_io_every=1
   exp_name=eval_debug
 ```
 
+### 记录推理 Trace
+
+为了对比 sim2real 中机械臂每一步的操作，可以开启轻量 JSONL trace。它会记录前 `eval_trace_steps` 次推理的 `obs`、`action`、`task`；如果通过 ZMQ 发给机械臂，还会记录乘过 `eval_zmq_action_scale` 的 `sent_action`。仿真还会记录 `next_obs/reward/done`，真机闭环会记录 observation 消息里的 `seq/timestamp`。
+
+仿真侧建议用 `eval_trials` 路径记录：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=/path/to/checkpoint.pt \
+  eval_mode=sim \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=00186 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=3 \
+  num_envs=1 \
+  eval_trials=1 \
+  model_size=S \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  task_conditioning=axial_params \
+  eval_trace_enabled=true \
+  eval_trace_steps=20 \
+  eval_trace_fp=traces/sim_00186.jsonl \
+  enable_wandb=false \
+  exp_name=eval_sim_trace
+```
+
+真机闭环侧加同样的 trace 参数：
+
+```bash
+eval_trace_enabled=true \
+eval_trace_steps=20 \
+eval_trace_fp=traces/real_00186.jsonl
+```
+
+默认输出路径：
+
+```text
+logs/<task>/<seed>/<exp_name>/<run_id>/data/sim_trace.jsonl
+logs/<task>/<seed>/<exp_name>/<run_id>/data/real_closed_loop_trace.jsonl
+```
+
+每个文件第一行是 metadata，后续每行是一次推理：
+
+```json
+{"type":"inference_step","step":0,"episode_step":0,"obs":[...],"action":[...],"sent_action":[...],"task":[...],"next_obs":[...],"reward":0.0,"done":false}
+```
+
 ## 真机 Eval 命令
 
 真机侧需要先启动 action receiver，并监听与 `eval_zmq_server` 对应的地址。
@@ -347,6 +516,7 @@ episode_step
 done
 source: newt_eval
 action_frame
+command_frame
 action_order
 ```
 
@@ -384,7 +554,8 @@ cd /home/gpuserver/hx/github/Newt
   eval_zmq_server=tcp://<robot-host>:5555 \
   eval_zmq_rate=10 \
   eval_zmq_action_scale=0.05 \
-  eval_zmq_action_frame=socket \
+  eval_zmq_action_frame=world \
+  eval_zmq_command_frame=world \
   'eval_zmq_action_order="dx,dy,dz,droll,dpitch,dyaw"' \
   eval_zmq_send_done=true \
   isaaclab_backend=srsa \
@@ -401,11 +572,14 @@ cd /home/gpuserver/hx/github/Newt
   isaaclab_canonical_append_force=true \
   isaaclab_canonical_append_task_params=false \
   task_conditioning=axial_params \
+  eval_trace_enabled=true \
+  eval_trace_steps=20 \
+  eval_trace_fp=traces/real_00186.jsonl \
   enable_wandb=false \
   exp_name=eval_real_closed_loop
 ```
 
-控制机械臂时，机器人侧应把收到的 `delta/action` 当作归一化 6D 增量，按 `eval_zmq_action_scale` 和自身安全限幅映射到末端控制命令。不要让 Newt 直接绕过机器人侧的速度、位移、力、碰撞和 workspace 限幅。
+控制机械臂时，机器人侧应把收到的 `delta/action` 当作归一化 6D 末端增量，按 `eval_zmq_action_scale` 和自身安全限幅映射到末端控制命令。当前 SRSA/IsaacLab checkpoint 的 action 是 SRSA 原生 world/env frame fingertip delta，不是 canonical socket-frame action；机器人侧不要再做 socket -> TCP 的二次转换。不要让 Newt 直接绕过机器人侧的速度、位移、力、碰撞和 workspace 限幅。
 
 ### 真机低速 Smoke Test
 
@@ -560,9 +734,36 @@ logs/<task>/<seed>/<exp_name>/<run_id>/batch_eval/<checkpoint_name>/batch_eval_s
 
 精确评测多少个完成 episode。推荐 eval 脚本使用这个参数，尤其是 `num_envs > 1` 时。
 
+`eval_trace_enabled`
+
+记录少量推理状态用于 sim2real 对比。默认 `false`。开启后记录 `obs/action/task/action_info`；如果 action 通过 ZMQ 发送，还会记录缩放后的 `sent_action`；仿真 `eval_trials` 路径还会记录 `next_obs/reward/done` 和 SRSA success 诊断字段，例如 `official_success/terminal_process_success/depth_fraction/lateral_error/jam`；真机 `closed_loop` 路径会记录 observation 消息的 `seq/timestamp`。
+
+`eval_trace_steps`
+
+最多记录多少次推理，默认 `16`。
+
+`eval_trace_fp`
+
+trace 输出文件。相对路径会写到当前 Hydra run 目录下；不设置时仿真默认 `data/sim_trace.jsonl`，真机闭环默认 `data/real_closed_loop_trace.jsonl`。
+
+`eval_trace_env_index`
+
+`num_envs > 1` 时选择记录哪个 env。默认跟随 `eval_zmq_env_index`。
+
 `eval_episodes`
 
 `eval_trials` 未设置时使用。含义是每个 env 至少完成多少个 episode。
+
+`srsa_eval_success_metric`
+
+SRSA 仿真 eval 的主成功指标。可选：
+
+- `terminal_process`: 默认，终态严格 process 成功并连续稳定若干步。
+- `official`: AutoMate 原始 episode 锁存成功。
+- `current_official`: 只看 episode 结束当前帧的 AutoMate 成功。
+- `process`: 只看当前帧严格 process 成功，不要求稳定步数。
+- `episode_process`: episode 内曾经满足稳定严格 process 成功。
+- `dual`: `official && terminal_process`。
 
 `eval_task_id`
 
@@ -599,6 +800,14 @@ SRSA 参数模板 JSON。用于没有 offline manifest 时按 `assembly_id + srs
 `isaaclab_canonical_append_force`
 
 是否把 `flange_force_obs[3]` 拼进 observation。只有训练 checkpoint 是 17D 时才打开。
+
+`isaaclab_canonical_zero_force`
+
+用于无力传感器 ablation。保持 `isaaclab_canonical_append_force=true`，但把拼进 canonical obs 的 force 维度全部置 0；如果 SRSA 侧没有创建 `flange_force_obs`，也会按 `isaaclab_canonical_force_dim` 补零，从而保持 17D checkpoint 的输入维度不变。
+
+`isaaclab_canonical_force_dim`
+
+无力传感器补零时的 force 维度，默认 `3`。
 
 `isaaclab_canonical_append_task_params`
 
@@ -650,7 +859,11 @@ ZMQ action 发送频率。`0` 表示不额外限速。
 
 `eval_zmq_action_frame`
 
-写入 action JSON 的元信息，默认 `socket`。机器人侧应按这个坐标系解释 6D 增量，或在 receiver 里明确转换。
+写入 action JSON 的元信息，默认 `world`。当前 SRSA/IsaacLab 训练路径只 canonicalize observation，不 canonicalize action；6D action 会原样进入 SRSA 原生 action 接口，因此它应按 world/env frame 的末端增量理解，而不是 socket frame。
+
+`eval_zmq_command_frame`
+
+写入 `command.frame` 和顶层 `command_frame` 的元信息。默认跟随 `eval_zmq_action_frame`。如果机器人侧 receiver 会根据该字段做坐标变换，当前 SRSA checkpoint 应使用 `world`/base-frame 语义，避免 socket -> TCP 的额外转换。
 
 `eval_zmq_action_order`
 
@@ -733,16 +946,41 @@ raw.policy_obs: shape=(..., 24)
 - `action_dim`
 
 
+真机闭环示例：
 
+注意：`00186` 是 SRSA mesh/task id，应传给 `assembly_id`；`srsa_param_template_id`
+或 `srsa_task_template_id` 选择 clearance/depth 参数模板，当前模板文件只有 `0..4`。
+`srsa_mesh_geometry_fp` 需要指向 SRSA 导出的真实 CSV。
+
+```bash
 python3 tdmpc2/eval.py \
   eval_mode=real \
   eval_real_mode=closed_loop \
   eval_real_obs_server=tcp://192.168.10.37:5556 \
   eval_real_obs_socket_type=sub \
   eval_zmq_server=tcp://192.168.10.37:5555 \
+  model_size=S \
+  assembly_id=00186 \
   srsa_task_template_fp=data/srsa_axial_task_templates.json \
-  srsa_task_template_id=00186 \
+  srsa_param_template_id=2 \
+  srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
+  eval_real_state_format=libfranka \
   eval_real_use_msg_task_vec=false \
-  eval_real_socket_pos=[0.4906,-0.0346,0.329] \
-  eval_real_socket_quat_wxyz=[1.0,0.0,0.0,0.0] \
-  eval_real_force_scale=50.0
+  'eval_real_socket_pos=[0.4804, -0.0113, 0.3273]' \
+  'eval_real_socket_quat_wxyz=[1, 0.0, 0.0, 0.0]' \
+  eval_real_force_scale=50.0 \
+  eval_real_zero_missing_force=true \
+  eval_zmq_action_frame=base \
+  eval_zmq_command_frame=tcp \
+  eval_zmq_action_scale=0.05 \
+  eval_zmq_max_trans_delta=0.001 \
+  eval_zmq_max_rot_delta=0.003 \
+  eval_zmq_warmup_steps=10 \
+  eval_zmq_send_timeout_ms=100 \
+  eval_zmq_rate=10 \
+  eval_real_steps=150 \
+  eval_real_obs_timeout_ms=5000 \
+  eval_real_debug_log_fp=logs/real_closed_loop_debug_00186.jsonl \
+  compile=false \
+  checkpoint=logs/srsa_axial_online/20260521_105015_asm-01125/models/best.pt
+```
