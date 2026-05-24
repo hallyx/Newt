@@ -8,6 +8,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import json
+import csv
+import math
 from collections import defaultdict
 from pathlib import Path
 from time import monotonic
@@ -45,6 +47,11 @@ def setup(rank, world_size, port):
 
 
 SUCCESS_DIAGNOSTIC_KEYS = (
+	"official_success_latched",
+	"official_success_terminal",
+	"process_success_terminal",
+	"strict_success_stable",
+	"strict_success_episode",
 	"official_success",
 	"current_official_success",
 	"process_success",
@@ -53,6 +60,7 @@ SUCCESS_DIAGNOSTIC_KEYS = (
 	"dual_success",
 	"depth_fraction",
 	"lateral_error",
+	"angle_error",
 	"orientation_error",
 	"yaw_error",
 	"keypoint_error",
@@ -813,6 +821,52 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	return metrics
 
 
+def _metric_value(metrics, *names, default=0.0):
+	for name in names:
+		for key in (name, f"episode_{name}"):
+			if key in metrics:
+				return float(metrics[key])
+	return default
+
+
+def _write_eval_summary(cfg, metrics):
+	if int(cfg.get('rank', 0)) != 0:
+		return
+	output_dir = Path(cfg.work_dir) / "eval_summary"
+	output_dir.mkdir(parents=True, exist_ok=True)
+	official_latched = _metric_value(metrics, "official_success_latched", "official_success")
+	official_terminal = _metric_value(metrics, "official_success_terminal", "current_official_success")
+	strict_success = _metric_value(metrics, "strict_success_stable", "terminal_process_success", "success")
+	process_success = _metric_value(metrics, "process_success_terminal", "process_success")
+	depth_fraction = _metric_value(metrics, "depth_fraction")
+	lateral_error = _metric_value(metrics, "lateral_error")
+	angle_error = _metric_value(metrics, "angle_error", "orientation_error", "yaw_error")
+	keypoint_error = _metric_value(metrics, "keypoint_error")
+	row = {
+		"assembly_id": str(cfg.get('assembly_id', "")),
+		"official_success_latched": official_latched,
+		"official_success_terminal": official_terminal,
+		"strict_success": strict_success,
+		"process_success": process_success,
+		"mean_depth_fraction": depth_fraction,
+		"mean_lateral_error_mm": lateral_error * 1000.0,
+		"mean_angle_error_deg": math.degrees(angle_error),
+		"mean_keypoint_error_mm": keypoint_error * 1000.0,
+		"episode_len_mean": _metric_value(metrics, "episode_length", "length"),
+		"official_strict_gap": official_latched - strict_success,
+	}
+	json_fp = output_dir / "eval_summary.json"
+	csv_fp = output_dir / "eval_summary.csv"
+	with open(json_fp, "w", encoding="utf-8") as f:
+		json.dump(row, f, ensure_ascii=True, indent=2)
+	with open(csv_fp, "w", encoding="utf-8", newline="") as f:
+		writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+		writer.writeheader()
+		writer.writerow(row)
+	print(colored(f"Saved eval summary JSON: {json_fp}", "green", attrs=["bold"]))
+	print(colored(f"Saved eval summary CSV: {csv_fp}", "green", attrs=["bold"]))
+
+
 def evaluate(rank: int, cfg: dict):
 	"""
 	Script for checkpoint evaluation.
@@ -918,6 +972,7 @@ def evaluate(rank: int, cfg: dict):
 				'green',
 				attrs=['bold'],
 			))
+			_write_eval_summary(cfg, eval_metrics)
 		trainer.logger.finish()
 		if cfg.rank == 0:
 			print(colored('Evaluation completed successfully.', 'green', attrs=['bold']))

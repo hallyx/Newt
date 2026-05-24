@@ -142,6 +142,8 @@ class Logger:
 		self._model_dir = make_dir(self._log_dir / "models")
 		self._local_log_fp = self._log_dir / "metrics.jsonl"
 		self._save_agent = cfg.save_agent and self.rank == 0
+		self._save_freq = cfg.get("save_freq", None)
+		self._eval_freq = cfg.get("eval_freq", None)
 		self._group = cfg_to_group(cfg)
 		self._seed = cfg.seed
 		self._run_id = cfg.get("run_id", None)
@@ -159,6 +161,7 @@ class Logger:
 
 		self._write_run_metadata(cfg)
 		print_run(cfg)
+		self._print_checkpoint_policy()
 		if not cfg.enable_wandb or self.project is None:
 			print(colored("Wandb disabled. Using local logging only.", "blue", attrs=["bold"]))
 			cfg.save_video = False
@@ -221,9 +224,40 @@ class Logger:
 			"work_dir": str(self._log_dir),
 			"model_dir": str(self._model_dir),
 			"metrics_fp": str(self._local_log_fp),
+			"save_agent": bool(cfg.save_agent),
+			"save_freq": cfg.get("save_freq", None),
+			"eval_freq": cfg.get("eval_freq", None),
+			"save_best": bool(cfg.get("save_best", False)),
+			"save_best_metric": cfg.get("save_best_metric", "episode_success"),
 		}
 		with open(self._log_dir / "run.json", "w", encoding="utf-8") as f:
 			json.dump(meta, f, ensure_ascii=True, indent=2)
+
+	def _print_checkpoint_policy(self):
+		if self.rank != 0:
+			return
+		if not self._save_agent:
+			print(colored("Checkpointing disabled (`save_agent=false`).", "yellow", attrs=["bold"]))
+			return
+		freq_text = "disabled"
+		if self._save_freq is not None:
+			try:
+				freq_text = f"every {int(self._save_freq):,} env steps"
+			except (TypeError, ValueError):
+				freq_text = str(self._save_freq)
+		eval_text = "disabled"
+		if self._eval_freq is not None:
+			try:
+				eval_text = f"every {int(self._eval_freq):,} env steps"
+			except (TypeError, ValueError):
+				eval_text = str(self._eval_freq)
+		print(colored(
+			f"Checkpointing enabled: latest checkpoint after each eval -> {self._model_dir / 'latest.pt'}; "
+			f"periodic archives {freq_text}; best metric `{self._best_metric_name}`.",
+			"cyan",
+			attrs=["bold"],
+		))
+		print(colored(f"Evaluation cadence: {eval_text}. Checkpoints are saved as `.pt` files.", "cyan", attrs=["bold"]))
 
 	def _checkpoint_filename(self, identifier, metrics=None):
 		identifier = _safe_token(identifier)
@@ -262,6 +296,27 @@ class Logger:
 			print(colored(f"Saved checkpoint: {fp}", "green", attrs=["bold"]))
 			return fp
 		return None
+
+	def save_latest_agent(self, agent=None, metrics=None):
+		if not self._save_agent or not agent:
+			return None
+		fp = self._model_dir / "latest.pt"
+		agent.save(fp)
+		meta = dict(metrics or {})
+		with open(self._model_dir / "latest.json", "w", encoding="utf-8") as f:
+			json.dump(
+				{
+					"checkpoint": str(fp),
+					"step": meta.get("step", None),
+					"metric": self._best_metric_name,
+					"value": self._to_serializable(meta.get(self._best_metric_name, None)),
+				},
+				f,
+				ensure_ascii=True,
+				indent=2,
+			)
+		print(colored(f"Updated latest checkpoint: {fp}", "green", attrs=["bold"]))
+		return fp
 
 	def maybe_save_best_agent(self, agent, metrics, step):
 		if not self._save_agent or not agent:

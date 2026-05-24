@@ -10,6 +10,7 @@ warnings.filterwarnings('ignore')
 from copy import deepcopy
 from pathlib import Path
 from time import monotonic
+import csv
 import json
 import math
 import subprocess
@@ -35,6 +36,25 @@ torch.set_float32_matmul_precision('high')
 
 cs = ConfigStore.instance()
 cs.store(name="config", node=Config)
+
+SUCCESS_METADATA_KEYS = (
+	"official_success_latched",
+	"official_success_terminal",
+	"process_success_terminal",
+	"strict_success_stable",
+	"strict_success_episode",
+	"official_success",
+	"current_official_success",
+	"process_success",
+	"episode_process_success",
+	"terminal_process_success",
+	"depth_fraction",
+	"lateral_error",
+	"angle_error",
+	"orientation_error",
+	"yaw_error",
+	"keypoint_error",
+)
 
 
 def _checkpoint_state_dict(checkpoint_fp: Path):
@@ -64,6 +84,7 @@ def _infer_checkpoint_compat(checkpoint_fp: Path):
 	task_emb = _get_state_tensor(state_dict, "_task_emb.weight")
 	task_vecs = _get_state_tensor(state_dict, "_task_vecs")
 	task_encoder = _get_state_tensor(state_dict, "_task_encoder.type_encoder.weight")
+	action_masks = _get_state_tensor(state_dict, "_action_masks")
 	if task_emb is not None:
 		task_conditioning = "id_embedding"
 		task_dim = int(task_emb.shape[-1])
@@ -83,6 +104,7 @@ def _infer_checkpoint_compat(checkpoint_fp: Path):
 		"model_size": _infer_model_size(int(enc_weight.shape[0])),
 		"enc_dim": int(enc_weight.shape[0]),
 		"obs_dim": obs_dim,
+		"action_dim": int(action_masks.shape[-1]) if action_masks is not None else None,
 		"task_dim": task_dim,
 		"task_conditioning": task_conditioning,
 	}
@@ -99,7 +121,7 @@ def _parse_assembly_ids(raw) -> list[str]:
 	if raw is None:
 		return []
 	if isinstance(raw, str):
-		text = raw.strip()
+		text = raw.strip().strip("'\"")
 		if text.startswith("[") and text.endswith("]"):
 			text = text[1:-1]
 		items = [item for item in text.replace(";", ",").replace(" ", ",").split(",") if item.strip()]
@@ -119,12 +141,15 @@ def _resolve_assembly_ids(cfg) -> list[str]:
 			if entry.get("assembly_id") is not None
 		]
 	source_id = cfg.get('collect_source_assembly_id', None)
-	if source_id is not None and cfg.get('collect_exclude_source_assembly', True):
+	if source_id is not None and cfg.get('include_source_anchor_rollouts', False):
+		source_id = _normalize_assembly_id(source_id)
+		assembly_ids = list(dict.fromkeys([*assembly_ids, source_id]))
+	elif source_id is not None and cfg.get('collect_exclude_source_assembly', True):
 		source_id = _normalize_assembly_id(source_id)
 		assembly_ids = [assembly_id for assembly_id in assembly_ids if assembly_id != source_id]
 	if not assembly_ids:
 		raise ValueError(
-			"Provide target ids with `collect_assembly_ids=[00141,00211,...]` "
+			"Provide target ids with `collect_assembly_ids=[00004,00014,...]` "
 			"or provide `offline_manifest_fp` containing assembly_id values."
 		)
 	return assembly_ids
@@ -141,6 +166,8 @@ def _resolve_output_dir(cfg) -> Path:
 def _resolve_manifest_fp(cfg, output_dir: Path) -> Path:
 	if cfg.get('collect_manifest_fp', None):
 		return Path(cfg.collect_manifest_fp).expanduser().resolve()
+	if _normalize_assembly_id(cfg.get('collect_source_assembly_id', '01125')) == "01125":
+		return Path(hydra.utils.get_original_cwd()) / "data" / "offline_manifest_policy_rollouts_from_01125_axial_hole_3d.json"
 	return output_dir / "offline_manifest_eval_rollouts.json"
 
 
@@ -154,6 +181,9 @@ def _apply_checkpoint_compat(cfg, checkpoint_fp: Path):
 		cfg.model_size = compat["model_size"]
 	cfg.task_conditioning = compat["task_conditioning"]
 	cfg.collect_expected_obs_dim = compat["obs_dim"]
+	if compat.get("action_dim", None) is not None:
+		cfg.srsa_policy_action_dim = int(compat["action_dim"])
+		cfg.isaaclab_action_dim = int(compat["action_dim"])
 	if compat["task_conditioning"] == "id_embedding":
 		cfg.isaaclab_use_canonical_obs = False
 		cfg.isaaclab_canonical_append_force = False
@@ -270,11 +300,39 @@ def _empty_columns():
 		"terminal_success": [],
 		"terminal_failure": [],
 		"success_episode": [],
+		"episode_official_success_latched_final": [],
+		"episode_official_success_terminal_final": [],
+		"episode_process_success_terminal_final": [],
+		"episode_strict_success_stable_final": [],
+		"episode_strict_success_episode_final": [],
+		"episode_depth_fraction_final": [],
+		"episode_lateral_error_final": [],
+		"episode_angle_error_final": [],
+		"episode_keypoint_error_final": [],
 	}
 
 
-def _append_finished_episode(columns, rows, *, episode_id: int, task_id: int, final_return: float, final_success: float):
+def _append_finished_episode(
+	columns,
+	rows,
+	*,
+	episode_id: int,
+	task_id: int,
+	final_return: float,
+	final_success: float,
+	final_metrics: dict | None = None,
+):
 	final_failure = 1.0 - final_success
+	final_metrics = final_metrics or {}
+	official_latched = float(final_metrics.get("official_success_latched", final_metrics.get("official_success", 0.0)))
+	official_terminal = float(final_metrics.get("official_success_terminal", final_metrics.get("current_official_success", 0.0)))
+	process_terminal = float(final_metrics.get("process_success_terminal", final_metrics.get("process_success", 0.0)))
+	strict_stable = float(final_metrics.get("strict_success_stable", final_metrics.get("terminal_process_success", final_success)))
+	strict_episode = float(final_metrics.get("strict_success_episode", final_metrics.get("episode_process_success", strict_stable)))
+	depth_fraction = float(final_metrics.get("depth_fraction", 0.0))
+	lateral_error = float(final_metrics.get("lateral_error", 0.0))
+	angle_error = float(final_metrics.get("angle_error", final_metrics.get("orientation_error", 0.0)))
+	keypoint_error = float(final_metrics.get("keypoint_error", 0.0))
 	last_index = len(rows) - 1
 	for index, row in enumerate(rows):
 		is_terminal = index == last_index
@@ -295,6 +353,15 @@ def _append_finished_episode(columns, rows, *, episode_id: int, task_id: int, fi
 		columns["terminal_success"].append(torch.tensor(bool(is_terminal and final_success > 0.5), dtype=torch.bool))
 		columns["terminal_failure"].append(torch.tensor(bool(is_terminal and final_success <= 0.5), dtype=torch.bool))
 		columns["success_episode"].append(torch.tensor(final_success, dtype=torch.float32))
+		columns["episode_official_success_latched_final"].append(torch.tensor(official_latched, dtype=torch.float32))
+		columns["episode_official_success_terminal_final"].append(torch.tensor(official_terminal, dtype=torch.float32))
+		columns["episode_process_success_terminal_final"].append(torch.tensor(process_terminal, dtype=torch.float32))
+		columns["episode_strict_success_stable_final"].append(torch.tensor(strict_stable, dtype=torch.float32))
+		columns["episode_strict_success_episode_final"].append(torch.tensor(strict_episode, dtype=torch.float32))
+		columns["episode_depth_fraction_final"].append(torch.tensor(depth_fraction, dtype=torch.float32))
+		columns["episode_lateral_error_final"].append(torch.tensor(lateral_error, dtype=torch.float32))
+		columns["episode_angle_error_final"].append(torch.tensor(angle_error, dtype=torch.float32))
+		columns["episode_keypoint_error_final"].append(torch.tensor(keypoint_error, dtype=torch.float32))
 
 
 def _stack_columns(columns):
@@ -306,6 +373,40 @@ def _stack_columns(columns):
 	return TensorDict(data, batch_size=(data["obs"].shape[0],))
 
 
+def _validate_manifest(manifest):
+	entries = list(manifest.get("tasks", []))
+	if not entries:
+		raise ValueError("No rollout tasks were collected; all targets may have been deferred for online boost.")
+	task_ids = [int(entry["task_id"]) for entry in entries]
+	if task_ids != list(range(len(entries))):
+		raise ValueError(f"Manifest task_id values must be consecutive from 0, got {task_ids}.")
+	for entry in entries:
+		source_fp = Path(entry["source_fp"]).expanduser()
+		if not source_fp.exists():
+			raise FileNotFoundError(f"Manifest source_fp does not exist: {source_fp}")
+		if int(entry.get("action_dim", -1)) != 3:
+			raise ValueError(f"Expected action_dim=3 for {entry['assembly_id']}, got {entry.get('action_dim')}.")
+		obs_shape = entry.get("obs_shape", None)
+		if list(obs_shape or []) != [17]:
+			raise ValueError(f"Expected obs_shape=[17] for {entry['assembly_id']}, got {obs_shape}.")
+		if entry.get("assembly_id") is None:
+			raise ValueError(f"Missing assembly_id in manifest entry: {entry}")
+		if entry.get("task_vec_6", entry.get("task_param_vec", None)) is None:
+			raise ValueError(f"Missing task_vec_6/task_param_vec in manifest entry: {entry['assembly_id']}")
+		obj = torch.load(source_fp, map_location="cpu", weights_only=False)
+		if int(obj["action"].shape[-1]) != 3 or int(obj["obs"].shape[-1]) != 17:
+			raise ValueError(
+				f"Dataset shape mismatch for {source_fp}: "
+				f"obs={tuple(obj['obs'].shape)} action={tuple(obj['action'].shape)}"
+			)
+		episode_count = int(torch.unique(obj["episode"].reshape(-1)).numel())
+		if episode_count != int(entry.get("num_episodes", -1)):
+			raise ValueError(
+				f"Episode count mismatch for {entry['assembly_id']}: "
+				f"manifest={entry.get('num_episodes')} dataset={episode_count}"
+			)
+
+
 def _write_json(path: Path, obj):
 	path.parent.mkdir(parents=True, exist_ok=True)
 	with open(path, "w", encoding="utf-8") as f:
@@ -315,6 +416,64 @@ def _write_json(path: Path, obj):
 def _read_json(path: Path):
 	with open(path, "r", encoding="utf-8") as f:
 		return json.load(f)
+
+
+def _read_screening(path_value) -> dict[str, dict]:
+	if not path_value:
+		return {}
+	path = Path(path_value).expanduser()
+	if not path.is_absolute():
+		path = Path(hydra.utils.get_original_cwd()) / path
+	if not path.exists():
+		raise FileNotFoundError(f"collect_screening_fp not found: {path}")
+	if path.suffix.lower() == ".json":
+		with open(path, "r", encoding="utf-8") as f:
+			obj = json.load(f)
+		rows = obj.get("tasks", obj) if isinstance(obj, dict) else obj
+	else:
+		with open(path, "r", encoding="utf-8", newline="") as f:
+			rows = list(csv.DictReader(f))
+	out = {}
+	for row in rows:
+		assembly_id = row.get("assembly_id")
+		if assembly_id is None:
+			continue
+		out[_normalize_assembly_id(assembly_id)] = row
+	return out
+
+
+def _float_row(row, *keys, default=0.0):
+	for key in keys:
+		if key in row and row[key] not in (None, ""):
+			return float(row[key])
+	return default
+
+
+def _collection_decision(cfg, assembly_id: str, screening: dict[str, dict]):
+	row = screening.get(_normalize_assembly_id(assembly_id), {})
+	strict_success = _float_row(row, "strict_success", "process_success", "episode_success", default=1.0)
+	depth = _float_row(row, "mean_depth_fraction", "depth_fraction", default=1.0)
+	episodes = int(cfg.get('collect_episodes_per_task', 300))
+	decision = str(row.get("screen_decision", "")) if row else ""
+	requires_online_boost = False
+	skip = False
+	if strict_success < float(cfg.get('collect_weak_success_threshold', 0.10)):
+		episodes = max(episodes, int(cfg.get('collect_weak_task_episodes', 600)))
+	if (
+		strict_success < float(cfg.get('collect_defer_success_threshold', 0.03)) and
+		depth < float(cfg.get('collect_defer_depth_threshold', 0.35))
+	):
+		requires_online_boost = True
+		decision = decision or "defer_online_boost"
+		skip = bool(cfg.get('collect_skip_deferred_tasks', True))
+	return {
+		"episodes": episodes,
+		"screen_decision": decision,
+		"screen_strict_success": strict_success,
+		"screen_depth_fraction": depth,
+		"weak_task_requires_online_boost": requires_online_boost,
+		"skip": skip,
+	}
 
 
 def _json_safe(value):
@@ -361,6 +520,15 @@ def _override_value(value):
 def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 	fields = [
 		"checkpoint",
+		"eval_success_metric",
+		"srsa_eval_success_metric",
+		"strict_depth_fraction",
+		"strict_success_steps",
+		"strict_lateral_tol_min",
+		"strict_lateral_tol_max",
+		"strict_keypoint_tol_min",
+		"strict_keypoint_tol_max",
+		"strict_angle_tol_deg",
 		"isaaclab_backend",
 		"isaaclab_env_id",
 		"isaaclab_task_package",
@@ -392,6 +560,9 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 		"horizon",
 		"compile",
 		"mpc",
+		"eval_terminate_on_success",
+		"eval_terminate_success_key",
+		"eval_terminate_min_step",
 		"isaaclab_headless",
 		"isaaclab_use_canonical_obs",
 		"isaaclab_gpu_collision_stack_size",
@@ -436,7 +607,14 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 		"isaaclab_canonical_use_visual_noise",
 		"task_conditioning",
 		"collect_episodes_per_task",
+		"collect_weak_task_episodes",
+		"collect_screening_fp",
+		"collect_weak_success_threshold",
+		"collect_defer_success_threshold",
+		"collect_defer_depth_threshold",
+		"collect_skip_deferred_tasks",
 		"collect_source_assembly_id",
+		"include_source_anchor_rollouts",
 		"collect_match_checkpoint",
 		"collect_expected_obs_dim",
 		"collect_overwrite",
@@ -469,6 +647,7 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 def _collect_via_subprocesses(cfg, assembly_ids: list[str], output_dir: Path):
 	script = Path(__file__).resolve()
 	entries = []
+	skipped = []
 	for task_id, assembly_id in enumerate(assembly_ids):
 		result_fp = output_dir / assembly_id / "manifest_entry.json"
 		if result_fp.exists() and cfg.get('collect_overwrite', False):
@@ -488,13 +667,29 @@ def _collect_via_subprocesses(cfg, assembly_ids: list[str], output_dir: Path):
 		if not result_fp.exists():
 			raise FileNotFoundError(f"Worker did not write manifest entry: {result_fp}")
 		entry = _read_json(result_fp)
+		if entry.get("skip", False):
+			skipped.append(entry)
+			continue
 		entry["task_id"] = int(task_id)
 		entries.append(entry)
-	return entries
+	return entries, skipped
 
 
-def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id: int):
+def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id: int, screening=None):
 	cfg = _task_cfg(base_cfg, assembly_id)
+	decision = _collection_decision(cfg, assembly_id, screening or {})
+	if decision["skip"]:
+		return {
+			"skip": True,
+			"task_id": int(task_id),
+			"task_name": f"{cfg.task}-{assembly_id}",
+			"assembly_id": assembly_id,
+			"screen_decision": decision["screen_decision"],
+			"screen_strict_success": decision["screen_strict_success"],
+			"screen_depth_fraction": decision["screen_depth_fraction"],
+			"weak_task_requires_online_boost": decision["weak_task_requires_online_boost"],
+			"reason": "zero-shot strict success and depth were both too low; online boost is required first",
+		}
 	task_dir = output_dir / assembly_id
 	output_fp = task_dir / "policy_eval_rollouts.pt"
 	metadata_fp = task_dir / "policy_eval_rollouts.pt.json"
@@ -528,7 +723,7 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 		task_params = _current_srsa_task_params(env)
 		srsa_sampler = _srsa_sampler_config(cfg)
 		agent = _make_agent(cfg)
-		target_episodes = int(cfg.get('collect_episodes_per_task', cfg.get('eval_trials', 100)) or 100)
+		target_episodes = int(decision.get("episodes", cfg.get('collect_episodes_per_task', cfg.get('eval_trials', 100))) or 100)
 		if target_episodes <= 0:
 			raise ValueError(f"collect_episodes_per_task must be positive, got {target_episodes}.")
 		use_mpc = cfg.mpc if cfg.get('collect_mpc', None) is None else bool(cfg.collect_mpc)
@@ -540,6 +735,7 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 		columns = _empty_columns()
 		episode_returns = []
 		episode_successes = []
+		episode_metric_values = {}
 		completed = 0
 		env_steps = 0
 		start_time = monotonic()
@@ -607,8 +803,10 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 
 				env_steps += 1
 				if 'final_info' in info:
-					success_tensor = info['final_info'].get('success', None)
+					final_info = info['final_info']
+					success_tensor = final_info.get('success', None)
 				else:
+					final_info = {}
 					success_tensor = None
 				for env_index in range(cfg.num_envs):
 					if not bool(done[env_index].item()):
@@ -618,6 +816,12 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 						value = success_tensor[env_index]
 						final_success = float(torch.nan_to_num(value, nan=0.0).detach().item())
 					final_return = float(next_return[env_index].detach().item())
+					final_metrics = {}
+					for metric_key in SUCCESS_METADATA_KEYS:
+						if metric_key not in final_info:
+							continue
+						value = torch.nan_to_num(final_info[metric_key][env_index], nan=0.0)
+						final_metrics[metric_key] = float(value.detach().item())
 					if completed < target_episodes:
 						_append_finished_episode(
 							columns,
@@ -626,9 +830,12 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 							task_id=0,
 							final_return=final_return,
 							final_success=final_success,
+							final_metrics=final_metrics,
 						)
 						episode_returns.append(final_return)
 						episode_successes.append(final_success)
+						for metric_key, value in final_metrics.items():
+							episode_metric_values.setdefault(metric_key, []).append(value)
 						completed += 1
 					episode_rows[env_index] = []
 
@@ -658,19 +865,34 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 		summary = summarize_compact_dataset(dataset)
 		if getattr(agent.model, "_task_vecs", None) is not None:
 			task_vec = agent.model._task_vecs[0].detach().cpu().tolist()
+		if task_vec is None:
+			task_vec = _current_task_vec_6(cfg, env)
+		metric_means = {
+			key: float(sum(values) / max(1, len(values)))
+			for key, values in episode_metric_values.items()
+			if len(values) > 0
+		}
 		metadata = {
 			"assembly_id": assembly_id,
 			"checkpoint": str(Path(cfg.checkpoint).expanduser().resolve()),
 			"source_assembly_id": cfg.get('collect_source_assembly_id', None),
 			"output": str(output_fp),
 			"task_vec_6": task_vec,
+			"task_param_vec": task_vec,
 			"srsa_params": task_params,
 			"srsa_sampler": srsa_sampler,
+			"action_dim": int(cfg.action_dim),
+			"obs_shape": list(dataset["obs"].shape[1:]),
 			"num_envs": int(cfg.num_envs),
 			"episodes_requested": target_episodes,
 			"episodes_collected": len(episode_returns),
 			"episode_return_mean": float(sum(episode_returns) / max(1, len(episode_returns))),
 			"episode_success_mean": float(sum(episode_successes) / max(1, len(episode_successes))),
+			"success_metrics": metric_means,
+			"screen_decision": decision["screen_decision"],
+			"screen_strict_success": decision["screen_strict_success"],
+			"screen_depth_fraction": decision["screen_depth_fraction"],
+			"weak_task_requires_online_boost": decision["weak_task_requires_online_boost"],
 			"mpc": bool(use_mpc),
 			"summary": summary,
 		}
@@ -687,13 +909,20 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 			"assembly_id": assembly_id,
 			"source_fp": str(output_fp),
 			"action_dim": int(cfg.action_dim),
+			"obs_shape": list(dataset["obs"].shape[1:]),
 			"max_episode_steps": int(cfg.episode_length),
 			"task_vec_6": task_vec,
+			"task_param_vec": task_vec,
 			"num_episodes": len(episode_returns),
 			"num_transitions": int(summary["num_transitions"]),
 			"success_count": int(sum(1 for value in episode_successes if value > 0.5)),
 			"failure_count": int(sum(1 for value in episode_successes if value <= 0.5)),
 			"success_rate": metadata["episode_success_mean"],
+			"success_metrics": metric_means,
+			"screen_decision": decision["screen_decision"],
+			"screen_strict_success": decision["screen_strict_success"],
+			"screen_depth_fraction": decision["screen_depth_fraction"],
+			"weak_task_requires_online_boost": decision["weak_task_requires_online_boost"],
 		}
 		if task_params:
 			entry["srsa_params"] = task_params
@@ -715,7 +944,7 @@ def launch(cfg: Config):
 	if cfg.get('collect_source_assembly_id', None) is not None:
 		cfg.assembly_id = _normalize_assembly_id(cfg.collect_source_assembly_id)
 	if not cfg.checkpoint:
-		raise ValueError("`checkpoint` must point to the 00186 trained model checkpoint.")
+		raise ValueError("`checkpoint` must point to the source assembly checkpoint.")
 	checkpoint_fp = Path(hydra.utils.to_absolute_path(str(cfg.checkpoint))).expanduser().resolve()
 	if not checkpoint_fp.exists():
 		raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_fp}")
@@ -737,27 +966,39 @@ def launch(cfg: Config):
 	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.work_dir)
 	print(colored(f'Rollout output dir: {output_dir}', 'yellow', attrs=['bold']))
 	print(colored(f'Target assembly ids: {assembly_ids}', 'yellow', attrs=['bold']))
+	screening = _read_screening(cfg.get('collect_screening_fp', None))
+	if screening:
+		print(colored(f'Loaded screening rows for {len(screening)} assembly ids.', 'yellow', attrs=['bold']))
 
 	if worker_assembly_id is not None:
 		assembly_id = assembly_ids[0]
-		entry = _collect_for_assembly(cfg, assembly_id, output_dir, 0)
+		entry = _collect_for_assembly(cfg, assembly_id, output_dir, 0, screening)
 		result_fp = output_dir / assembly_id / "manifest_entry.json"
 		_write_json(result_fp, entry)
 		print(colored(f"Saved worker manifest entry: {result_fp}", "green", attrs=["bold"]))
 		return
 
 	if len(assembly_ids) > 1 and cfg.get('collect_spawn_per_assembly', True):
-		entries = _collect_via_subprocesses(cfg, assembly_ids, output_dir)
+		entries, skipped = _collect_via_subprocesses(cfg, assembly_ids, output_dir)
 	else:
 		entries = []
+		skipped = []
 		for task_id, assembly_id in enumerate(assembly_ids):
-			entries.append(_collect_for_assembly(cfg, assembly_id, output_dir, task_id))
+			entry = _collect_for_assembly(cfg, assembly_id, output_dir, task_id, screening)
+			if entry.get("skip", False):
+				skipped.append(entry)
+				continue
+			entries.append(entry)
+	for new_task_id, entry in enumerate(entries):
+		entry["task_id"] = int(new_task_id)
 
 	manifest = {
 		"source_assembly_id": cfg.get('collect_source_assembly_id', None),
 		"checkpoint": str(Path(cfg.checkpoint).expanduser().resolve()),
 		"tasks": entries,
+		"skipped_tasks": skipped,
 	}
+	_validate_manifest(manifest)
 	_write_json(manifest_fp, manifest)
 	total_episodes = sum(entry["num_episodes"] for entry in entries)
 	total_success = sum(entry["success_count"] for entry in entries)

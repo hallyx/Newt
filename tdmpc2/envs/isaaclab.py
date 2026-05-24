@@ -1,6 +1,7 @@
 import sys
 import os
 import importlib
+import math
 from pathlib import Path
 
 import gymnasium as gym
@@ -227,28 +228,33 @@ def _get_srsa_current_task_vec(env):
 
 
 def _normalize_srsa_eval_success_metric(metric):
-	normalized = str(metric or "official").strip().lower().replace("-", "_")
+	normalized = str(metric or "strict").strip().lower().replace("-", "_")
 	aliases = {
 		"automate": "official",
 		"auto_mate": "official",
 		"official_success": "official",
+		"official_success_latched": "official",
 		"current": "current_official",
 		"current_success": "current_official",
 		"current_official_success": "current_official",
+		"official_terminal": "current_official",
+		"official_success_terminal": "current_official",
 		"process_success": "process",
+		"process_success_terminal": "process",
 		"episode_process_success": "episode_process",
 		"terminal": "terminal_process",
 		"terminal_success": "terminal_process",
 		"terminal_process_success": "terminal_process",
 		"strict": "terminal_process",
 		"strict_success": "terminal_process",
+		"strict_success_stable": "terminal_process",
 		"dual_success": "dual",
 	}
 	normalized = aliases.get(normalized, normalized)
 	if normalized not in {"official", "current_official", "process", "episode_process", "terminal_process", "dual"}:
 		raise ValueError(
 			"srsa_eval_success_metric must be one of: official, current_official, "
-			"process, episode_process, terminal_process, dual."
+			"process, episode_process, terminal_process/strict, dual."
 		)
 	return normalized
 
@@ -376,14 +382,14 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 	current_depth = (target_depth - rel_socket[:, 2]).clamp_min(0.0)
 	depth_fraction = current_depth / target_depth.clamp_min(1.0e-6)
 	height_window_ok = (rel_socket[:, 2] > 0.0) & (rel_socket[:, 2] < target_depth.clamp_min(1.0e-6))
-	depth_ok = height_window_ok & (depth_fraction >= float(cfg.get('srsa_process_success_depth_ratio', 0.85)))
+	depth_ok = height_window_ok & (depth_fraction >= float(cfg.get('strict_depth_fraction', cfg.get('srsa_process_success_depth_ratio', 0.90))))
 
 	lateral_error = torch.linalg.norm(rel_socket[:, :2], dim=-1)
 	lateral_tol = _clamped_tolerance(
 		radial_clearance,
 		cfg.get('srsa_process_success_lateral_tol_scale', 2.0),
-		cfg.get('srsa_process_success_lateral_tol_min', 0.001),
-		cfg.get('srsa_process_success_lateral_tol_max', 0.003),
+		cfg.get('strict_lateral_tol_min', cfg.get('srsa_process_success_lateral_tol_min', 0.0005)),
+		cfg.get('strict_lateral_tol_max', cfg.get('srsa_process_success_lateral_tol_max', 0.0020)),
 	)
 	lateral_ok = lateral_error <= lateral_tol
 
@@ -401,11 +407,13 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 			yaw_error = torch.abs(rel_euler[:, 2]).to(dtype=torch.float32)
 		except Exception:
 			pass
-	orientation_ok = orientation_error <= float(cfg.get('srsa_process_success_orientation_tol_rad', 0.0872665))
+	angle_tol_rad = math.radians(float(cfg.get('strict_angle_tol_deg', 3.0)))
+	orientation_ok = orientation_error <= float(cfg.get('srsa_process_success_orientation_tol_rad', angle_tol_rad))
 	yaw_required = _task_param_vector(env, "yaw_requirement_float", default=0.0) > 0.5
 	if cfg.get('srsa_axial_yaw_requirement', None) is not None:
 		yaw_required = torch.full_like(yaw_required, bool(cfg.get('srsa_axial_yaw_requirement', False)))
-	yaw_ok = (~yaw_required) | (yaw_error <= float(cfg.get('srsa_process_success_yaw_tol_rad', 0.0872665)))
+	yaw_ok = (~yaw_required) | (yaw_error <= float(cfg.get('srsa_process_success_yaw_tol_rad', angle_tol_rad)))
+	angle_error = torch.maximum(orientation_error, yaw_error)
 
 	keypoint_error = zeros.clone()
 	if all(hasattr(env, name) for name in ("keypoints_held", "keypoints_fixed")):
@@ -413,8 +421,8 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 	keypoint_tol = _clamped_tolerance(
 		radial_clearance,
 		cfg.get('srsa_process_success_keypoint_tol_scale', 2.0),
-		cfg.get('srsa_process_success_keypoint_tol_min', 0.001),
-		cfg.get('srsa_process_success_keypoint_tol_max', 0.003),
+		cfg.get('strict_keypoint_tol_min', cfg.get('srsa_process_success_keypoint_tol_min', 0.0010)),
+		cfg.get('strict_keypoint_tol_max', cfg.get('srsa_process_success_keypoint_tol_max', 0.0030)),
 	)
 	keypoint_ok = keypoint_error <= keypoint_tol
 
@@ -430,14 +438,19 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 	if bool(cfg.get('srsa_process_success_require_official', False)):
 		process = process & current_official
 
-	stable_steps = max(1, int(cfg.get('srsa_process_success_stable_steps', 3)))
+	stable_steps = max(1, int(cfg.get('strict_success_steps', cfg.get('srsa_process_success_stable_steps', 10))))
 	process_streak = torch.where(process, process_streak + 1, torch.zeros_like(process_streak))
 	terminal_process = process & (process_streak >= stable_steps)
 	episode_process_success = episode_process_success | terminal_process
 	dual = official & terminal_process
 
 	return {
-		"success_metric": _normalize_srsa_eval_success_metric(cfg.get('srsa_eval_success_metric', 'official')),
+		"success_metric": _normalize_srsa_eval_success_metric(cfg.get('eval_success_metric', cfg.get('srsa_eval_success_metric', 'strict'))),
+		"official_success_latched": official,
+		"official_success_terminal": current_official,
+		"process_success_terminal": process,
+		"strict_success_stable": terminal_process,
+		"strict_success_episode": episode_process_success,
 		"official_success": official,
 		"current_official_success": current_official,
 		"process_success": process,
@@ -455,6 +468,7 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 		"target_depth": target_depth,
 		"lateral_error": lateral_error,
 		"lateral_tol": lateral_tol,
+		"angle_error": angle_error,
 		"orientation_error": orientation_error,
 		"yaw_error": yaw_error,
 		"keypoint_error": keypoint_error,
@@ -785,6 +799,7 @@ class IsaacLabWrapper(gym.Wrapper):
 			device=self.env.unwrapped.device,
 		)
 		self._warned_missing_ep_success = False
+		self._warned_missing_eval_terminate_key = False
 		if self._debug_io and int(getattr(self.cfg, 'rank', 0)) == 0:
 			print(
 				"[isaaclab-debug] enabled "
@@ -1020,6 +1035,20 @@ class IsaacLabWrapper(gym.Wrapper):
 
 		final_obs = None
 		success_info = self._compute_success_info()
+		if bool(self.cfg.get('eval_terminate_on_success', False)) and _uses_srsa_backend(self.cfg):
+			success_key = str(self.cfg.get('eval_terminate_success_key', 'terminal_process_success'))
+			success_value = success_info.get(success_key, None)
+			if success_value is None:
+				if not self._warned_missing_eval_terminate_key and int(getattr(self.cfg, 'rank', 0)) == 0:
+					print(f"[isaaclab-warning] eval_terminate_success_key={success_key!r} not found; ignoring success termination.")
+					self._warned_missing_eval_terminate_key = True
+			else:
+				success_done = success_value.to(device=done.device, dtype=torch.float32) > 0.5
+				min_step = max(0, int(self.cfg.get('eval_terminate_min_step', 0)))
+				if min_step > 0:
+					success_done = success_done & (env.episode_length_buf >= min_step)
+				done = done | success_done
+				env.reset_buf = done
 		if done.any():
 			final_obs_dict = env._get_observations()
 			final_obs = self._extract_obs(final_obs_dict)[done].clone()

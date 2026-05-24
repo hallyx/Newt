@@ -43,6 +43,11 @@ cs = ConfigStore.instance()
 cs.store(name="config", node=Config)
 
 SUCCESS_DIAGNOSTIC_KEYS = (
+	"official_success_latched",
+	"official_success_terminal",
+	"process_success_terminal",
+	"strict_success_stable",
+	"strict_success_episode",
 	"official_success",
 	"current_official_success",
 	"process_success",
@@ -51,6 +56,7 @@ SUCCESS_DIAGNOSTIC_KEYS = (
 	"dual_success",
 	"depth_fraction",
 	"lateral_error",
+	"angle_error",
 	"orientation_error",
 	"yaw_error",
 	"keypoint_error",
@@ -62,7 +68,7 @@ def _parse_assembly_ids(raw) -> list[str]:
 	if raw is None:
 		return []
 	if isinstance(raw, str):
-		text = raw.strip()
+		text = raw.strip().strip("'\"")
 		if text.startswith("[") and text.endswith("]"):
 			text = text[1:-1]
 		items = [item for item in text.replace(";", ",").replace(" ", ",").split(",") if item.strip()]
@@ -72,19 +78,37 @@ def _parse_assembly_ids(raw) -> list[str]:
 
 
 def _resolve_eval_entries(cfg) -> list[dict]:
-	if not cfg.offline_manifest_fp:
-		raise ValueError("`offline_manifest_fp` is required so batch eval can map assembly_id -> task_id.")
-	entries = load_offline_manifest(cfg.offline_manifest_fp)
-	selected = _parse_assembly_ids(cfg.get('batch_eval_assembly_ids', None))
+	manifest_entries = []
+	if cfg.offline_manifest_fp:
+		manifest_entries = load_offline_manifest(cfg.offline_manifest_fp)
+	manifest_by_assembly = {
+		_normalize_assembly_id(entry.get("assembly_id")): dict(entry)
+		for entry in manifest_entries
+		if entry.get("assembly_id") is not None
+	}
+	selected = _parse_assembly_ids(cfg.get('eval_assembly_ids', None))
+	if not selected:
+		selected = _parse_assembly_ids(cfg.get('batch_eval_assembly_ids', None))
 	if selected:
-		selected_set = set(selected)
-		entries = [entry for entry in entries if _normalize_assembly_id(entry.get("assembly_id")) in selected_set]
-		present = {_normalize_assembly_id(entry.get("assembly_id")) for entry in entries}
-		missing = [assembly_id for assembly_id in selected if assembly_id not in present]
-		if missing:
-			raise ValueError(f"Requested assembly ids are not present in manifest: {missing}")
+		entries = []
+		for index, assembly_id in enumerate(selected):
+			if assembly_id in manifest_by_assembly:
+				entry = dict(manifest_by_assembly[assembly_id])
+			else:
+				entry = {
+					"task_id": index if not manifest_entries else len(entries),
+					"task_name": f"{cfg.task}-{assembly_id}",
+					"assembly_id": assembly_id,
+				}
+			entry["assembly_id"] = assembly_id
+			entry["eval_index"] = index
+			entries.append(entry)
+	elif manifest_entries:
+		entries = manifest_entries
+	else:
+		raise ValueError("Provide `eval_assembly_ids`, `batch_eval_assembly_ids`, or `offline_manifest_fp`.")
 	if not entries:
-		raise ValueError("No eval entries resolved from offline_manifest_fp/batch_eval_assembly_ids.")
+		raise ValueError("No eval entries resolved from eval/batch assembly ids or offline_manifest_fp.")
 	return entries
 
 
@@ -105,6 +129,16 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 	fields = [
 		"checkpoint",
 		"offline_manifest_fp",
+		"eval_assembly_ids",
+		"eval_success_metric",
+		"srsa_eval_success_metric",
+		"strict_depth_fraction",
+		"strict_success_steps",
+		"strict_lateral_tol_min",
+		"strict_lateral_tol_max",
+		"strict_keypoint_tol_min",
+		"strict_keypoint_tol_max",
+		"strict_angle_tol_deg",
 		"isaaclab_backend",
 		"isaaclab_env_id",
 		"isaaclab_task_package",
@@ -169,6 +203,9 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"horizon",
 		"compile",
 		"mpc",
+		"eval_terminate_on_success",
+		"eval_terminate_success_key",
+		"eval_terminate_min_step",
 		"isaaclab_headless",
 		"isaaclab_use_canonical_obs",
 		"isaaclab_gpu_collision_stack_size",
@@ -179,6 +216,15 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"isaaclab_canonical_append_task_params",
 		"isaaclab_canonical_use_visual_noise",
 		"task_conditioning",
+		"contact_history_enabled",
+		"contact_history_len",
+		"contact_context_dim",
+		"contact_history_hidden_dim",
+		"contact_history_layers",
+		"contact_force_dim",
+		"contact_action_dim",
+		"contact_ee_delta_dim",
+		"contact_history_use_ee_delta",
 		"learn_task_emb",
 		"collect_match_checkpoint",
 		"collect_expected_obs_dim",
@@ -204,6 +250,7 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 	overrides.extend([
 		f"batch_eval_worker_assembly_id={entry['assembly_id']}",
 		f"batch_eval_worker_task_id={int(entry['task_id'])}",
+		f"batch_eval_worker_eval_index={int(entry.get('eval_index', entry['task_id']))}",
 		"batch_eval_spawn_per_assembly=false",
 		f"batch_eval_output_dir={output_dir}",
 	])
@@ -234,12 +281,49 @@ def _run_subprocess_eval(cfg, entries: list[dict], output_dir: Path):
 		subprocess.run(cmd, cwd=hydra.utils.get_original_cwd(), check=True)
 		if not result_fp.exists():
 			raise FileNotFoundError(f"Worker did not write eval metrics: {result_fp}")
-		results.append(_read_json(result_fp))
+		result = _read_json(result_fp)
+		result["eval_index"] = index
+		results.append(result)
 	return results
 
 
 def _mean(values):
 	return float(sum(values) / max(1, len(values)))
+
+
+def _metric(item, *names, default=0.0):
+	for name in names:
+		for key in (name, f"episode_{name}"):
+			if key in item:
+				return float(item[key])
+	return default
+
+
+def _summary_row(item):
+	official_latched = _metric(item, "official_success_latched", "official_success")
+	official_terminal = _metric(item, "official_success_terminal", "current_official_success")
+	strict_success = _metric(item, "strict_success_stable", "terminal_process_success", "success")
+	process_success = _metric(item, "process_success_terminal", "process_success")
+	angle_error = _metric(item, "angle_error", "orientation_error", "yaw_error")
+	return {
+		"task_id": item.get("task_id"),
+		"assembly_id": item.get("assembly_id"),
+		"task_name": item.get("task_name"),
+		"episodes": item.get("episodes"),
+		"official_success_latched": official_latched,
+		"official_success_terminal": official_terminal,
+		"strict_success": strict_success,
+		"process_success": process_success,
+		"mean_depth_fraction": _metric(item, "depth_fraction"),
+		"mean_lateral_error_mm": _metric(item, "lateral_error") * 1000.0,
+		"mean_angle_error_deg": math.degrees(angle_error),
+		"mean_keypoint_error_mm": _metric(item, "keypoint_error") * 1000.0,
+		"episode_len_mean": item.get("episode_length"),
+		"official_strict_gap": official_latched - strict_success,
+		"episode_reward": item.get("episode_reward"),
+		"success_count": item.get("success_count"),
+		"failure_count": item.get("failure_count"),
+	}
 
 
 def _evaluate_one(cfg, entry: dict, output_dir: Path):
@@ -275,7 +359,10 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 		target_episodes = int(cfg.get('batch_eval_episodes_per_task', cfg.get('eval_trials', 100)) or 100)
 		use_mpc = cfg.mpc if cfg.get('batch_eval_mpc', None) is None else bool(cfg.batch_eval_mpc)
 		rollout_device = torch.device(f"cuda:{cfg.device_id}")
-		tasks = torch.full((cfg.num_envs,), task_id, dtype=torch.long, device=rollout_device)
+		if str(cfg.get('task_conditioning', '')).lower() == 'axial_params':
+			tasks = torch.zeros(cfg.num_envs, dtype=torch.long, device=rollout_device)
+		else:
+			tasks = torch.full((cfg.num_envs,), task_id, dtype=torch.long, device=rollout_device)
 		episode_return = torch.zeros(cfg.num_envs, dtype=torch.float32, device=rollout_device)
 		episode_len = torch.zeros(cfg.num_envs, dtype=torch.int64, device=rollout_device)
 		returns = []
@@ -357,6 +444,7 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 		metrics = {
 			"assembly_id": assembly_id,
 			"task_id": task_id,
+			"eval_index": int(entry.get("eval_index", task_id)),
 			"task_name": entry.get("task_name", f"{cfg.task}-{assembly_id}"),
 			"checkpoint": str(Path(cfg.checkpoint).expanduser().resolve()),
 			"episodes": len(returns),
@@ -385,13 +473,19 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 
 def _write_summary(summary_fp: Path, results: list[dict]):
 	summary_fp.parent.mkdir(parents=True, exist_ok=True)
-	ordered = sorted(results, key=lambda item: int(item["task_id"]))
+	ordered = sorted(results, key=lambda item: int(item.get("eval_index", item.get("task_id", 0))))
+	rows = [_summary_row(item) for item in ordered]
 	summary = {
 		"num_tasks": len(ordered),
 		"episode_success": _mean([item["episode_success"] for item in ordered]),
 		"episode_reward": _mean([item["episode_reward"] for item in ordered]),
 		"episode_length": _mean([item["episode_length"] for item in ordered]),
+		"strict_success": _mean([row["strict_success"] for row in rows]),
+		"process_success": _mean([row["process_success"] for row in rows]),
+		"official_success_latched": _mean([row["official_success_latched"] for row in rows]),
+		"official_strict_gap": _mean([row["official_strict_gap"] for row in rows]),
 		"tasks": ordered,
+		"csv_rows": rows,
 	}
 	for metric_key in SUCCESS_DIAGNOSTIC_KEYS:
 		values = [item[f"episode_{metric_key}"] for item in ordered if f"episode_{metric_key}" in item]
@@ -407,23 +501,24 @@ def _write_summary(summary_fp: Path, results: list[dict]):
 				"assembly_id",
 				"task_name",
 				"episodes",
-				"episode_success",
-				"episode_official_success",
-				"episode_terminal_process_success",
-				"episode_process_success",
-				"episode_dual_success",
-				"episode_depth_fraction",
-				"episode_lateral_error",
-				"episode_jam",
+				"official_success_latched",
+				"official_success_terminal",
+				"strict_success",
+				"process_success",
+				"mean_depth_fraction",
+				"mean_lateral_error_mm",
+				"mean_angle_error_deg",
+				"mean_keypoint_error_mm",
+				"episode_len_mean",
+				"official_strict_gap",
 				"episode_reward",
-				"episode_length",
 				"success_count",
 				"failure_count",
 			],
 		)
 		writer.writeheader()
-		for item in ordered:
-			writer.writerow({key: item.get(key) for key in writer.fieldnames})
+		for row in rows:
+			writer.writerow({key: row.get(key) for key in writer.fieldnames})
 	return summary, csv_fp
 
 
@@ -451,12 +546,14 @@ def launch(cfg: Config):
 			raise ValueError("`batch_eval_worker_task_id` is required when `batch_eval_worker_assembly_id` is set.")
 		worker_task_id = int(cfg.batch_eval_worker_task_id)
 		worker_assembly_id = _normalize_assembly_id(cfg.batch_eval_worker_assembly_id)
+		worker_eval_index = cfg.get('batch_eval_worker_eval_index', worker_task_id)
 		entries = []
 		if cfg.get('offline_manifest_fp', None):
 			for entry in load_offline_manifest(cfg.offline_manifest_fp):
-				if int(entry["task_id"]) == worker_task_id:
+				entry_assembly_id = _normalize_assembly_id(entry.get("assembly_id", ""))
+				if int(entry["task_id"]) == worker_task_id and entry_assembly_id == worker_assembly_id:
 					entry = dict(entry)
-					entry["assembly_id"] = _normalize_assembly_id(entry.get("assembly_id", worker_assembly_id))
+					entry["assembly_id"] = entry_assembly_id
 					entries = [entry]
 					break
 		if not entries:
@@ -465,6 +562,7 @@ def launch(cfg: Config):
 				"task_id": worker_task_id,
 				"task_name": f"{cfg.task}-{worker_assembly_id}",
 			}]
+		entries[0]["eval_index"] = int(worker_eval_index)
 	else:
 		entries = _resolve_eval_entries(cfg)
 	output_dir = _resolve_output_dir(cfg)

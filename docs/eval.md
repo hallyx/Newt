@@ -481,6 +481,46 @@ isaaclab_debug_io_every=1
   exp_name=eval_sim_trace
 ```
 
+```bash
+python tdmpc2/eval.py \
+  checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260523_163332_asm-01125/models/best_step-6300000_s-0p8010.pt \
+  eval_mode=sim \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=01125 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_task_template_id=3 \
+  num_envs=200 \
+  eval_trials=1000 \
+  model_size=S \
+  horizon=3 \
+  compile=false \
+  mpc=true \
+  eval_terminate_on_success=true \
+  eval_terminate_success_key=terminal_process_success \
+  isaaclab_headless=false \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  task_conditioning=axial_params \
+  eval_trace_enabled=true \
+  eval_trace_steps=20 \
+  eval_trace_fp=traces/sim_01125.jsonl \
+  enable_wandb=false \
+  exp_name=srsa_axial_online \
+  contact_history_enabled=true \
+  contact_history_len=4  \
+  contact_context_dim=64 \
+  contact_history_hidden_dim=128 \
+  contact_history_layers=2 \
+  contact_force_dim=6 \
+  contact_action_dim=3 \
+  contact_ee_delta_dim=3 \
+  contact_history_use_ee_delta=true
+
+
+```
+
 真机闭环侧加同样的 trace 参数：
 
 ```bash
@@ -734,6 +774,18 @@ logs/<task>/<seed>/<exp_name>/<run_id>/batch_eval/<checkpoint_name>/batch_eval_s
 
 精确评测多少个完成 episode。推荐 eval 脚本使用这个参数，尤其是 `num_envs > 1` 时。
 
+`eval_terminate_on_success`
+
+仿真 eval 中是否在稳定成功后提前结束当前 env 的 episode。默认 `false`，保持旧的“跑满 74 step 后看终态”口径。部署/调试建议设为 `true`，这样一旦满足 `eval_terminate_success_key`，该 env 会立刻 reset 并计入完成，避免继续发动作把已经插入的状态推坏。
+
+`eval_terminate_success_key`
+
+提前结束使用的 success 字段，默认 `terminal_process_success`。这个字段已经包含 `srsa_process_success_stable_steps` 的连续稳定要求，通常不用再额外实现 hold counter。
+
+`eval_terminate_min_step`
+
+提前结束允许的最小 episode step，默认 `0`。如果担心 reset 后前几步误判，可以设成例如 `5`。
+
 `eval_trace_enabled`
 
 记录少量推理状态用于 sim2real 对比。默认 `false`。开启后记录 `obs/action/task/action_info`；如果 action 通过 ZMQ 发送，还会记录缩放后的 `sent_action`；仿真 `eval_trials` 路径还会记录 `next_obs/reward/done` 和 SRSA success 诊断字段，例如 `official_success/terminal_process_success/depth_fraction/lateral_error/jam`；真机 `closed_loop` 路径会记录 observation 消息的 `seq/timestamp`。
@@ -946,11 +998,7 @@ raw.policy_obs: shape=(..., 24)
 - `action_dim`
 
 
-真机闭环示例：
-
-注意：`00186` 是 SRSA mesh/task id，应传给 `assembly_id`；`srsa_param_template_id`
-或 `srsa_task_template_id` 选择 clearance/depth 参数模板，当前模板文件只有 `0..4`。
-`srsa_mesh_geometry_fp` 需要指向 SRSA 导出的真实 CSV。
+真机闭环最小示例：
 
 ```bash
 python3 tdmpc2/eval.py \
@@ -959,28 +1007,10 @@ python3 tdmpc2/eval.py \
   eval_real_obs_server=tcp://192.168.10.37:5556 \
   eval_real_obs_socket_type=sub \
   eval_zmq_server=tcp://192.168.10.37:5555 \
-  model_size=S \
-  assembly_id=00186 \
   srsa_task_template_fp=data/srsa_axial_task_templates.json \
-  srsa_param_template_id=2 \
-  srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
-  eval_real_state_format=libfranka \
+  srsa_task_template_id=00186 \
   eval_real_use_msg_task_vec=false \
-  'eval_real_socket_pos=[0.4804, -0.0113, 0.3273]' \
-  'eval_real_socket_quat_wxyz=[1, 0.0, 0.0, 0.0]' \
-  eval_real_force_scale=50.0 \
-  eval_real_zero_missing_force=true \
-  eval_zmq_action_frame=base \
-  eval_zmq_command_frame=tcp \
-  eval_zmq_action_scale=0.05 \
-  eval_zmq_max_trans_delta=0.001 \
-  eval_zmq_max_rot_delta=0.003 \
-  eval_zmq_warmup_steps=10 \
-  eval_zmq_send_timeout_ms=100 \
-  eval_zmq_rate=10 \
-  eval_real_steps=150 \
-  eval_real_obs_timeout_ms=5000 \
-  eval_real_debug_log_fp=logs/real_closed_loop_debug_00186.jsonl \
-  compile=false \
-  checkpoint=logs/srsa_axial_online/20260521_105015_asm-01125/models/best.pt
+  eval_real_socket_pos=[0.4906,-0.0346,0.329] \
+  eval_real_socket_quat_wxyz=[1.0,0.0,0.0,0.0] \
+  eval_real_force_scale=50.0
 ```

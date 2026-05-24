@@ -128,22 +128,31 @@ class Config:
 	srsa_flange_force_sensor_obs_frame: str = "socket"
 	srsa_flange_force_sensor_obs_scale: float = 50.0
 	srsa_flange_force_sensor_force_threshold: float = 1.0
-	srsa_eval_success_metric: str = "terminal_process"
-	srsa_process_success_depth_ratio: float = 0.85
+	eval_success_metric: str = "strict"
+	srsa_eval_success_metric: str = "strict"
+	strict_depth_fraction: float = 0.90
+	strict_success_steps: int = 10
+	strict_lateral_tol_min: float = 0.0005
+	strict_lateral_tol_max: Optional[float] = 0.0020
+	strict_keypoint_tol_min: float = 0.0010
+	strict_keypoint_tol_max: Optional[float] = 0.0030
+	strict_angle_tol_deg: float = 3.0
+	srsa_process_success_depth_ratio: float = 0.90
 	srsa_process_success_lateral_tol_scale: float = 2.0
-	srsa_process_success_lateral_tol_min: float = 0.001
-	srsa_process_success_lateral_tol_max: Optional[float] = 0.003
-	srsa_process_success_orientation_tol_rad: float = 0.0872665
-	srsa_process_success_yaw_tol_rad: float = 0.0872665
+	srsa_process_success_lateral_tol_min: float = 0.0005
+	srsa_process_success_lateral_tol_max: Optional[float] = 0.0020
+	srsa_process_success_orientation_tol_rad: float = 0.05235987755982989
+	srsa_process_success_yaw_tol_rad: float = 0.05235987755982989
 	srsa_process_success_keypoint_tol_scale: float = 2.0
-	srsa_process_success_keypoint_tol_min: float = 0.001
-	srsa_process_success_keypoint_tol_max: Optional[float] = 0.003
-	srsa_process_success_stable_steps: int = 3
+	srsa_process_success_keypoint_tol_min: float = 0.0010
+	srsa_process_success_keypoint_tol_max: Optional[float] = 0.0030
+	srsa_process_success_stable_steps: int = 10
 	srsa_process_success_require_official: bool = False
 	srsa_process_success_require_no_jam: bool = True
 
 	# evaluation
 	checkpoint: Optional[str] = None
+	eval_assembly_ids: Any = "[01125,00004,00014,00062,00271]"
 	eval_episodes: int = 2
 	eval_trials: Optional[int] = None
 	eval_task_id: Optional[int] = None
@@ -151,6 +160,9 @@ class Config:
 	skip_initial_eval: bool = False
 	eval_task_template_exact: bool = True
 	eval_task_template_print: bool = True
+	eval_terminate_on_success: bool = False
+	eval_terminate_success_key: str = "terminal_process_success"
+	eval_terminate_min_step: int = 0
 	eval_mode: str = "sim"
 	eval_zmq_enabled: bool = False
 	eval_zmq_server: str = "tcp://localhost:5555"
@@ -209,6 +221,12 @@ class Config:
 	offline_action_key: str = "action"
 	offline_obs_dim: int = 14
 	offline_filter_mode: str = "all"
+	offline_wm_filter_mode: str = "all"
+	offline_bc_filter_mode: str = "success_or_high_depth"
+	offline_rl_filter_mode: str = "all"
+	task_balanced_sampling: bool = True
+	offline_high_depth_threshold: float = 0.75
+	offline_high_depth_lateral_tol_m: float = 0.0020
 	offline_bc_steps: int = 50_000
 	offline_wm_steps: int = 100_000
 	offline_rl_steps: int = 0
@@ -217,10 +235,17 @@ class Config:
 	offline_eval_freq: int = 0
 
 	# policy rollout collection for offline RL
-	collect_assembly_ids: Any = None
-	collect_source_assembly_id: Optional[str] = "00186"
+	collect_assembly_ids: Any = "[00004,00014,00062,00271]"
+	collect_source_assembly_id: Optional[str] = "01125"
 	collect_exclude_source_assembly: bool = True
-	collect_episodes_per_task: int = 100
+	include_source_anchor_rollouts: bool = False
+	collect_episodes_per_task: int = 300
+	collect_weak_task_episodes: int = 600
+	collect_screening_fp: Optional[str] = None
+	collect_weak_success_threshold: float = 0.10
+	collect_defer_success_threshold: float = 0.03
+	collect_defer_depth_threshold: float = 0.35
+	collect_skip_deferred_tasks: bool = True
 	collect_output_dir: Optional[str] = None
 	collect_manifest_fp: Optional[str] = None
 	collect_overwrite: bool = False
@@ -252,9 +277,24 @@ class Config:
 	batch_eval_spawn_per_assembly: bool = True
 	batch_eval_worker_assembly_id: Optional[str] = None
 	batch_eval_worker_task_id: Optional[int] = None
+	batch_eval_worker_eval_index: Optional[int] = None
 	batch_eval_overwrite: bool = False
 	batch_eval_mpc: Optional[bool] = None
 	batch_eval_max_env_steps: Optional[int] = None
+
+	# zero-shot task screening
+	screen_assembly_ids: Any = "[00004,00014,00062,00271]"
+	screen_trials: int = 200
+	screen_output_csv: Optional[str] = "data/task_screening_01125_axial_hole.csv"
+	screen_output_json: Optional[str] = None
+	screen_high_depth_threshold: float = 0.75
+	screen_low_depth_threshold: float = 0.35
+	screen_hard_min_success: float = 0.15
+	screen_hard_max_success: float = 0.45
+	screen_extra_min_success: float = 0.05
+	screen_extra_max_success: float = 0.15
+	screen_easy_success: float = 0.70
+	screen_defer_success: float = 0.03
 
 	# training
 	steps: int = 100_000_000
@@ -1261,6 +1301,17 @@ def parse_cfg(cfg):
 		raise ValueError(
 			f"Unknown eval_mode={cfg.eval_mode!r}. Use sim or real."
 		)
+	if cfg.get('eval_success_metric', None) is not None:
+		cfg.srsa_eval_success_metric = cfg.eval_success_metric
+	angle_tol_rad = math.radians(float(cfg.get('strict_angle_tol_deg', 3.0)))
+	cfg.srsa_process_success_depth_ratio = float(cfg.get('strict_depth_fraction', 0.90))
+	cfg.srsa_process_success_stable_steps = int(cfg.get('strict_success_steps', 10))
+	cfg.srsa_process_success_lateral_tol_min = float(cfg.get('strict_lateral_tol_min', 0.0005))
+	cfg.srsa_process_success_lateral_tol_max = cfg.get('strict_lateral_tol_max', 0.0020)
+	cfg.srsa_process_success_keypoint_tol_min = float(cfg.get('strict_keypoint_tol_min', 0.0010))
+	cfg.srsa_process_success_keypoint_tol_max = cfg.get('strict_keypoint_tol_max', 0.0030)
+	cfg.srsa_process_success_orientation_tol_rad = angle_tol_rad
+	cfg.srsa_process_success_yaw_tol_rad = angle_tol_rad
 
 	# Set defaults
 	manifest_tasks = None

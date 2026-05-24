@@ -29,6 +29,10 @@ class OfflineDatasetStats:
 	has_terminal_failure: bool
 	has_task_ids: bool
 	num_tasks: int
+	task_balanced_sampling: bool
+	task_episode_counts: dict[int, int]
+	task_valid_start_counts: dict[int, int]
+	task_success_rates: dict[int, float]
 
 
 class OfflineSequenceDataset:
@@ -52,6 +56,9 @@ class OfflineSequenceDataset:
 		filter_mode: str = "all",
 		success_key: str = "episode_success_final",
 		failure_key: str = "episode_failure_final",
+		task_balanced_sampling: bool = False,
+		high_depth_threshold: float = 0.75,
+		high_depth_lateral_tol_m: float = 0.0020,
 		device: str = "cpu",
 	):
 		self._path = Path(path).expanduser().resolve()
@@ -66,7 +73,11 @@ class OfflineSequenceDataset:
 		self._filter_mode = filter_mode
 		self._success_key = success_key
 		self._failure_key = failure_key
+		self._task_balanced_sampling = bool(task_balanced_sampling)
+		self._high_depth_threshold = float(high_depth_threshold)
+		self._high_depth_lateral_tol_m = float(high_depth_lateral_tol_m)
 		self._device = torch.device(device)
+		self.last_sample_task_counts = {}
 
 		obj = torch.load(self._path, map_location="cpu", weights_only=False)
 		if not hasattr(obj, "keys"):
@@ -90,6 +101,21 @@ class OfflineSequenceDataset:
 
 		self.success_final = self._resolve_episode_label(obj, success_key, fallback_key="success_episode")
 		self.failure_final = self._resolve_episode_label(obj, failure_key, fallback_key=None)
+		self.strict_success_final = self._resolve_episode_label(
+			obj,
+			"episode_strict_success_stable_final",
+			fallback_key="episode_success_final",
+		)
+		self.depth_fraction_final = self._resolve_episode_label(
+			obj,
+			"episode_depth_fraction_final",
+			fallback_key=None,
+		)
+		self.lateral_error_final = self._resolve_episode_label(
+			obj,
+			"episode_lateral_error_final",
+			fallback_key=None,
+		)
 		self.terminal_success = _to_cpu_contiguous(obj["terminal_success"], torch.bool).view(-1) if "terminal_success" in obj.keys() else None
 		self.terminal_failure = _to_cpu_contiguous(obj["terminal_failure"], torch.bool).view(-1) if "terminal_failure" in obj.keys() else None
 		self.episode_return_final = _to_cpu_contiguous(obj["episode_return_final"], torch.float32).view(-1) if "episode_return_final" in obj.keys() else None
@@ -99,6 +125,7 @@ class OfflineSequenceDataset:
 		self._episode_task_ids = self._build_episode_task_ids()
 		self._selected_episode_ids = self._select_episodes(filter_mode)
 		self._valid_starts = self._build_valid_starts()
+		self._valid_starts_by_task = self._build_valid_starts_by_task()
 		if len(self._valid_starts) == 0:
 			raise ValueError(
 				f"No valid subsequences found for horizon={self._horizon} with filter_mode='{self._filter_mode}'."
@@ -117,6 +144,10 @@ class OfflineSequenceDataset:
 			has_terminal_failure=self.terminal_failure is not None,
 			has_task_ids=self.task is not None,
 			num_tasks=len(set(self._episode_task_ids.values())),
+			task_balanced_sampling=self._task_balanced_sampling,
+			task_episode_counts=self._task_episode_counts(),
+			task_valid_start_counts={task_id: len(starts) for task_id, starts in self._valid_starts_by_task.items()},
+			task_success_rates=self._task_success_rates(),
 		)
 
 	def _resolve_episode_label(self, obj, preferred_key: str, fallback_key: Optional[str]) -> Optional[torch.Tensor]:
@@ -155,8 +186,11 @@ class OfflineSequenceDataset:
 		return episode_task_ids
 
 	def _select_episodes(self, filter_mode: str) -> list[int]:
-		if filter_mode not in ("all", "success_only", "failure_only"):
-			raise ValueError(f"Invalid filter_mode '{filter_mode}'. Expected one of: all, success_only, failure_only.")
+		if filter_mode not in ("all", "success_only", "failure_only", "success_or_high_depth"):
+			raise ValueError(
+				f"Invalid filter_mode '{filter_mode}'. Expected one of: "
+				"all, success_only, failure_only, success_or_high_depth."
+			)
 		episode_ids = sorted(self._episode_indices.keys())
 		if filter_mode == "all":
 			return episode_ids
@@ -164,6 +198,25 @@ class OfflineSequenceDataset:
 			if self.success_final is None:
 				raise KeyError("success_only requested but no success label exists in the offline dataset.")
 			return [ep for ep in episode_ids if self._episode_label(self.success_final, ep) > 0.5]
+		if filter_mode == "success_or_high_depth":
+			if self.strict_success_final is None and self.success_final is None:
+				raise KeyError("success_or_high_depth requested but no success label exists in the offline dataset.")
+			success_tensor = self.strict_success_final if self.strict_success_final is not None else self.success_final
+			selected = []
+			for ep in episode_ids:
+				if self._episode_label(success_tensor, ep) > 0.5:
+					selected.append(ep)
+					continue
+				if self.depth_fraction_final is None:
+					continue
+				depth_ok = self._episode_label(self.depth_fraction_final, ep) >= self._high_depth_threshold
+				if self.lateral_error_final is None:
+					lateral_ok = True
+				else:
+					lateral_ok = self._episode_label(self.lateral_error_final, ep) <= self._high_depth_lateral_tol_m
+				if depth_ok and lateral_ok:
+					selected.append(ep)
+			return selected
 		if self.failure_final is not None:
 			return [ep for ep in episode_ids if self._episode_label(self.failure_final, ep) > 0.5]
 		if self.success_final is not None:
@@ -184,6 +237,53 @@ class OfflineSequenceDataset:
 			starts.extend((episode_id, offset) for offset in range(max_start + 1))
 		return starts
 
+	def _build_valid_starts_by_task(self) -> dict[int, list[tuple[int, int]]]:
+		by_task: dict[int, list[tuple[int, int]]] = {}
+		for start in self._valid_starts:
+			task_id = self._episode_task_ids[start[0]]
+			by_task.setdefault(task_id, []).append(start)
+		return {task_id: starts for task_id, starts in by_task.items() if starts}
+
+	def _task_episode_counts(self) -> dict[int, int]:
+		counts: dict[int, int] = {}
+		for episode_id in self._selected_episode_ids:
+			task_id = self._episode_task_ids[episode_id]
+			counts[task_id] = counts.get(task_id, 0) + 1
+		return counts
+
+	def _task_success_rates(self) -> dict[int, float]:
+		success_tensor = self.strict_success_final if self.strict_success_final is not None else self.success_final
+		if success_tensor is None:
+			return {}
+		values: dict[int, list[float]] = {}
+		for episode_id in self._selected_episode_ids:
+			task_id = self._episode_task_ids[episode_id]
+			values.setdefault(task_id, []).append(self._episode_label(success_tensor, episode_id))
+		return {
+			task_id: float(sum(task_values) / max(1, len(task_values)))
+			for task_id, task_values in values.items()
+		}
+
+	def _sample_valid_starts(self):
+		if not self._task_balanced_sampling or len(self._valid_starts_by_task) <= 1:
+			indices = torch.randint(0, len(self._valid_starts), (self._batch_size,))
+			starts = [self._valid_starts[idx] for idx in indices.tolist()]
+		else:
+			task_ids = sorted(self._valid_starts_by_task.keys())
+			task_indices = torch.randint(0, len(task_ids), (self._batch_size,))
+			starts = []
+			for raw_task_index in task_indices.tolist():
+				task_id = task_ids[raw_task_index]
+				task_starts = self._valid_starts_by_task[task_id]
+				start_index = int(torch.randint(0, len(task_starts), (1,)).item())
+				starts.append(task_starts[start_index])
+		counts: dict[int, int] = {}
+		for episode_id, _ in starts:
+			task_id = self._episode_task_ids[episode_id]
+			counts[task_id] = counts.get(task_id, 0) + 1
+		self.last_sample_task_counts = counts
+		return starts
+
 	@property
 	def stats(self) -> OfflineDatasetStats:
 		return self._stats
@@ -193,14 +293,13 @@ class OfflineSequenceDataset:
 
 	def sample(self, device: Optional[str | torch.device] = None):
 		device = torch.device(device) if device is not None else self._device
-		indices = torch.randint(0, len(self._valid_starts), (self._batch_size,))
+		starts = self._sample_valid_starts()
 
 		obs_batch = []
 		action_batch = []
 		reward_batch = []
 		task_batch = []
-		for idx in indices.tolist():
-			episode_id, start_offset = self._valid_starts[idx]
+		for episode_id, start_offset in starts:
 			seq_indices = self._episode_indices[episode_id][start_offset : start_offset + self._horizon]
 			last_index = int(seq_indices[-1].item())
 			obs_seq = torch.cat(

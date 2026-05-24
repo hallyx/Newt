@@ -139,6 +139,8 @@ def _run_stage(agent: TDMPC2, dataset: OfflineSequenceDataset, logger: Logger, c
 		))
 	for update in range(1, num_steps + 1):
 		metrics = dict(agent.update(dataset).items())
+		for task_id, count in sorted(getattr(dataset, "last_sample_task_counts", {}).items()):
+			metrics[f"sample_task_frac/{stage_name}/{task_id}"] = float(count) / max(1, int(cfg.batch_size))
 		metrics.update({
 			'iteration': update,
 			'step': update,
@@ -148,6 +150,19 @@ def _run_stage(agent: TDMPC2, dataset: OfflineSequenceDataset, logger: Logger, c
 			logger.log(metrics, 'pretrain')
 		if logger.rank == 0 and (update % save_freq == 0 or update == num_steps):
 			logger.save_agent(agent, f'{stage_name}_{update:,}'.replace(',', '_'), metrics=metrics)
+
+
+def _make_offline_dataset(cfg, offline_dataset_fp, *, filter_mode: str, device: str):
+	return OfflineSequenceDataset(
+		path=offline_dataset_fp,
+		batch_size=cfg.batch_size,
+		horizon=cfg.horizon,
+		filter_mode=filter_mode,
+		task_balanced_sampling=bool(cfg.get('task_balanced_sampling', True)),
+		high_depth_threshold=float(cfg.get('offline_high_depth_threshold', 0.75)),
+		high_depth_lateral_tol_m=float(cfg.get('offline_high_depth_lateral_tol_m', 0.0020)),
+		device=device,
+	)
 
 
 @hydra.main(version_base=None, config_name="config")
@@ -160,18 +175,32 @@ def launch(cfg: Config):
 	torch.cuda.set_device(offline_gpu)
 	print(colored(f'Offline training device: cuda:{offline_gpu}', 'yellow', attrs=['bold']))
 	offline_dataset_fp = _resolve_offline_dataset_fp(cfg)
+	offline_device = f'cuda:{offline_gpu}'
 
-	dataset = OfflineSequenceDataset(
-		path=offline_dataset_fp,
-		batch_size=cfg.batch_size,
-		horizon=cfg.horizon,
-		filter_mode=cfg.offline_filter_mode,
-		device=f'cuda:{offline_gpu}',
+	wm_dataset = _make_offline_dataset(
+		cfg,
+		offline_dataset_fp,
+		filter_mode=cfg.get('offline_wm_filter_mode', cfg.offline_filter_mode),
+		device=offline_device,
 	)
-	cfg = _prepare_cfg_from_dataset(cfg, dataset)
+	bc_dataset = _make_offline_dataset(
+		cfg,
+		offline_dataset_fp,
+		filter_mode=cfg.get('offline_bc_filter_mode', cfg.offline_filter_mode),
+		device=offline_device,
+	)
+	rl_dataset = _make_offline_dataset(
+		cfg,
+		offline_dataset_fp,
+		filter_mode=cfg.get('offline_rl_filter_mode', cfg.offline_filter_mode),
+		device=offline_device,
+	)
+	cfg = _prepare_cfg_from_dataset(cfg, wm_dataset)
 	logger = Logger(cfg)
 	if logger.rank == 0:
-		print(colored('Offline dataset stats:', 'yellow', attrs=['bold']), asdict(dataset.stats))
+		print(colored('Offline WM dataset stats:', 'yellow', attrs=['bold']), asdict(wm_dataset.stats))
+		print(colored('Offline BC dataset stats:', 'yellow', attrs=['bold']), asdict(bc_dataset.stats))
+		print(colored('Offline RL dataset stats:', 'yellow', attrs=['bold']), asdict(rl_dataset.stats))
 
 	agent = make_agent(cfg)
 	if cfg.checkpoint:
@@ -182,7 +211,7 @@ def launch(cfg: Config):
 
 	# Stage 1: BC-only sanity check.
 	_stage_cfg(agent, consistency=0.0, reward=0.0, value=0.0, prior=1.0, maxq_pi=False)
-	_run_stage(agent, dataset, logger, cfg, stage_name='bc', num_steps=cfg.offline_bc_steps)
+	_run_stage(agent, bc_dataset, logger, cfg, stage_name='bc', num_steps=cfg.offline_bc_steps)
 
 	# Stage 2: state-only WM pretraining with BC retained.
 	_stage_cfg(
@@ -193,7 +222,7 @@ def launch(cfg: Config):
 		prior=cfg.prior_coef,
 		maxq_pi=False,
 	)
-	_run_stage(agent, dataset, logger, cfg, stage_name='wm', num_steps=cfg.offline_wm_steps)
+	_run_stage(agent, wm_dataset, logger, cfg, stage_name='wm', num_steps=cfg.offline_wm_steps)
 
 	# Stage 3: offline Max-Q fine-tuning with the learned world model and behavior prior.
 	_stage_cfg(
@@ -204,7 +233,7 @@ def launch(cfg: Config):
 		prior=cfg.prior_coef,
 		maxq_pi=True,
 	)
-	_run_stage(agent, dataset, logger, cfg, stage_name='rl', num_steps=cfg.offline_rl_steps)
+	_run_stage(agent, rl_dataset, logger, cfg, stage_name='rl', num_steps=cfg.offline_rl_steps)
 
 	logger.finish(agent)
 	print(colored('Offline training completed successfully.', 'green', attrs=['bold']))

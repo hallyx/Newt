@@ -20,6 +20,15 @@ OPTIONAL_FIELDS = [
 	"terminal_success",
 	"terminal_failure",
 	"success_episode",
+	"episode_official_success_latched_final",
+	"episode_official_success_terminal_final",
+	"episode_process_success_terminal_final",
+	"episode_strict_success_stable_final",
+	"episode_strict_success_episode_final",
+	"episode_depth_fraction_final",
+	"episode_lateral_error_final",
+	"episode_angle_error_final",
+	"episode_keypoint_error_final",
 ]
 
 
@@ -31,6 +40,15 @@ OPTIONAL_FIELD_DTYPES = {
 	"terminal_success": torch.bool,
 	"terminal_failure": torch.bool,
 	"success_episode": torch.float32,
+	"episode_official_success_latched_final": torch.float32,
+	"episode_official_success_terminal_final": torch.float32,
+	"episode_process_success_terminal_final": torch.float32,
+	"episode_strict_success_stable_final": torch.float32,
+	"episode_strict_success_episode_final": torch.float32,
+	"episode_depth_fraction_final": torch.float32,
+	"episode_lateral_error_final": torch.float32,
+	"episode_angle_error_final": torch.float32,
+	"episode_keypoint_error_final": torch.float32,
 }
 
 
@@ -286,7 +304,7 @@ def export_multitask_compact_dataset(
 			"action_dim": int(data["action"].shape[-1]),
 			"obs_shape": list(data["obs"].shape[1:]),
 		}
-		for optional_key in ("task_vec_6", "srsa_params", "srsa_sampler"):
+		for optional_key in ("task_vec_6", "task_param_vec", "srsa_params", "srsa_sampler", "success_metrics"):
 			if optional_key in entry:
 				task_meta[optional_key] = entry[optional_key]
 		task_map.append(task_meta)

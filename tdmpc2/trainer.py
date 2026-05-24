@@ -390,6 +390,11 @@ class Trainer():
 				if self.cfg.task == 'soup':
 					self.logger.pprint_multitask(eval_metrics, self.cfg)
 				self.logger.log(eval_metrics, 'eval')
+				if self._step > 0:
+					self.logger.save_latest_agent(
+						self.agent,
+						eval_metrics,
+					)
 				if self.cfg.save_best and self._step > 0:
 					self.logger.maybe_save_best_agent(
 						self.agent,
