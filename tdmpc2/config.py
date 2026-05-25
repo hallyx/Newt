@@ -118,6 +118,7 @@ class Config:
 	srsa_if_logging_eval: bool = False
 	srsa_eval_filename: Optional[str] = None
 	srsa_num_eval_trials: int = 100
+	srsa_align_direct_reward_success: bool = False
 	srsa_vision_noise_xy_std: float = 0.0
 	srsa_vision_noise_xy_jitter_std: float = 0.0
 	srsa_vision_noise_z_std: float = 0.0
@@ -1192,9 +1193,78 @@ def _update_selected_task_vector(cfg, task_id, task_vec):
 	_set_cfg_value(cfg, "task_vectors", task_vectors)
 
 
+def _update_selected_task_name(cfg, task_id, task_name):
+	if task_id is None or task_name is None:
+		return
+	task_id = int(task_id)
+	for key in ("tasks", "global_tasks"):
+		values = _cfg_value(cfg, key, None)
+		if not values or not isinstance(values, list):
+			continue
+		if 0 <= task_id < len(values):
+			values[task_id] = str(task_name)
+			_set_cfg_value(cfg, key, values)
+
+
+def _entry_has_task_params(entry):
+	if not isinstance(entry, dict):
+		return False
+	for key in (
+		"task_vec",
+		"task_vec_6",
+		"axial_task_vec",
+		"axial_task_vec_6",
+		"srsa_params",
+		"srsa_sampler",
+		"plug_diameter",
+		"male_diameter",
+		"hole_diameter",
+		"female_diameter",
+		"clearance",
+		"diametral_clearance",
+		"radial_clearance",
+		"clearance_ratio",
+		"insertion_depth",
+		"target_insertion_depth",
+		"scale_ratio",
+	):
+		if entry.get(key, None) is not None:
+			return True
+	return False
+
+
 def resolve_eval_task_template(cfg, entry=None):
 	if entry is not None:
-		return _merge_template_params(entry)
+		entry = _merge_template_params(entry)
+		if _entry_has_task_params(entry) or _cfg_value(cfg, "srsa_task_template_fp", None) is None:
+			return entry
+		task_id = _first_value(
+			_get_value(entry, "srsa_param_template_id", None),
+			_get_value(entry, "srsa_task_template_id", None),
+			_cfg_value(cfg, "srsa_param_template_id", None),
+			_cfg_value(cfg, "srsa_task_template_id", None),
+			_cfg_value(cfg, "eval_task_id", None),
+			_get_value(entry, "task_id", None),
+		)
+		template_cfg = deepcopy(cfg)
+		if entry.get("assembly_id", None) is not None:
+			_set_cfg_value(template_cfg, "assembly_id", str(entry["assembly_id"]).zfill(5))
+		_set_cfg_value(template_cfg, "axial_task_vec_6", None)
+		_set_cfg_value(template_cfg, "srsa_task_template_applied_id", None)
+		template_tasks = _load_template_tasks(template_cfg)
+		if template_tasks is None or task_id is None:
+			return entry
+		for item in template_tasks:
+			if int(item["task_id"]) != int(task_id):
+				continue
+			template = _merge_template_params(item)
+			template["task_id"] = int(entry.get("task_id", template.get("task_id", 0)))
+			template["assembly_id"] = entry.get("assembly_id", template.get("assembly_id"))
+			template["task_name"] = entry.get("task_name", template.get("task_name"))
+			if entry.get("eval_index", None) is not None:
+				template["eval_index"] = entry["eval_index"]
+			return template
+		raise ValueError(f"task_id={task_id} was not found in the configured SRSA task templates.")
 	task_id = _cfg_value(cfg, "eval_task_id", None)
 	if task_id is None:
 		task_id = _cfg_value(cfg, "srsa_task_template_id", None)
@@ -1251,6 +1321,7 @@ def apply_eval_task_template(cfg, entry=None):
 		task_vec = make_axial_task_vec(cfg, template)
 		_set_cfg_value(cfg, "axial_task_vec_6", task_vec)
 	_update_selected_task_vector(cfg, task_id, task_vec)
+	_update_selected_task_name(cfg, task_id, template.get("task_name", None))
 
 	if bool(_cfg_value(cfg, "eval_task_template_print", True)) and int(_cfg_value(cfg, "rank", 0) or 0) == 0:
 		vec_text = ", ".join(f"{float(value):.6g}" for value in task_vec) if task_vec is not None else "n/a"

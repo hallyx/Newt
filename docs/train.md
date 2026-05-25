@@ -14,123 +14,56 @@
 - 默认使用 `AxialTaskEncoder(task_vec_6) -> c_task(64D)` 作为 task conditioning
 - 力传感器/接触信息作为 state observation 的一部分进入 state encoder
 
-## 推荐在线训练命令
+## 推荐配置文件启动
 
 从 repo 根目录运行：
 
 ```bash
 cd /home/gpuserver/hx/github/Newt
 
-/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/train.py \
-  isaaclab_backend=srsa \
-  task=isaaclab-srsa-assembly \
-  assembly_id=01125 \
-  srsa_dir=/home/gpuserver/hx/github/srsa \
-  srsa_sparse_reward=true \
-  srsa_if_sbc=false \
-  num_envs=300 \
-  isaaclab_gpu_collision_stack_size=268435456 \
-  gpu_id=0 \
-  multiproc=true \
-  num_gpus=2 \
-  steps=6000000 \
-  model_size=S \
-  batch_size=1024 \
-  buffer_size=6000000 \
-  horizon=3 \
-  utd=0.075 \
-  use_demos=false \
-  compile=true \
-  enable_wandb=false \
-  save_agent=true \
-  save_best=true \
-  compile=false \
-  mpc=true \
-  isaaclab_headless=true \
-  isaaclab_use_canonical_obs=true \
-  isaaclab_disable_imitation_reward=true \
-  srsa_task_family_name=normal_fit \
-  srsa_task_param_obs=false \
-  srsa_task_param_obs_mode=task_vec \
-  srsa_enable_axial_task_param_sampler=true \
-  srsa_axial_fixed_plug_scale=true \
-  srsa_axial_clearance_base=0.000114 \
-  'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
-  srsa_axial_clearance_jitter_ratio=0.10 \
-  srsa_axial_depth_base=0.015 \
-  srsa_axial_depth_jitter_ratio=0.10 \
-  'srsa_axial_init_error_xy_range="0.009,0.0010"' \
-  'srsa_axial_init_error_z_range="0.0010,0.0020"' \
-  'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"' \
-  'srsa_axial_visual_noise_xy_range="0.0,0.0"' \
-  'srsa_axial_visual_noise_z_range="0.0,0.0"' \
-  srsa_enable_flange_force_sensor=true \
-  isaaclab_canonical_append_force=true \
-  isaaclab_canonical_append_task_params=false \
-  srsa_vision_noise_xy_std=0.0 \
-  srsa_vision_noise_xy_jitter_std=0.0 \
-  srsa_vision_noise_z_std=0.0 \
-  srsa_vision_noise_z_jitter_std=0.0 \
-  isaaclab_canonical_use_visual_noise=false \
-  task_conditioning=axial_params \
-  progress_log_interval_sec=30 \
-  skip_initial_eval=true \
-  eval_episodes=1 \
-  eval_freq=500000 \
-  exp_name=srsa_axial_online
+./scripts/train_from_config.sh configs/train/srsa_01125_imitation_relaxed.yaml
+```
+
+这个配置默认打开当前推荐路线：
+
+- `srsa_sparse_reward=false`: 使用 SRSA direct env。
+- `isaaclab_disable_imitation_reward=false`: 保留 AutoMate SDF + imitation reward。
+- `srsa_align_direct_reward_success=true`: direct reward 的 success bonus 使用当前 `eval_success_metric`。
+- `eval_success_metric=relaxed`: 3D translation policy 的训练、best checkpoint 和 retention 主指标使用 relaxed。
+- `contact_history_enabled=true`: 使用接触历史 dynamics conditioning。
+
+常用 override 直接接在配置文件后面。例如微调某个目标：
+
+```bash
+./scripts/train_from_config.sh configs/train/srsa_01125_imitation_relaxed.yaml \
+  checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260523_163332_asm-01125/models/best.pt \
+  finetune=true \
+  seeding_coef=1 \
+  assembly_id=00004 \
+  steps=600000 \
+  eval_freq=150000 \
+  save_freq=150000 \
+  exp_name=srsa_axial_finetune_from_01125
 ```
 
 如果只是确认环境和输入输出是否正常，可以先跑小步数：
 
 ```bash
-/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/train.py \
-  isaaclab_backend=srsa \
-  task=isaaclab-srsa-assembly \
+./scripts/train_from_config.sh configs/train/srsa_01125_imitation_relaxed.yaml \
   assembly_id=00783 \
-  srsa_sparse_reward=true \
-  srsa_if_sbc=false \
   num_envs=1 \
+  multiproc=false \
+  num_gpus=1 \
   steps=1 \
   eval_episodes=1 \
-  model_size=S \
   batch_size=8 \
   buffer_size=10000 \
   horizon=2 \
-  use_demos=false \
   enable_wandb=false \
   save_agent=false \
   save_best=false \
-  compile=false \
   mpc=false \
-  isaaclab_headless=true \
-  isaaclab_use_canonical_obs=true \
-  isaaclab_disable_imitation_reward=true \
-  srsa_task_family_name=normal_fit \
-  srsa_task_param_obs=false \
-  srsa_task_param_obs_mode=task_vec \
-  srsa_enable_axial_task_param_sampler=true \
-  srsa_axial_fixed_plug_scale=true \
-  srsa_axial_clearance_base=0.000114 \
-  'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
-  srsa_axial_clearance_jitter_ratio=0.10 \
-  srsa_axial_depth_base=0.015 \
-  srsa_axial_depth_jitter_ratio=0.10 \
-  'srsa_axial_init_error_xy_range="0.005,0.0010"' \
-  'srsa_axial_init_error_z_range="0.00,0.005"' \
-  'srsa_axial_init_error_yaw_range="-0.15,0.15"' \
-  'srsa_axial_visual_noise_xy_range="0.0,0.0"' \
-  'srsa_axial_visual_noise_z_range="0.0,0.0"' \
-  srsa_enable_flange_force_sensor=true \
-  isaaclab_canonical_append_force=true \
-  isaaclab_canonical_append_task_params=false \
-  srsa_vision_noise_xy_std=0.0 \
-  srsa_vision_noise_xy_jitter_std=0.0 \
-  srsa_vision_noise_z_std=0.0 \
-  srsa_vision_noise_z_jitter_std=0.0 \
-  isaaclab_canonical_use_visual_noise=false \
-  task_conditioning=axial_params \
   progress_log_interval_sec=10 \
-  skip_initial_eval=true \
   exp_name=srsa_smoke
 ```
 

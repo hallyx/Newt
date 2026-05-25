@@ -14,17 +14,22 @@
 
 SRSA/AutoMate 原始 `ep_succeeded` 是 episode 内锁存信号：只要某一步满足原始插入判定，episode 结束时就会记为成功。这个判定主要检查高度窗口和 keypoint 平均距离，默认 `success_pos_tol=0.015`，对精密装配来说偏宽，因此可能出现画面上没有稳定插入但 `official_success=1` 的情况。
 
-Newt 现在在 IsaacLab wrapper 侧额外计算严格 SRSA process 指标。默认：
+Newt 在 IsaacLab wrapper 侧额外计算两套 process 指标：
+
+- `strict`: 6D / 姿态可控策略的诊断指标，要求插入深度、横向误差、orientation、yaw、keypoint 和 no-jam 同时满足。
+- `relaxed`: 当前 3D translation policy 的主训练/retention 指标，只要求策略实际可控的插入深度、横向误差和 no-jam；angle、yaw、keypoint 继续写入 JSON/CSV 作为姿态诊断，但不进入 `relaxed_success` gate。
+
+全局默认仍是 strict 口径：
 
 ```bash
-srsa_eval_success_metric=terminal_process
+srsa_eval_success_metric=strict
 ```
 
 也就是 `episode_success` 使用终态稳定严格成功，而不是 AutoMate 锁存成功。日志中会同时输出：
 
 - `episode_success`: 当前主指标，默认等于 `episode_terminal_process_success`。
 - `episode_official_success`: AutoMate 原始锁存成功，适合和历史结果对齐。
-- `episode_relaxed_terminal_process_success`: 介于 official 和 strict 之间的终态稳定成功，仍要求终态满足 process 条件，但默认阈值较 strict 放宽。
+- `episode_relaxed_terminal_process_success`: 3D translation policy 的 relaxed 终态稳定成功。
 - `episode_process_success`: episode 内曾经满足严格 process 成功并达到稳定步数。
 - `episode_terminal_process_success`: episode 结束时满足严格 process 成功并连续稳定 `srsa_process_success_stable_steps` 步。
 - `episode_dual_success`: `official_success && terminal_process_success`。
@@ -43,24 +48,56 @@ strict_success_steps=10
 srsa_process_success_require_no_jam=true
 ```
 
-中间档 relaxed success 默认条件：
+3D translation policy 主指标 `relaxed_success` 默认 gate：
 
 ```bash
 relaxed_depth_fraction=0.85
 relaxed_success_steps=3
 relaxed_lateral_tol_min=0.001
 relaxed_lateral_tol_max=0.003
-relaxed_keypoint_tol_min=0.001
-relaxed_keypoint_tol_max=0.003
-relaxed_angle_tol_deg=5.0
 relaxed_success_require_no_jam=true
+relaxed_success_require_official=false
 ```
 
-如果要把主 `episode_success` 切到这个中间档，可显式设置：
+`relaxed_keypoint_tol_*` 和 `relaxed_angle_tol_deg` 仍会用于记录 `relaxed_keypoint_ok`、`relaxed_orientation_ok`、`relaxed_yaw_ok` 等诊断项，但不会影响 `relaxed_success`。eval summary / batch CSV 会保留：
+
+- `relaxed_success`
+- `relaxed_process_success`
+- `strict_success`
+- `mean_angle_error_deg`
+- `mean_keypoint_error_mm`
+- `official_relaxed_gap`
+- `relaxed_strict_gap`
+
+3D policy 训练、checkpoint 选择和 continual retention 建议显式设置：
 
 ```bash
 eval_success_metric=relaxed
 ```
+
+6D 或姿态可控策略需要把姿态也纳入 gate 时，使用：
+
+```bash
+eval_success_metric=strict
+```
+
+## Reward 口径
+
+SRSA direct env 保留 AutoMate 的 dense reward：
+
+```text
+sdf reward + imitation reward + success bonus
+```
+
+当 `srsa_sparse_reward=false` 且需要使用 imitation reward 时，建议打开：
+
+```bash
+srsa_align_direct_reward_success=true
+```
+
+这样 direct reward 里的 `success bonus` 会复用当前 `eval_success_metric` 选择的成功口径。对当前 3D translation policy，这意味着 `eval_success_metric=relaxed` 时，reward bonus 使用新的 relaxed gate；SDF 和 imitation 项仍由 AutoMate 原实现计算。`official_success_latched`、`strict_success`、angle、keypoint 等诊断项仍继续记录，不会因为 reward 对齐而丢失。
+
+如果 `srsa_align_direct_reward_success=false`，direct env 会保持 IsaacLab/AutoMate 原始 `_get_rewards()` 行为，success bonus 仍来自原始 `check_plug_inserted_in_socket()`。
 
 如果需要复现旧结果，可以显式设置：
 
@@ -1041,6 +1078,6 @@ python tdmpc2/batch_eval_tasks.py \
   checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260523_214912_asm-00186/models/best.pt \
   eval_assembly_ids="[00783,00186]" \
   batch_eval_episodes_per_task=200 \
-  eval_success_metric=strict \
+  eval_success_metric=relaxed \
   batch_eval_output_dir=data/success_compare \
   batch_eval_overwrite=true

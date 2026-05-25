@@ -151,14 +151,13 @@ class TDMPC2(torch.nn.Module):
 			state_dict = torch.load(fp, map_location=torch.get_default_device(), weights_only=False)
 		state_dict = state_dict["model"] if "model" in state_dict else state_dict
 		
-		# Retain task_emb and action_masks if finetuning
+		# Retain task-specific buffers/embeddings when finetuning, but keep learned
+		# shared encoders (e.g. AxialTaskEncoder) from the checkpoint.
 		if self.cfg.finetune:
 			prefix = "module." if any(key.startswith("module.") for key in state_dict.keys()) else ""
 			if getattr(self.model, '_task_emb', None) is not None:
 				state_dict[prefix+"_task_emb.weight"] = self.model._task_emb.weight
 			if getattr(self.model, '_task_encoder', None) is not None:
-				for key, value in self.model._task_encoder.state_dict().items():
-					state_dict[prefix+f"_task_encoder.{key}"] = value
 				state_dict[prefix+"_task_vecs"] = self.model._task_vecs
 			state_dict[prefix+"_action_masks"] = self.model._action_masks
 

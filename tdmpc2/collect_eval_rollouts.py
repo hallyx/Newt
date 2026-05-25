@@ -561,6 +561,7 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 		"task",
 		"srsa_dir",
 		"srsa_sparse_reward",
+		"srsa_align_direct_reward_success",
 		"srsa_sil",
 		"srsa_if_sbc",
 		"srsa_task_template_fp",

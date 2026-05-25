@@ -2,6 +2,7 @@ import sys
 import os
 import importlib
 import math
+import types
 from pathlib import Path
 
 import gymnasium as gym
@@ -497,13 +498,7 @@ def _compute_srsa_success_metrics(
 	relaxed_keypoint_ok = keypoint_error <= relaxed_keypoint_tol
 	relaxed_jam_lateral_thresh = torch.maximum(radial_clearance, relaxed_lateral_tol)
 	relaxed_jam = contact & (~current_official) & (lateral_error > relaxed_jam_lateral_thresh)
-	relaxed_process = (
-		relaxed_depth_ok
-		& relaxed_lateral_ok
-		& relaxed_orientation_ok
-		& relaxed_yaw_ok
-		& relaxed_keypoint_ok
-	)
+	relaxed_process = relaxed_depth_ok & relaxed_lateral_ok
 	if bool(cfg.get('relaxed_success_require_no_jam', True)):
 		relaxed_process = relaxed_process & (~relaxed_jam)
 	if bool(cfg.get('relaxed_success_require_official', False)):
@@ -904,6 +899,7 @@ class IsaacLabWrapper(gym.Wrapper):
 			dtype=torch.bool,
 			device=self.env.unwrapped.device,
 		)
+		self._configure_srsa_direct_reward_success()
 		self._warned_missing_ep_success = False
 		self._warned_missing_eval_terminate_key = False
 		if self._debug_io and int(getattr(self.cfg, 'rank', 0)) == 0:
@@ -1037,21 +1033,124 @@ class IsaacLabWrapper(gym.Wrapper):
 			self._srsa_episode_process_success[env_ids] = False
 			self._srsa_episode_relaxed_process_success[env_ids] = False
 
+	def _srsa_success_metrics(self, *, update_state):
+		env = self.env.unwrapped
+		metrics = _compute_srsa_success_metrics(
+			env,
+			self.cfg,
+			self._srsa_process_success_streak,
+			self._srsa_episode_process_success,
+			self._srsa_relaxed_process_success_streak,
+			self._srsa_episode_relaxed_process_success,
+		)
+		process_streak = metrics.pop("_process_success_streak")
+		relaxed_process_streak = metrics.pop("_relaxed_process_success_streak")
+		if update_state:
+			self._srsa_process_success_streak = process_streak
+			self._srsa_relaxed_process_success_streak = relaxed_process_streak
+			self._srsa_episode_process_success = metrics["episode_process_success"].detach().clone()
+			self._srsa_episode_relaxed_process_success = metrics["episode_relaxed_process_success"].detach().clone()
+		return metrics
+
+	def _configure_srsa_direct_reward_success(self):
+		if not _uses_srsa_backend(self.cfg):
+			return
+		if not bool(self.cfg.get('srsa_align_direct_reward_success', False)):
+			return
+		if bool(self.cfg.get('srsa_sparse_reward', False)):
+			return
+
+		env = self.env.unwrapped
+		if not hasattr(env, '_update_rew_buf'):
+			if int(getattr(self.cfg, 'rank', 0)) == 0:
+				print("[isaaclab-warning] SRSA direct reward success alignment requested, but env has no _update_rew_buf.")
+			return
+
+		wrapper = self
+
+		def _get_rewards_with_newt_success(env_self):
+			current_official = _compute_srsa_current_official_success(env_self)
+			if hasattr(env_self, 'ep_succeeded'):
+				env_self.ep_succeeded = torch.logical_or(
+					env_self.ep_succeeded,
+					current_official.to(dtype=torch.bool),
+				)
+
+			success_metrics = wrapper._srsa_success_metrics(update_state=False)
+			reward_success = _select_srsa_success(success_metrics).to(dtype=torch.bool)
+			rew_buf = env_self._update_rew_buf(reward_success)
+
+			if hasattr(env_self, "_update_task_param_extras"):
+				env_self._update_task_param_extras()
+			if hasattr(env_self, "_update_flange_force_extras"):
+				env_self._update_flange_force_extras()
+			if hasattr(env_self, "_update_srsa_success_extras"):
+				env_self._update_srsa_success_extras(success_metrics)
+			if hasattr(env_self, "_update_newt_task_extras"):
+				env_self._update_newt_task_extras()
+			if hasattr(env_self, "extras") and isinstance(env_self.extras, dict):
+				env_self.extras["logs_rew_selected_success"] = reward_success.float().mean()
+				if current_official is not None:
+					env_self.extras["logs_rew_official_curr_successes"] = current_official.float().mean()
+
+			if torch.any(env_self.reset_buf):
+				if hasattr(env_self, "extras") and isinstance(env_self.extras, dict):
+					env_self.extras["successes"] = torch.count_nonzero(reward_success) / env_self.num_envs
+					if hasattr(env_self, 'ep_succeeded'):
+						env_self.extras["official_successes"] = torch.count_nonzero(env_self.ep_succeeded) / env_self.num_envs
+
+				from isaaclab_tasks.direct.automate import automate_algo_utils as automate_algo
+
+				sbc_rwd_scale = automate_algo.get_curriculum_reward_scale(
+					curr_max_disp=env_self.curr_max_disp,
+					curriculum_height_bound=env_self.curriculum_height_bound,
+				)
+				rew_buf *= sbc_rwd_scale
+
+				if env_self.cfg_task.if_sbc:
+					env_self.curr_max_disp = automate_algo.get_new_max_disp(
+						curr_success=torch.count_nonzero(reward_success) / env_self.num_envs,
+						cfg_task=env_self.cfg_task,
+						curriculum_height_bound=env_self.curriculum_height_bound,
+						curriculum_height_step=env_self.curriculum_height_step,
+						curr_max_disp=env_self.curr_max_disp,
+					)
+
+				if hasattr(env_self, "extras") and isinstance(env_self.extras, dict):
+					env_self.extras["curr_max_disp"] = env_self.curr_max_disp
+
+				if env_self.cfg_task.if_logging_eval:
+					from isaaclab_tasks.direct.automate import automate_log_utils as automate_log
+
+					success_log = reward_success.reshape((env_self.num_envs, 1))
+					env_self.success_log = torch.cat([env_self.success_log, success_log], dim=0)
+
+					if env_self.success_log.shape[0] >= env_self.cfg_task.num_eval_trials:
+						automate_log.write_log_to_hdf5(
+							env_self.held_asset_pose_log,
+							env_self.fixed_asset_pose_log,
+							env_self.success_log,
+							env_self.cfg_task.eval_filename,
+						)
+						exit(0)
+
+			env_self.prev_actions = env_self.actions.clone()
+			return rew_buf
+
+		env._newt_original_get_rewards = env._get_rewards
+		env._get_rewards = types.MethodType(_get_rewards_with_newt_success, env)
+		if int(getattr(self.cfg, 'rank', 0)) == 0:
+			print(
+				"[Rank {rank}] Aligned SRSA direct reward success bonus with eval_success_metric={metric}.".format(
+					rank=getattr(self.cfg, 'rank', 0),
+					metric=self.cfg.get('eval_success_metric', self.cfg.get('srsa_eval_success_metric', 'strict')),
+				)
+			)
+
 	def _compute_success_info(self):
 		env = self.env.unwrapped
 		if _uses_srsa_backend(self.cfg):
-			metrics = _compute_srsa_success_metrics(
-				env,
-				self.cfg,
-				self._srsa_process_success_streak,
-				self._srsa_episode_process_success,
-				self._srsa_relaxed_process_success_streak,
-				self._srsa_episode_relaxed_process_success,
-			)
-			self._srsa_process_success_streak = metrics.pop("_process_success_streak")
-			self._srsa_relaxed_process_success_streak = metrics.pop("_relaxed_process_success_streak")
-			self._srsa_episode_process_success = metrics["episode_process_success"].detach().clone()
-			self._srsa_episode_relaxed_process_success = metrics["episode_relaxed_process_success"].detach().clone()
+			metrics = self._srsa_success_metrics(update_state=True)
 			success = _select_srsa_success(metrics).to(dtype=torch.float32)
 			info = {
 				key: _float_metric(value)

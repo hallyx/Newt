@@ -13,6 +13,8 @@ TARGETS=${TARGETS:-"00004 00014 00062 00271"}
 STEPS_PER_TASK=${STEPS_PER_TASK:-1000000}
 HANDOFF=${HANDOFF:-latest}
 RETENTION_EVAL_EPISODES=${RETENTION_EVAL_EPISODES:-200}
+SRSA_TASK_TEMPLATE_FP=${SRSA_TASK_TEMPLATE_FP:-data/srsa_axial_task_templates.json}
+SRSA_PARAM_TEMPLATE_ID=${SRSA_PARAM_TEMPLATE_ID:-2}
 NUM_ENVS=${NUM_ENVS:-300}
 RETENTION_NUM_ENVS=${RETENTION_NUM_ENVS:-${NUM_ENVS}}
 NUM_GPUS=${NUM_GPUS:-2}
@@ -25,6 +27,25 @@ WORK_BASE=${REPO_ROOT}/logs/isaaclab-srsa-assembly/${SEED}/${EXP_NAME}
 LOG_ROOT=${LOG_ROOT:-${WORK_BASE}/${RUN_STAMP}_launcher}
 DRY_RUN=${DRY_RUN:-0}
 CHECK_CUDA=${CHECK_CUDA:-1}
+
+make_abs_path() {
+  local path=$1
+  if [[ "${path}" == "~" ]]; then
+    path=${HOME}
+  elif [[ "${path}" == "~/"* ]]; then
+    path="${HOME}/${path#~/}"
+  fi
+  if [[ "${path}" == /* ]]; then
+    printf '%s\n' "${path}"
+  else
+    printf '%s/%s\n' "${REPO_ROOT}" "${path}"
+  fi
+}
+
+SOURCE_CHECKPOINT=$(make_abs_path "${SOURCE_CHECKPOINT}")
+if [[ -n "${SRSA_TASK_TEMPLATE_FP}" ]]; then
+  SRSA_TASK_TEMPLATE_FP=$(make_abs_path "${SRSA_TASK_TEMPLATE_FP}")
+fi
 
 if [[ "${HANDOFF}" != "latest" ]]; then
   echo "[launcher] unsupported HANDOFF=${HANDOFF}; continual finetune handoff is fixed to latest" >&2
@@ -104,6 +125,9 @@ join_eval_ids() {
   local joined="01125"
   local item
   for item in "$@"; do
+    if [[ "${item}" == "01125" ]]; then
+      continue
+    fi
     joined="${joined},${item}"
   done
   printf '[%s]' "${joined}"
@@ -124,17 +148,30 @@ if anchor is None:
     print(f"[launcher] retention warning: 01125 row not found in {csv_fp}")
     sys.exit(0)
 
-strict = float(anchor.get("strict_success") or 0.0)
-gap = anchor.get("official_strict_gap", "")
-if strict < 0.65:
+def as_float(name):
+    try:
+        return float(anchor.get(name) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+relaxed = as_float("relaxed_success")
+strict = as_float("strict_success")
+angle = as_float("mean_angle_error_deg")
+keypoint = as_float("mean_keypoint_error_mm")
+gap = anchor.get("official_relaxed_gap", "")
+diagnostics = (
+    f"official_relaxed_gap={gap}; strict_success={strict:.4f}; "
+    f"mean_angle_error_deg={angle:.3f}; mean_keypoint_error_mm={keypoint:.3f}"
+)
+if relaxed < 0.65:
     print(
-        "[launcher] forgetting risk: 01125 strict_success="
-        f"{strict:.4f} < 0.65; official_strict_gap={gap}"
+        "[launcher] forgetting risk: 01125 relaxed_success="
+        f"{relaxed:.4f} < 0.65; {diagnostics}"
     )
 else:
     print(
-        "[launcher] anchor ok: 01125 strict_success="
-        f"{strict:.4f}; official_strict_gap={gap}"
+        "[launcher] anchor ok: 01125 relaxed_success="
+        f"{relaxed:.4f}; {diagnostics}"
     )
 PY
 }
@@ -148,6 +185,8 @@ echo "[launcher] targets=${TARGETS}"
 echo "[launcher] steps_per_task=${STEPS_PER_TASK}"
 echo "[launcher] handoff=${HANDOFF}"
 echo "[launcher] retention_eval_episodes=${RETENTION_EVAL_EPISODES}"
+echo "[launcher] srsa_task_template_fp=${SRSA_TASK_TEMPLATE_FP}"
+echo "[launcher] srsa_param_template_id=${SRSA_PARAM_TEMPLATE_ID}"
 echo "[launcher] num_envs=${NUM_ENVS} retention_num_envs=${RETENTION_NUM_ENVS} multiproc=${MULTIPROC} num_gpus=${NUM_GPUS} gpu_id=${GPU_ID}"
 echo "[launcher] eval_freq=${EVAL_FREQ} save_freq=${SAVE_FREQ}"
 echo "[launcher] exp_name=${EXP_NAME}"
@@ -181,8 +220,13 @@ for ASM in ${TARGETS}; do
     assembly_id="${ASM}"
     isaaclab_dir="${ISAACLAB_DIR}"
     srsa_dir="${SRSA_DIR}"
+    srsa_task_template_fp="${SRSA_TASK_TEMPLATE_FP}"
+    srsa_param_template_id="${SRSA_PARAM_TEMPLATE_ID}"
+    eval_task_template_exact=true
+    eval_task_template_print=true
     srsa_sparse_reward=false
     isaaclab_disable_imitation_reward=false
+    srsa_align_direct_reward_success=true
     srsa_if_sbc=false
     num_envs="${NUM_ENVS}"
     isaaclab_gpu_collision_stack_size=268435456
@@ -228,7 +272,7 @@ for ASM in ${TARGETS}; do
     srsa_vision_noise_z_jitter_std=0.0
     isaaclab_canonical_use_visual_noise=false
     task_conditioning=axial_params
-    eval_success_metric=strict
+    eval_success_metric=relaxed
     strict_depth_fraction=0.90
     strict_success_steps=10
     strict_lateral_tol_min=0.0005
@@ -291,8 +335,13 @@ for ASM in ${TARGETS}; do
     task=isaaclab-srsa-assembly
     isaaclab_dir="${ISAACLAB_DIR}"
     srsa_dir="${SRSA_DIR}"
+    srsa_task_template_fp="${SRSA_TASK_TEMPLATE_FP}"
+    srsa_param_template_id="${SRSA_PARAM_TEMPLATE_ID}"
+    eval_task_template_exact=true
+    eval_task_template_print=true
     srsa_sparse_reward=false
     isaaclab_disable_imitation_reward=false
+    srsa_align_direct_reward_success=true
     srsa_if_sbc=false
     num_envs="${RETENTION_NUM_ENVS}"
     isaaclab_gpu_collision_stack_size=268435456
@@ -327,7 +376,7 @@ for ASM in ${TARGETS}; do
     srsa_vision_noise_z_jitter_std=0.0
     isaaclab_canonical_use_visual_noise=false
     task_conditioning=axial_params
-    eval_success_metric=strict
+    eval_success_metric=relaxed
     strict_depth_fraction=0.90
     strict_success_steps=10
     strict_lateral_tol_min=0.0005
