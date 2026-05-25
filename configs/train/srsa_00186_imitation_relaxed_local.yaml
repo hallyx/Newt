@@ -1,0 +1,99 @@
+defaults:
+  - config
+  - _self_
+
+# Local SRSA 00186 retraining with AutoMate dense reward.
+# Reward = SDF + imitation + selected-success bonus.
+# The success bonus is aligned to eval_success_metric below.
+
+isaaclab_backend: srsa
+task: isaaclab-srsa-assembly
+assembly_id: "00186"
+isaaclab_dir: /home/robot2/isaaclab/IsaacLab
+srsa_dir: /home/robot2/hx/github/srsa
+
+srsa_task_template_fp: data/srsa_axial_task_templates.json
+srsa_mesh_geometry_fp: docs/srsa_mesh_geometry_params.csv
+srsa_param_template_id: 2
+eval_task_template_exact: true
+eval_task_template_print: true
+
+srsa_sparse_reward: false
+isaaclab_disable_imitation_reward: false
+srsa_align_direct_reward_success: true
+srsa_if_sbc: false
+
+num_envs: 350
+isaaclab_gpu_collision_stack_size: 268435456
+gpu_id: 0
+multiproc: false
+num_gpus: 1
+
+steps: 10000000
+model_size: S
+batch_size: 1024
+buffer_size: 10000000
+horizon: 3
+utd: 0.075
+use_demos: false
+compile: false
+enable_wandb: false
+save_agent: true
+save_best: true
+save_best_metric: episode_success
+mpc: true
+
+isaaclab_headless: true
+isaaclab_use_canonical_obs: true
+srsa_task_family_name: normal_fit
+srsa_task_param_obs: false
+srsa_task_param_obs_mode: task_vec
+srsa_enable_axial_task_param_sampler: true
+srsa_axial_fixed_plug_scale: true
+srsa_axial_clearance_base: 0.000114
+srsa_axial_clearance_depth_templates: "0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"
+srsa_axial_clearance_jitter_ratio: 0.10
+srsa_axial_depth_base: 0.015
+srsa_axial_depth_jitter_ratio: 0.10
+srsa_axial_init_error_xy_range: "0.009,0.0010"
+srsa_axial_init_error_z_range: "0.0010,0.0020"
+srsa_axial_init_error_yaw_range: "-0.0872665,0.0872665"
+srsa_axial_visual_noise_xy_range: "0.0,0.0"
+srsa_axial_visual_noise_z_range: "0.0,0.0"
+
+srsa_enable_flange_force_sensor: true
+isaaclab_canonical_append_force: true
+isaaclab_canonical_append_task_params: false
+srsa_vision_noise_xy_std: 0.0
+srsa_vision_noise_xy_jitter_std: 0.0
+srsa_vision_noise_z_std: 0.0
+srsa_vision_noise_z_jitter_std: 0.0
+isaaclab_canonical_use_visual_noise: false
+
+task_conditioning: axial_params
+eval_success_metric: relaxed
+srsa_eval_success_metric: relaxed
+strict_depth_fraction: 0.90
+strict_success_steps: 10
+strict_lateral_tol_min: 0.0005
+strict_lateral_tol_max: 0.0020
+strict_keypoint_tol_min: 0.0010
+strict_keypoint_tol_max: 0.0030
+strict_angle_tol_deg: 3.0
+
+progress_log_interval_sec: 30
+skip_initial_eval: true
+eval_episodes: 1
+eval_freq: 100000
+save_freq: 100000
+exp_name: srsa_axial_00186_imitation_relaxed
+
+contact_history_enabled: true
+contact_history_len: 4
+contact_context_dim: 64
+contact_history_hidden_dim: 128
+contact_history_layers: 2
+contact_force_dim: 6
+contact_action_dim: 3
+contact_ee_delta_dim: 3
+contact_history_use_ee_delta: true
