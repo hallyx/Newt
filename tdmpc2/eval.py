@@ -50,11 +50,17 @@ SUCCESS_DIAGNOSTIC_KEYS = (
 	"official_success_latched",
 	"official_success_terminal",
 	"process_success_terminal",
+	"relaxed_process_success_terminal",
+	"relaxed_success_stable",
+	"relaxed_success_episode",
 	"strict_success_stable",
 	"strict_success_episode",
 	"official_success",
 	"current_official_success",
 	"process_success",
+	"relaxed_process_success",
+	"episode_relaxed_process_success",
+	"relaxed_terminal_process_success",
 	"episode_process_success",
 	"terminal_process_success",
 	"dual_success",
@@ -836,6 +842,8 @@ def _write_eval_summary(cfg, metrics):
 	output_dir.mkdir(parents=True, exist_ok=True)
 	official_latched = _metric_value(metrics, "official_success_latched", "official_success")
 	official_terminal = _metric_value(metrics, "official_success_terminal", "current_official_success")
+	relaxed_success = _metric_value(metrics, "relaxed_success_stable", "relaxed_terminal_process_success")
+	relaxed_process_success = _metric_value(metrics, "relaxed_process_success_terminal", "relaxed_process_success")
 	strict_success = _metric_value(metrics, "strict_success_stable", "terminal_process_success", "success")
 	process_success = _metric_value(metrics, "process_success_terminal", "process_success")
 	depth_fraction = _metric_value(metrics, "depth_fraction")
@@ -846,6 +854,8 @@ def _write_eval_summary(cfg, metrics):
 		"assembly_id": str(cfg.get('assembly_id', "")),
 		"official_success_latched": official_latched,
 		"official_success_terminal": official_terminal,
+		"relaxed_success": relaxed_success,
+		"relaxed_process_success": relaxed_process_success,
 		"strict_success": strict_success,
 		"process_success": process_success,
 		"mean_depth_fraction": depth_fraction,
@@ -853,6 +863,8 @@ def _write_eval_summary(cfg, metrics):
 		"mean_angle_error_deg": math.degrees(angle_error),
 		"mean_keypoint_error_mm": keypoint_error * 1000.0,
 		"episode_len_mean": _metric_value(metrics, "episode_length", "length"),
+		"official_relaxed_gap": official_latched - relaxed_success,
+		"relaxed_strict_gap": relaxed_success - strict_success,
 		"official_strict_gap": official_latched - strict_success,
 	}
 	json_fp = output_dir / "eval_summary.json"

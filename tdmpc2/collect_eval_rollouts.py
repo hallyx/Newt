@@ -41,11 +41,17 @@ SUCCESS_METADATA_KEYS = (
 	"official_success_latched",
 	"official_success_terminal",
 	"process_success_terminal",
+	"relaxed_process_success_terminal",
+	"relaxed_success_stable",
+	"relaxed_success_episode",
 	"strict_success_stable",
 	"strict_success_episode",
 	"official_success",
 	"current_official_success",
 	"process_success",
+	"relaxed_process_success",
+	"episode_relaxed_process_success",
+	"relaxed_terminal_process_success",
 	"episode_process_success",
 	"terminal_process_success",
 	"depth_fraction",
@@ -303,6 +309,9 @@ def _empty_columns():
 		"episode_official_success_latched_final": [],
 		"episode_official_success_terminal_final": [],
 		"episode_process_success_terminal_final": [],
+		"episode_relaxed_process_success_terminal_final": [],
+		"episode_relaxed_success_stable_final": [],
+		"episode_relaxed_success_episode_final": [],
 		"episode_strict_success_stable_final": [],
 		"episode_strict_success_episode_final": [],
 		"episode_depth_fraction_final": [],
@@ -327,6 +336,9 @@ def _append_finished_episode(
 	official_latched = float(final_metrics.get("official_success_latched", final_metrics.get("official_success", 0.0)))
 	official_terminal = float(final_metrics.get("official_success_terminal", final_metrics.get("current_official_success", 0.0)))
 	process_terminal = float(final_metrics.get("process_success_terminal", final_metrics.get("process_success", 0.0)))
+	relaxed_process_terminal = float(final_metrics.get("relaxed_process_success_terminal", final_metrics.get("relaxed_process_success", 0.0)))
+	relaxed_stable = float(final_metrics.get("relaxed_success_stable", final_metrics.get("relaxed_terminal_process_success", final_success)))
+	relaxed_episode = float(final_metrics.get("relaxed_success_episode", final_metrics.get("episode_relaxed_process_success", relaxed_stable)))
 	strict_stable = float(final_metrics.get("strict_success_stable", final_metrics.get("terminal_process_success", final_success)))
 	strict_episode = float(final_metrics.get("strict_success_episode", final_metrics.get("episode_process_success", strict_stable)))
 	depth_fraction = float(final_metrics.get("depth_fraction", 0.0))
@@ -356,6 +368,9 @@ def _append_finished_episode(
 		columns["episode_official_success_latched_final"].append(torch.tensor(official_latched, dtype=torch.float32))
 		columns["episode_official_success_terminal_final"].append(torch.tensor(official_terminal, dtype=torch.float32))
 		columns["episode_process_success_terminal_final"].append(torch.tensor(process_terminal, dtype=torch.float32))
+		columns["episode_relaxed_process_success_terminal_final"].append(torch.tensor(relaxed_process_terminal, dtype=torch.float32))
+		columns["episode_relaxed_success_stable_final"].append(torch.tensor(relaxed_stable, dtype=torch.float32))
+		columns["episode_relaxed_success_episode_final"].append(torch.tensor(relaxed_episode, dtype=torch.float32))
 		columns["episode_strict_success_stable_final"].append(torch.tensor(strict_stable, dtype=torch.float32))
 		columns["episode_strict_success_episode_final"].append(torch.tensor(strict_episode, dtype=torch.float32))
 		columns["episode_depth_fraction_final"].append(torch.tensor(depth_fraction, dtype=torch.float32))
@@ -529,6 +544,17 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 		"strict_keypoint_tol_min",
 		"strict_keypoint_tol_max",
 		"strict_angle_tol_deg",
+		"relaxed_depth_fraction",
+		"relaxed_success_steps",
+		"relaxed_lateral_tol_scale",
+		"relaxed_lateral_tol_min",
+		"relaxed_lateral_tol_max",
+		"relaxed_keypoint_tol_scale",
+		"relaxed_keypoint_tol_min",
+		"relaxed_keypoint_tol_max",
+		"relaxed_angle_tol_deg",
+		"relaxed_success_require_official",
+		"relaxed_success_require_no_jam",
 		"isaaclab_backend",
 		"isaaclab_env_id",
 		"isaaclab_task_package",

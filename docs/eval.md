@@ -24,6 +24,7 @@ srsa_eval_success_metric=terminal_process
 
 - `episode_success`: 当前主指标，默认等于 `episode_terminal_process_success`。
 - `episode_official_success`: AutoMate 原始锁存成功，适合和历史结果对齐。
+- `episode_relaxed_terminal_process_success`: 介于 official 和 strict 之间的终态稳定成功，仍要求终态满足 process 条件，但默认阈值较 strict 放宽。
 - `episode_process_success`: episode 内曾经满足严格 process 成功并达到稳定步数。
 - `episode_terminal_process_success`: episode 结束时满足严格 process 成功并连续稳定 `srsa_process_success_stable_steps` 步。
 - `episode_dual_success`: `official_success && terminal_process_success`。
@@ -31,14 +32,34 @@ srsa_eval_success_metric=terminal_process
 严格 process 默认条件：
 
 ```bash
-srsa_process_success_depth_ratio=0.85
+strict_depth_fraction=0.90
 srsa_process_success_lateral_tol_scale=2.0
-srsa_process_success_lateral_tol_min=0.001
-srsa_process_success_lateral_tol_max=0.003
-srsa_process_success_orientation_tol_rad=0.0872665
-srsa_process_success_yaw_tol_rad=0.0872665
-srsa_process_success_stable_steps=3
+strict_lateral_tol_min=0.0005
+strict_lateral_tol_max=0.002
+strict_keypoint_tol_min=0.001
+strict_keypoint_tol_max=0.003
+strict_angle_tol_deg=3.0
+strict_success_steps=10
 srsa_process_success_require_no_jam=true
+```
+
+中间档 relaxed success 默认条件：
+
+```bash
+relaxed_depth_fraction=0.85
+relaxed_success_steps=3
+relaxed_lateral_tol_min=0.001
+relaxed_lateral_tol_max=0.003
+relaxed_keypoint_tol_min=0.001
+relaxed_keypoint_tol_max=0.003
+relaxed_angle_tol_deg=5.0
+relaxed_success_require_no_jam=true
+```
+
+如果要把主 `episode_success` 切到这个中间档，可显式设置：
+
+```bash
+eval_success_metric=relaxed
 ```
 
 如果需要复现旧结果，可以显式设置：
@@ -1014,3 +1035,12 @@ python3 tdmpc2/eval.py \
   eval_real_socket_quat_wxyz=[1.0,0.0,0.0,0.0] \
   eval_real_force_scale=50.0
 ```
+
+
+python tdmpc2/batch_eval_tasks.py \
+  checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260523_214912_asm-00186/models/best.pt \
+  eval_assembly_ids="[00783,00186]" \
+  batch_eval_episodes_per_task=200 \
+  eval_success_metric=strict \
+  batch_eval_output_dir=data/success_compare \
+  batch_eval_overwrite=true

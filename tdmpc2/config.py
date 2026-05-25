@@ -137,6 +137,17 @@ class Config:
 	strict_keypoint_tol_min: float = 0.0010
 	strict_keypoint_tol_max: Optional[float] = 0.0030
 	strict_angle_tol_deg: float = 3.0
+	relaxed_depth_fraction: float = 0.85
+	relaxed_success_steps: int = 3
+	relaxed_lateral_tol_scale: float = 2.0
+	relaxed_lateral_tol_min: float = 0.0010
+	relaxed_lateral_tol_max: Optional[float] = 0.0030
+	relaxed_keypoint_tol_scale: float = 2.0
+	relaxed_keypoint_tol_min: float = 0.0010
+	relaxed_keypoint_tol_max: Optional[float] = 0.0030
+	relaxed_angle_tol_deg: float = 5.0
+	relaxed_success_require_official: bool = False
+	relaxed_success_require_no_jam: bool = True
 	srsa_process_success_depth_ratio: float = 0.90
 	srsa_process_success_lateral_tol_scale: float = 2.0
 	srsa_process_success_lateral_tol_min: float = 0.0005

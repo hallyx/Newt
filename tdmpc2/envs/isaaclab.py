@@ -248,13 +248,36 @@ def _normalize_srsa_eval_success_metric(metric):
 		"strict": "terminal_process",
 		"strict_success": "terminal_process",
 		"strict_success_stable": "terminal_process",
+		"relaxed": "relaxed_terminal_process",
+		"relaxed_success": "relaxed_terminal_process",
+		"relaxed_success_stable": "relaxed_terminal_process",
+		"relaxed_terminal": "relaxed_terminal_process",
+		"relaxed_terminal_success": "relaxed_terminal_process",
+		"relaxed_terminal_process_success": "relaxed_terminal_process",
+		"terminal_relaxed_process_success": "relaxed_terminal_process",
+		"relaxed_process_success": "relaxed_process",
+		"relaxed_process_success_terminal": "relaxed_process",
+		"relaxed_episode": "relaxed_episode_process",
+		"relaxed_episode_success": "relaxed_episode_process",
+		"relaxed_success_episode": "relaxed_episode_process",
+		"episode_relaxed_process_success": "relaxed_episode_process",
 		"dual_success": "dual",
 	}
 	normalized = aliases.get(normalized, normalized)
-	if normalized not in {"official", "current_official", "process", "episode_process", "terminal_process", "dual"}:
+	if normalized not in {
+		"official",
+		"current_official",
+		"process",
+		"episode_process",
+		"terminal_process",
+		"relaxed_process",
+		"relaxed_episode_process",
+		"relaxed_terminal_process",
+		"dual",
+	}:
 		raise ValueError(
 			"srsa_eval_success_metric must be one of: official, current_official, "
-			"process, episode_process, terminal_process/strict, dual."
+			"process, episode_process, terminal_process/strict, relaxed, dual."
 		)
 	return normalized
 
@@ -344,11 +367,22 @@ def _compute_srsa_current_official_success(env):
 		return zeros
 
 
-def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_success):
+def _compute_srsa_success_metrics(
+	env,
+	cfg,
+	process_streak,
+	episode_process_success,
+	relaxed_process_streak=None,
+	episode_relaxed_process_success=None,
+):
 	num_envs = int(getattr(env, 'num_envs', 1))
 	device = getattr(env, 'device', None)
 	zeros = torch.zeros((num_envs,), dtype=torch.float32, device=device)
 	false = torch.zeros((num_envs,), dtype=torch.bool, device=device)
+	if relaxed_process_streak is None:
+		relaxed_process_streak = torch.zeros((num_envs,), dtype=torch.int64, device=device)
+	if episode_relaxed_process_success is None:
+		episode_relaxed_process_success = false.clone()
 
 	current_official = _compute_srsa_current_official_success(env)
 	if hasattr(env, 'ep_succeeded'):
@@ -442,6 +476,46 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 	process_streak = torch.where(process, process_streak + 1, torch.zeros_like(process_streak))
 	terminal_process = process & (process_streak >= stable_steps)
 	episode_process_success = episode_process_success | terminal_process
+
+	relaxed_depth_ok = height_window_ok & (depth_fraction >= float(cfg.get('relaxed_depth_fraction', 0.85)))
+	relaxed_lateral_tol = _clamped_tolerance(
+		radial_clearance,
+		cfg.get('relaxed_lateral_tol_scale', 2.0),
+		cfg.get('relaxed_lateral_tol_min', 0.0010),
+		cfg.get('relaxed_lateral_tol_max', 0.0030),
+	)
+	relaxed_lateral_ok = lateral_error <= relaxed_lateral_tol
+	relaxed_angle_tol_rad = math.radians(float(cfg.get('relaxed_angle_tol_deg', 5.0)))
+	relaxed_orientation_ok = orientation_error <= relaxed_angle_tol_rad
+	relaxed_yaw_ok = (~yaw_required) | (yaw_error <= relaxed_angle_tol_rad)
+	relaxed_keypoint_tol = _clamped_tolerance(
+		radial_clearance,
+		cfg.get('relaxed_keypoint_tol_scale', 2.0),
+		cfg.get('relaxed_keypoint_tol_min', 0.0010),
+		cfg.get('relaxed_keypoint_tol_max', 0.0030),
+	)
+	relaxed_keypoint_ok = keypoint_error <= relaxed_keypoint_tol
+	relaxed_jam_lateral_thresh = torch.maximum(radial_clearance, relaxed_lateral_tol)
+	relaxed_jam = contact & (~current_official) & (lateral_error > relaxed_jam_lateral_thresh)
+	relaxed_process = (
+		relaxed_depth_ok
+		& relaxed_lateral_ok
+		& relaxed_orientation_ok
+		& relaxed_yaw_ok
+		& relaxed_keypoint_ok
+	)
+	if bool(cfg.get('relaxed_success_require_no_jam', True)):
+		relaxed_process = relaxed_process & (~relaxed_jam)
+	if bool(cfg.get('relaxed_success_require_official', False)):
+		relaxed_process = relaxed_process & current_official
+	relaxed_stable_steps = max(1, int(cfg.get('relaxed_success_steps', 3)))
+	relaxed_process_streak = torch.where(
+		relaxed_process,
+		relaxed_process_streak + 1,
+		torch.zeros_like(relaxed_process_streak),
+	)
+	relaxed_terminal_process = relaxed_process & (relaxed_process_streak >= relaxed_stable_steps)
+	episode_relaxed_process_success = episode_relaxed_process_success | relaxed_terminal_process
 	dual = official & terminal_process
 
 	return {
@@ -449,11 +523,17 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 		"official_success_latched": official,
 		"official_success_terminal": current_official,
 		"process_success_terminal": process,
+		"relaxed_process_success_terminal": relaxed_process,
+		"relaxed_success_stable": relaxed_terminal_process,
+		"relaxed_success_episode": episode_relaxed_process_success,
 		"strict_success_stable": terminal_process,
 		"strict_success_episode": episode_process_success,
 		"official_success": official,
 		"current_official_success": current_official,
 		"process_success": process,
+		"relaxed_process_success": relaxed_process,
+		"episode_relaxed_process_success": episode_relaxed_process_success,
+		"relaxed_terminal_process_success": relaxed_terminal_process,
 		"episode_process_success": episode_process_success,
 		"terminal_process_success": terminal_process,
 		"dual_success": dual,
@@ -462,20 +542,30 @@ def _compute_srsa_success_metrics(env, cfg, process_streak, episode_process_succ
 		"orientation_ok": orientation_ok,
 		"yaw_ok": yaw_ok,
 		"keypoint_ok": keypoint_ok,
+		"relaxed_depth_ok": relaxed_depth_ok,
+		"relaxed_lateral_ok": relaxed_lateral_ok,
+		"relaxed_orientation_ok": relaxed_orientation_ok,
+		"relaxed_yaw_ok": relaxed_yaw_ok,
+		"relaxed_keypoint_ok": relaxed_keypoint_ok,
 		"jam": jam,
+		"relaxed_jam": relaxed_jam,
 		"depth_fraction": depth_fraction,
 		"current_depth": current_depth,
 		"target_depth": target_depth,
 		"lateral_error": lateral_error,
 		"lateral_tol": lateral_tol,
+		"relaxed_lateral_tol": relaxed_lateral_tol,
 		"angle_error": angle_error,
 		"orientation_error": orientation_error,
 		"yaw_error": yaw_error,
 		"keypoint_error": keypoint_error,
 		"keypoint_tol": keypoint_tol,
+		"relaxed_keypoint_tol": relaxed_keypoint_tol,
 		"radial_clearance": radial_clearance,
 		"process_success_streak": process_streak.to(dtype=torch.float32),
+		"relaxed_process_success_streak": relaxed_process_streak.to(dtype=torch.float32),
 		"_process_success_streak": process_streak,
+		"_relaxed_process_success_streak": relaxed_process_streak,
 	}
 
 
@@ -491,6 +581,12 @@ def _select_srsa_success(metrics):
 		return metrics["episode_process_success"]
 	if metric == "terminal_process":
 		return metrics["terminal_process_success"]
+	if metric == "relaxed_process":
+		return metrics["relaxed_process_success"]
+	if metric == "relaxed_episode_process":
+		return metrics["episode_relaxed_process_success"]
+	if metric == "relaxed_terminal_process":
+		return metrics["relaxed_terminal_process_success"]
 	if metric == "dual":
 		return metrics["dual_success"]
 	raise AssertionError(f"Unhandled SRSA success metric: {metric}")
@@ -793,7 +889,17 @@ class IsaacLabWrapper(gym.Wrapper):
 			dtype=torch.int64,
 			device=self.env.unwrapped.device,
 		)
+		self._srsa_relaxed_process_success_streak = torch.zeros(
+			(self.cfg.num_envs,),
+			dtype=torch.int64,
+			device=self.env.unwrapped.device,
+		)
 		self._srsa_episode_process_success = torch.zeros(
+			(self.cfg.num_envs,),
+			dtype=torch.bool,
+			device=self.env.unwrapped.device,
+		)
+		self._srsa_episode_relaxed_process_success = torch.zeros(
 			(self.cfg.num_envs,),
 			dtype=torch.bool,
 			device=self.env.unwrapped.device,
@@ -906,7 +1012,14 @@ class IsaacLabWrapper(gym.Wrapper):
 			print("[isaaclab-debug] " + _tensor_debug_summary("output.truncated", truncated))
 		if isinstance(info, dict) and 'success' in info:
 			print("[isaaclab-debug] " + _tensor_debug_summary("info.success", info['success']))
-			for key in ("official_success", "terminal_process_success", "depth_fraction", "lateral_error", "jam"):
+			for key in (
+				"official_success",
+				"relaxed_terminal_process_success",
+				"terminal_process_success",
+				"depth_fraction",
+				"lateral_error",
+				"jam",
+			):
 				if key in info:
 					print("[isaaclab-debug] " + _tensor_debug_summary(f"info.{key}", info[key]))
 		self._debug_runtime_tensors()
@@ -914,11 +1027,15 @@ class IsaacLabWrapper(gym.Wrapper):
 	def _reset_srsa_success_state(self, env_ids=None):
 		if env_ids is None:
 			self._srsa_process_success_streak.zero_()
+			self._srsa_relaxed_process_success_streak.zero_()
 			self._srsa_episode_process_success.zero_()
+			self._srsa_episode_relaxed_process_success.zero_()
 			return
 		if torch.is_tensor(env_ids) and env_ids.numel() > 0:
 			self._srsa_process_success_streak[env_ids] = 0
+			self._srsa_relaxed_process_success_streak[env_ids] = 0
 			self._srsa_episode_process_success[env_ids] = False
+			self._srsa_episode_relaxed_process_success[env_ids] = False
 
 	def _compute_success_info(self):
 		env = self.env.unwrapped
@@ -928,9 +1045,13 @@ class IsaacLabWrapper(gym.Wrapper):
 				self.cfg,
 				self._srsa_process_success_streak,
 				self._srsa_episode_process_success,
+				self._srsa_relaxed_process_success_streak,
+				self._srsa_episode_relaxed_process_success,
 			)
 			self._srsa_process_success_streak = metrics.pop("_process_success_streak")
+			self._srsa_relaxed_process_success_streak = metrics.pop("_relaxed_process_success_streak")
 			self._srsa_episode_process_success = metrics["episode_process_success"].detach().clone()
+			self._srsa_episode_relaxed_process_success = metrics["episode_relaxed_process_success"].detach().clone()
 			success = _select_srsa_success(metrics).to(dtype=torch.float32)
 			info = {
 				key: _float_metric(value)
