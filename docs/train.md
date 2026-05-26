@@ -158,6 +158,14 @@ SRSA 环境接口仍保持 6D，不需要改 SRSA 仓库。Newt 的 IsaacLab wra
 [dx, dy, dz, 0, 0, 0]
 ```
 
+真机 ZMQ 控制建议保持 3D 口径：
+
+```bash
+'eval_zmq_action_order="dx,dy,dz"'
+```
+
+这样 action receiver 收到的 `delta/action` 就是 `[dx,dy,dz]`。如果保留默认 6D order，ZMQ publisher 会把 3D policy action 补零成 `[dx,dy,dz,0,0,0]`。
+
 因此新的 3D checkpoint 和旧的 6D checkpoint 结构不同，不能直接互相加载。若要复现旧 6D action checkpoint，显式设置：
 
 ```bash
@@ -475,7 +483,7 @@ contact_history_use_ee_delta=true
 
 第一版不需要改 SRSA 环境也可以验证：
 
-- `action_history`: Newt 已经知道过去策略输出的 6D action。
+- `action_history`: Newt 已经知道过去策略输出的 action；01125 当前 checkpoint 是 3D `[dx,dy,dz]`。
 - `ee_delta_history`: 可以从连续 canonical obs 的 TCP pose 差分得到。
 - `force_history`: 当前 17D obs 只有 `flange_force_obs[3]`，可先临时扩成 `[Fx,Fy,Fz,0,0,0]`。
 
@@ -741,6 +749,66 @@ logs/<task>/<seed>/<exp_name>/<run_id>/
 
 默认按 eval success 选 best。
 
+## SpaceMouse HIRL 真机采集与微调
+
+当前推荐的 SpaceMouse 人在回路流程是：Newt 用 checkpoint 根据真机 observation 推理 3D policy action，ZMQ 发送 `[dx,dy,dz]`；真机侧 action receiver 同步读取 SpaceMouse，如果人接管就执行 SpaceMouse action，否则执行 Newt action；下一帧 observation 消息把实际执行的 action 作为 `executed_action` 发回 Newt，采集脚本保存为 compact offline dataset。
+
+仓库提供了 01125 采集配置：
+
+```text
+configs/train/srsa_01125_hirl_collection.yaml
+```
+
+采集命令：
+
+```bash
+cd /home/gpuserver/hx/github/Newt
+
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/collect_real_hil_rollouts.py \
+  --config-dir configs/train \
+  --config-name srsa_01125_hirl_collection \
+  checkpoint=/path/to/checkpoint.pt \
+  eval_real_obs_server=tcp://<robot-host>:5556 \
+  eval_zmq_server=tcp://<robot-host>:5555 \
+  hil_collect_episodes=20 \
+  hil_collect_output_fp=data/real_hil_01125.pt \
+  hil_collect_manifest_fp=data/real_hil_01125_manifest.json
+```
+
+真机侧返回的 observation JSON 至少包含：
+
+```json
+{
+  "obs": [17 floats],
+  "executed_action": [dx, dy, dz],
+  "intervened": true,
+  "reward": 0.0,
+  "done": false,
+  "success": false
+}
+```
+
+`executed_action` 必须用 Newt 训练时的归一化 action 单位。若机器人实际执行的是 `scaled_delta = raw_action * eval_zmq_action_scale`，返回给 Newt 保存的数据应是 `raw_action = scaled_delta / eval_zmq_action_scale`。这样后续 BC 或离线微调学到的 action 尺度才和 checkpoint 保持一致。
+
+采集完成后，先用 BC 做保守微调：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/offline_train.py \
+  --config-dir configs/train \
+  --config-name srsa_01125_imitation_relaxed \
+  checkpoint=/path/to/checkpoint.pt \
+  offline_dataset_fp=data/real_hil_01125.pt \
+  offline_bc_steps=20000 \
+  offline_wm_steps=20000 \
+  offline_rl_steps=0 \
+  batch_size=256 \
+  compile=false \
+  enable_wandb=false \
+  exp_name=real_01125_hirl_offline_ft
+```
+
+如果真机侧的 `reward/done/success` 已经可靠，再逐步增加 `offline_wm_steps` 或打开少量 `offline_rl_steps`。
+
 ## 离线预训练入口
 
 已有 compact offline dataset：
@@ -981,8 +1049,8 @@ batch_eval_assembly_ids="[00141,00211]"
 
 真机 eval 现在有两种模式：
 
-- `eval_real_mode=closed_loop`: 真机侧发送最新 canonical obs，Newt 按 `17D/14D obs + task_vec_6 -> 6D action` 闭环推理并控制机械臂。
-- `eval_real_mode=stream`: 旧 smoke test。Newt 仍创建一个 SRSA/Isaac 环境用于产生策略输入，同时把选中 env 的 6D action 发送给真机侧 receiver。
+- `eval_real_mode=closed_loop`: 真机侧发送最新 canonical obs，Newt 按 `17D/14D obs + task_vec_6 -> action` 闭环推理并控制机械臂；01125 当前 checkpoint 是 3D `[dx,dy,dz]`。
+- `eval_real_mode=stream`: 旧 smoke test。Newt 仍创建一个 SRSA/Isaac 环境用于产生策略输入，同时把选中 env 的 action 发送给真机侧 receiver。
 
 最新结构控制机械臂应优先用 `closed_loop`：
 
@@ -998,7 +1066,7 @@ batch_eval_assembly_ids="[00141,00211]"
   eval_zmq_action_scale=0.05 \
   eval_zmq_action_frame=world \
   eval_zmq_command_frame=world \
-  'eval_zmq_action_order="dx,dy,dz,droll,dpitch,dyaw"' \
+  'eval_zmq_action_order="dx,dy,dz"' \
   isaaclab_backend=srsa \
   task=isaaclab-srsa-assembly \
   assembly_id=00186 \
@@ -1090,7 +1158,7 @@ batch_eval_assembly_ids="[00141,00211]"
   exp_name=eval_real_zmq
 ```
 
-真机首次测试建议把 `eval_zmq_action_scale` 设小，例如 `0.05` 或 `0.10`，确认方向、坐标系和限幅无误后再提高。机器人侧必须把 Newt 的 6D action 作为归一化末端增量处理，并保留速度、位移、力、碰撞和 workspace 限幅；当前 SRSA/IsaacLab checkpoint 的 action 是 SRSA 原生 world/env frame fingertip delta，不是 socket-frame action，因此不要再做 socket -> TCP 的二次转换。真机 success 需要由真机侧日志或外部记录确认。
+真机首次测试建议把 `eval_zmq_action_scale` 设小，例如 `0.05` 或 `0.10`，确认方向、坐标系和限幅无误后再提高。机器人侧必须把 Newt 的 3D `[dx,dy,dz]` action 作为归一化末端平移增量处理，并保留速度、位移、力、碰撞和 workspace 限幅；当前 SRSA/IsaacLab checkpoint 的 action 是 SRSA 原生 world/env frame fingertip delta，不是 socket-frame action，因此不要再做 socket -> TCP 的二次转换。真机 success 需要由真机侧日志或外部记录确认。
 
 结果会保存为：
 

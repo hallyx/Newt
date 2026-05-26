@@ -1,0 +1,44 @@
+defaults:
+  - srsa_01125_imitation_relaxed
+  - _self_
+
+# Real-robot SpaceMouse HIRL / HIL data collection for the 01125 3D policy.
+# Override checkpoint and the two ZMQ endpoints at launch time.
+
+checkpoint: null
+exp_name: srsa_01125_hirl_collection
+
+num_envs: 1
+multiproc: false
+num_gpus: 1
+gpu_id: 0
+steps: 1
+
+eval_mode: real
+eval_real_mode: closed_loop
+eval_real_obs_server: tcp://localhost:5556
+eval_real_obs_socket_type: sub
+eval_real_obs_connect: true
+eval_real_obs_timeout_ms: 1000
+eval_real_steps: 74
+
+eval_zmq_server: tcp://localhost:5555
+eval_zmq_rate: 10
+eval_zmq_action_scale: 0.05
+eval_zmq_action_frame: world
+eval_zmq_command_frame: world
+eval_zmq_action_order: dx,dy,dz
+eval_zmq_send_done: true
+
+hil_collect_episodes: 20
+hil_collect_output_fp: data/real_hil_01125.pt
+hil_collect_manifest_fp: data/real_hil_01125_manifest.json
+hil_collect_action_keys: executed_action,actual_action,applied_action,intervene_action
+hil_collect_intervened_key: intervened
+hil_collect_require_actual_action: true
+
+compile: false
+mpc: true
+enable_wandb: false
+save_agent: false
+save_best: false
