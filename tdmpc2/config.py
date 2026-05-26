@@ -114,6 +114,9 @@ class Config:
 	srsa_axial_yaw_requirement: Optional[bool] = None
 	srsa_axial_reference_radius: Optional[float] = None
 	srsa_axial_reference_depth: Optional[float] = None
+	srsa_axial_reference_anchor_assembly_id: Optional[str] = None
+	srsa_axial_reference_anchor_task_type_id: Optional[int] = None
+	srsa_axial_recompute_manifest_task_vecs: bool = False
 	srsa_if_sbc: Optional[bool] = None
 	srsa_if_logging_eval: bool = False
 	srsa_eval_filename: Optional[str] = None
@@ -762,6 +765,85 @@ def make_isaaclab_task_info(cfg):
 	return info
 
 
+def _strip_explicit_task_vec_fields(item):
+	item = dict(item)
+	for key in ("task_vec", "task_vec_6", "axial_task_vec", "axial_task_vec_6", "task_param_vec"):
+		item.pop(key, None)
+	return item
+
+
+def _manifest_param_template_id(cfg, item):
+	for key in ("srsa_param_template_id", "srsa_task_template_id", "param_template_id", "template_id"):
+		value = _get_value(item, key, None)
+		if value is not None:
+			return int(value)
+	for key in ("srsa_param_template_id", "srsa_task_template_id", "eval_task_id"):
+		value = cfg.get(key, None)
+		if value is not None:
+			return int(value)
+	return None
+
+
+def _should_recompute_manifest_task_vec(cfg):
+	return (
+		bool(cfg.get("srsa_axial_recompute_manifest_task_vecs", False)) or
+		cfg.get("srsa_axial_reference_anchor_assembly_id", None) is not None
+	)
+
+
+def _manifest_task_template_entry(cfg, item):
+	assembly_id = _normalize_srsa_assembly_id(_get_value(item, "assembly_id", None))
+	template_fp = cfg.get("srsa_task_template_fp", None)
+	template_id = _manifest_param_template_id(cfg, item)
+	if assembly_id is None or template_fp is None or template_id is None:
+		return None
+
+	template_cfg = deepcopy(cfg)
+	_set_cfg_value(template_cfg, "assembly_id", assembly_id)
+	_set_cfg_value(template_cfg, "offline_manifest_fp", None)
+	templates = _load_srsa_task_template_tasks(template_cfg, template_fp)
+	for template in templates:
+		if int(template["task_id"]) == int(template_id):
+			template = _merge_template_params(template)
+			template["task_id"] = int(_get_value(item, "task_id", template.get("task_id", 0)))
+			template["assembly_id"] = assembly_id
+			if _get_value(item, "task_name", None) is not None:
+				template["task_name"] = _get_value(item, "task_name")
+			if _get_value(item, "eval_index", None) is not None:
+				template["eval_index"] = _get_value(item, "eval_index")
+			return template
+	raise ValueError(
+		f"Task template id {template_id} for assembly_id={assembly_id} was not found in {template_fp}."
+	)
+
+
+def _manifest_task_vec_from_template(cfg, item):
+	template = _manifest_task_template_entry(cfg, item)
+	if template is None:
+		return None
+	return make_axial_task_vec(cfg, template)
+
+
+def _manifest_task_vec(cfg, item):
+	if not _should_recompute_manifest_task_vec(cfg):
+		return make_axial_task_vec(cfg, item)
+
+	task_vec = _manifest_task_vec_from_template(cfg, item)
+	if task_vec is not None:
+		return task_vec
+
+	item_without_vec = _strip_explicit_task_vec_fields(item)
+	if _entry_has_task_params(item_without_vec):
+		return make_axial_task_vec(cfg, item_without_vec)
+
+	raise ValueError(
+		"Cannot recompute axial task_vec_6 for offline manifest entry. "
+		"Provide structured SRSA params in the manifest, or provide assembly_id with "
+		"srsa_task_template_fp and srsa_param_template_id/srsa_task_template_id. "
+		f"Entry keys: {sorted(item.keys())}"
+	)
+
+
 def make_offline_manifest_task_info(cfg, manifest_tasks):
 	"""Create task metadata from an offline multitask manifest."""
 	info = {}
@@ -773,7 +855,7 @@ def make_offline_manifest_task_info(cfg, manifest_tasks):
 			embedding = [0.0] * max(int(cfg.task_dim), 0)
 		info[task_name] = {
 			'text_embedding': embedding,
-			'task_vec_6': make_axial_task_vec(cfg, item),
+			'task_vec_6': _manifest_task_vec(cfg, item),
 			'max_episode_steps': int(item.get('max_episode_steps', cfg.isaaclab_max_episode_steps)),
 			'action_dim': srsa_policy_action_dim(cfg, item.get('action_dim', cfg.isaaclab_action_dim)),
 		}
@@ -945,6 +1027,41 @@ def _fixed_pair_from_float(value):
 	return f"{value:.12g},{value:.12g}"
 
 
+def _type_reference_anchor(cfg, template, mesh_path, plug_col, reference_radius_col, reference_depth_col):
+	anchor_assembly_id = _cfg_value(cfg, "srsa_axial_reference_anchor_assembly_id", None)
+	if anchor_assembly_id is None:
+		return None
+	task_type_id = int(template.get("task_type_id", _resolve_axial_task_type_id(cfg, template)))
+	anchor_task_type_id = _cfg_value(cfg, "srsa_axial_reference_anchor_task_type_id", None)
+	if anchor_task_type_id is None:
+		anchor_task_type_id = _resolve_axial_task_type_id(cfg, None)
+	anchor_task_type_id = int(anchor_task_type_id)
+	if task_type_id != anchor_task_type_id:
+		return None
+
+	anchor_assembly_id = _normalize_srsa_assembly_id(anchor_assembly_id)
+	with open(mesh_path, "r", encoding="utf-8", newline="") as f:
+		for anchor_row in csv.DictReader(f):
+			if _normalize_srsa_assembly_id(anchor_row.get("assembly_id")) != anchor_assembly_id:
+				continue
+			anchor_plug_diameter = _float_row_value(anchor_row, plug_col)
+			return {
+				"assembly_id": anchor_assembly_id,
+				"task_type_id": anchor_task_type_id,
+				"reference_radius": max(
+					1.0e-8,
+					_float_row_value(anchor_row, reference_radius_col, default=0.5 * anchor_plug_diameter),
+				),
+				"reference_depth": max(
+					1.0e-8,
+					_float_row_value(anchor_row, reference_depth_col, default=0.015),
+				),
+			}
+	raise ValueError(
+		f"Reference anchor assembly_id={anchor_assembly_id} was not found in mesh geometry CSV: {mesh_path}"
+	)
+
+
 def _build_mesh_template_entry(cfg, manifest, template, row, assembly_id, mesh_path):
 	mesh_cfg = manifest.get("mesh_geometry", {}) if isinstance(manifest, dict) else {}
 	plug_col = _mesh_option(cfg, mesh_cfg, "plug_diameter_column", "plug_diameter_column", "plug_xy_bbox_max")
@@ -963,8 +1080,22 @@ def _build_mesh_template_entry(cfg, manifest, template, row, assembly_id, mesh_p
 	clearance_base = _diametral_clearance_from_mesh(raw_clearance, clearance_col, clearance_mode)
 	clearance_base = max(0.0, clearance_base * float(_cfg_value(cfg, "srsa_mesh_clearance_scale", 1.0)))
 	depth_base = max(0.0, _float_row_value(row, depth_col) * float(_cfg_value(cfg, "srsa_mesh_depth_scale", 1.0)))
-	reference_radius = max(1.0e-8, _float_row_value(row, reference_radius_col, default=0.5 * plug_diameter))
-	reference_depth = max(1.0e-8, _float_row_value(row, reference_depth_col, default=depth_base or 0.015))
+	local_reference_radius = max(1.0e-8, _float_row_value(row, reference_radius_col, default=0.5 * plug_diameter))
+	local_reference_depth = max(1.0e-8, _float_row_value(row, reference_depth_col, default=depth_base or 0.015))
+	reference_anchor = _type_reference_anchor(
+		cfg,
+		template,
+		mesh_path,
+		plug_col,
+		reference_radius_col,
+		reference_depth_col,
+	)
+	if reference_anchor is None:
+		reference_radius = local_reference_radius
+		reference_depth = local_reference_depth
+	else:
+		reference_radius = reference_anchor["reference_radius"]
+		reference_depth = reference_anchor["reference_depth"]
 	clearance_multiplier = _template_multiplier(template, "clearance", 0, 1.0)
 	depth_multiplier = _template_multiplier(template, "depth", 1, 1.0)
 	diametral_clearance = max(0.0, clearance_base * clearance_multiplier)
@@ -995,6 +1126,9 @@ def _build_mesh_template_entry(cfg, manifest, template, row, assembly_id, mesh_p
 			"raw_clearance_proxy": raw_clearance,
 			"clearance_base_diametral": clearance_base,
 			"depth_base": depth_base,
+			"local_reference_radius": local_reference_radius,
+			"local_reference_depth": local_reference_depth,
+			"reference_anchor": reference_anchor,
 		},
 		"srsa_params": {
 			"task_family_name": template.get("task_family_name", "normal_fit"),
@@ -1257,6 +1391,10 @@ def _entry_has_task_params(entry):
 def resolve_eval_task_template(cfg, entry=None):
 	if entry is not None:
 		entry = _merge_template_params(entry)
+		if _should_recompute_manifest_task_vec(cfg):
+			template = _manifest_task_template_entry(cfg, entry)
+			if template is not None:
+				return template
 		if _entry_has_task_params(entry) or _cfg_value(cfg, "srsa_task_template_fp", None) is None:
 			return entry
 		task_id = _first_value(
@@ -1289,6 +1427,18 @@ def resolve_eval_task_template(cfg, entry=None):
 	task_id = _cfg_value(cfg, "eval_task_id", None)
 	if task_id is None:
 		task_id = _cfg_value(cfg, "srsa_task_template_id", None)
+	if (
+		task_id is not None and
+		_should_recompute_manifest_task_vec(cfg) and
+		_cfg_value(cfg, "offline_manifest_fp", None)
+	):
+		for item in _load_manifest_tasks(_cfg_value(cfg, "offline_manifest_fp")):
+			if int(item["task_id"]) != int(task_id):
+				continue
+			template = _manifest_task_template_entry(cfg, _merge_template_params(item))
+			if template is not None:
+				return template
+			break
 	template_tasks = _load_template_tasks(cfg)
 	if template_tasks is None or task_id is None:
 		return None

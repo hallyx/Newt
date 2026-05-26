@@ -70,6 +70,9 @@ srsa_vision_noise_z_jitter_std: 0.0
 isaaclab_canonical_use_visual_noise: false
 
 task_conditioning: axial_params
+srsa_axial_reference_anchor_assembly_id: "01125"
+srsa_axial_reference_anchor_task_type_id: 0
+srsa_axial_recompute_manifest_task_vecs: true
 eval_success_metric: relaxed
 srsa_eval_success_metric: relaxed
 strict_depth_fraction: 0.90

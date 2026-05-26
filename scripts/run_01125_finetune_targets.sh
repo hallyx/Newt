@@ -1,25 +1,90 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/gpuserver/hx/github/Newt
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=${REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}
+cd "${REPO_ROOT}"
 
 PYTHON=${PYTHON:-/home/gpuserver/miniconda3/envs/isaac51/bin/python}
-CHECKPOINT=${CHECKPOINT:-/home/gpuserver/hx/github/Newt/logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260523_163332_asm-01125/models/best.pt}
+ISAACLAB_DIR=${ISAACLAB_DIR:-/home/gpuserver/IsaacLab}
+SRSA_DIR=${SRSA_DIR:-/home/gpuserver/hx/github/srsa}
+CHECKPOINT=${CHECKPOINT:-${REPO_ROOT}/logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260523_163332_asm-01125/models/best.pt}
 TARGETS=${TARGETS:-"00004 00014 00062 00271"}
 STEPS=${STEPS:-600000}
 NUM_ENVS=${NUM_ENVS:-300}
 NUM_GPUS=${NUM_GPUS:-2}
 GPU_ID=${GPU_ID:-0}
+MULTIPROC=${MULTIPROC:-true}
 EVAL_FREQ=${EVAL_FREQ:-150000}
+SAVE_FREQ=${SAVE_FREQ:-${EVAL_FREQ}}
+EXP_NAME=${EXP_NAME:-srsa_axial_finetune_from_01125}
+EVAL_SUCCESS_METRIC=${EVAL_SUCCESS_METRIC:-strict}
+SRSA_TASK_TEMPLATE_FP=${SRSA_TASK_TEMPLATE_FP:-data/srsa_axial_task_templates.json}
+SRSA_MESH_GEOMETRY_FP=${SRSA_MESH_GEOMETRY_FP:-data/srsa_mesh_geometry_params.csv}
+SRSA_PARAM_TEMPLATE_ID=${SRSA_PARAM_TEMPLATE_ID:-2}
+REFERENCE_ANCHOR_ID=${REFERENCE_ANCHOR_ID:-01125}
+REFERENCE_ANCHOR_TYPE_ID=${REFERENCE_ANCHOR_TYPE_ID:-0}
 RUN_STAMP=${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}
-LOG_ROOT=${LOG_ROOT:-/home/gpuserver/hx/github/Newt/logs/finetune_01125_axial_hole/${RUN_STAMP}}
+LOG_ROOT=${LOG_ROOT:-${REPO_ROOT}/logs/finetune_01125_axial_hole/${RUN_STAMP}}
+
+make_abs_path() {
+  local path=$1
+  if [[ "${path}" == "~" ]]; then
+    path=${HOME}
+  elif [[ "${path}" == "~/"* ]]; then
+    path="${HOME}/${path#~/}"
+  fi
+  if [[ "${path}" == /* ]]; then
+    printf '%s\n' "${path}"
+  else
+    printf '%s/%s\n' "${REPO_ROOT}" "${path}"
+  fi
+}
+
+CHECKPOINT=$(make_abs_path "${CHECKPOINT}")
+SRSA_TASK_TEMPLATE_FP=$(make_abs_path "${SRSA_TASK_TEMPLATE_FP}")
+SRSA_MESH_GEOMETRY_FP=$(make_abs_path "${SRSA_MESH_GEOMETRY_FP}")
+
+if [[ ! -x "${PYTHON}" ]]; then
+  echo "[launcher] python not found or not executable: ${PYTHON}" >&2
+  exit 1
+fi
+if [[ ! -d "${ISAACLAB_DIR}" ]]; then
+  echo "[launcher] IsaacLab dir not found: ${ISAACLAB_DIR}" >&2
+  exit 1
+fi
+if [[ ! -d "${SRSA_DIR}" ]]; then
+  echo "[launcher] SRSA dir not found: ${SRSA_DIR}" >&2
+  exit 1
+fi
+if [[ ! -f "${CHECKPOINT}" ]]; then
+  echo "[launcher] checkpoint not found: ${CHECKPOINT}" >&2
+  exit 1
+fi
+if [[ ! -f "${SRSA_TASK_TEMPLATE_FP}" ]]; then
+  echo "[launcher] SRSA task template not found: ${SRSA_TASK_TEMPLATE_FP}" >&2
+  exit 1
+fi
+if [[ ! -f "${SRSA_MESH_GEOMETRY_FP}" ]]; then
+  echo "[launcher] SRSA mesh geometry CSV not found: ${SRSA_MESH_GEOMETRY_FP}" >&2
+  exit 1
+fi
 
 mkdir -p "${LOG_ROOT}"
 
 echo "[launcher] log_root=${LOG_ROOT}"
+echo "[launcher] repo_root=${REPO_ROOT}"
+echo "[launcher] python=${PYTHON}"
+echo "[launcher] isaaclab_dir=${ISAACLAB_DIR}"
+echo "[launcher] srsa_dir=${SRSA_DIR}"
 echo "[launcher] checkpoint=${CHECKPOINT}"
 echo "[launcher] targets=${TARGETS}"
-echo "[launcher] steps=${STEPS} num_envs=${NUM_ENVS} num_gpus=${NUM_GPUS} gpu_id=${GPU_ID}"
+echo "[launcher] steps=${STEPS} num_envs=${NUM_ENVS} multiproc=${MULTIPROC} num_gpus=${NUM_GPUS} gpu_id=${GPU_ID}"
+echo "[launcher] eval_freq=${EVAL_FREQ} save_freq=${SAVE_FREQ} eval_success_metric=${EVAL_SUCCESS_METRIC}"
+echo "[launcher] srsa_task_template_fp=${SRSA_TASK_TEMPLATE_FP}"
+echo "[launcher] srsa_mesh_geometry_fp=${SRSA_MESH_GEOMETRY_FP}"
+echo "[launcher] srsa_param_template_id=${SRSA_PARAM_TEMPLATE_ID}"
+echo "[launcher] reference_anchor=${REFERENCE_ANCHOR_ID} type=${REFERENCE_ANCHOR_TYPE_ID}"
 
 for ASM in ${TARGETS}; do
   ASM_LOG="${LOG_ROOT}/asm-${ASM}.log"
@@ -31,14 +96,21 @@ for ASM in ${TARGETS}; do
     isaaclab_backend=srsa \
     task=isaaclab-srsa-assembly \
     assembly_id="${ASM}" \
-    srsa_dir=/home/gpuserver/hx/github/srsa \
+    isaaclab_dir="${ISAACLAB_DIR}" \
+    srsa_dir="${SRSA_DIR}" \
+    srsa_task_template_fp="${SRSA_TASK_TEMPLATE_FP}" \
+    srsa_mesh_geometry_fp="${SRSA_MESH_GEOMETRY_FP}" \
+    srsa_param_template_id="${SRSA_PARAM_TEMPLATE_ID}" \
+    eval_task_template_exact=true \
+    eval_task_template_print=true \
     srsa_sparse_reward=false \
     isaaclab_disable_imitation_reward=false \
+    srsa_align_direct_reward_success=true \
     srsa_if_sbc=false \
     num_envs="${NUM_ENVS}" \
     isaaclab_gpu_collision_stack_size=268435456 \
     gpu_id="${GPU_ID}" \
-    multiproc=true \
+    multiproc="${MULTIPROC}" \
     num_gpus="${NUM_GPUS}" \
     steps="${STEPS}" \
     model_size=S \
@@ -59,12 +131,6 @@ for ASM in ${TARGETS}; do
     srsa_task_param_obs=false \
     srsa_task_param_obs_mode=task_vec \
     srsa_enable_axial_task_param_sampler=true \
-    srsa_axial_fixed_plug_scale=true \
-    srsa_axial_clearance_base=0.000114 \
-    'srsa_axial_clearance_depth_templates="0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"' \
-    srsa_axial_clearance_jitter_ratio=0.10 \
-    srsa_axial_depth_base=0.015 \
-    srsa_axial_depth_jitter_ratio=0.10 \
     'srsa_axial_init_error_xy_range="0.009,0.0010"' \
     'srsa_axial_init_error_z_range="0.0010,0.0020"' \
     'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"' \
@@ -79,7 +145,11 @@ for ASM in ${TARGETS}; do
     srsa_vision_noise_z_jitter_std=0.0 \
     isaaclab_canonical_use_visual_noise=false \
     task_conditioning=axial_params \
-    eval_success_metric=strict \
+    srsa_axial_reference_anchor_assembly_id="${REFERENCE_ANCHOR_ID}" \
+    srsa_axial_reference_anchor_task_type_id="${REFERENCE_ANCHOR_TYPE_ID}" \
+    srsa_axial_recompute_manifest_task_vecs=true \
+    eval_success_metric="${EVAL_SUCCESS_METRIC}" \
+    srsa_eval_success_metric="${EVAL_SUCCESS_METRIC}" \
     strict_depth_fraction=0.90 \
     strict_success_steps=10 \
     strict_lateral_tol_min=0.0005 \
@@ -91,8 +161,8 @@ for ASM in ${TARGETS}; do
     skip_initial_eval=true \
     eval_episodes=1 \
     eval_freq="${EVAL_FREQ}" \
-    save_freq="${EVAL_FREQ}" \
-    exp_name=srsa_axial_finetune_from_01125 \
+    save_freq="${SAVE_FREQ}" \
+    exp_name="${EXP_NAME}" \
     contact_history_enabled=true \
     contact_history_len=4 \
     contact_context_dim=64 \
