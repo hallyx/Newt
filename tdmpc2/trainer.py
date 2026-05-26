@@ -83,12 +83,15 @@ class Trainer():
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
 		elapsed_time = time() - self._start_time
-		return dict(
+		metrics = dict(
 			step=self._step,
 			episode=self._ep_idx,
 			elapsed_time=elapsed_time,
 			steps_per_second=self._step / elapsed_time
 		)
+		if hasattr(self.agent, 'latent_residual_metrics'):
+			metrics.update(self.agent.latent_residual_metrics())
+		return metrics
 
 	def _uses_runtime_task_vec(self):
 		return (

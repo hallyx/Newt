@@ -390,6 +390,27 @@ class Config:
 	contact_context_dim: int = 64
 	contact_history_hidden_dim: int = 128
 	contact_history_layers: int = 2
+	latent_residual_enabled: bool = False
+	latent_residual_freeze_base_wm: bool = True
+	latent_residual_hidden_dim: int = 256
+	latent_residual_num_layers: int = 2
+	latent_residual_alpha: float = 0.1
+	latent_residual_alpha_warmup_steps: int = 0
+	latent_residual_clip: float = 0.1
+	latent_residual_gate_mode: str = "always"
+	latent_residual_contact_force_threshold: float = 0.0
+	latent_residual_use_force: bool = True
+	latent_residual_use_task_vec: bool = True
+	latent_residual_use_z_next_base: bool = True
+	latent_residual_train_only_contact_phase: bool = False
+	latent_residual_reg_coef: float = 1.0e-4
+	latent_residual_depth_loss_coef: float = 0.0
+	latent_residual_radial_loss_coef: float = 0.0
+	latent_residual_jam_loss_coef: float = 0.0
+	latent_residual_force_loss_coef: float = 0.0
+	latent_residual_force_history_len: Optional[int] = None
+	latent_residual_force_dim: Optional[int] = None
+	latent_residual_contact_feature_dim: int = 0
 	num_q: int = 5
 	simnorm_dim: int = 8
 	disable_task_emb: bool = False
@@ -1373,6 +1394,16 @@ def parse_cfg(cfg):
 			f"Unknown task_conditioning={cfg.task_conditioning!r}. "
 			"Use axial_params, id_embedding, or none."
 		)
+	cfg.latent_residual_gate_mode = str(cfg.get('latent_residual_gate_mode', 'always')).lower()
+	if cfg.latent_residual_gate_mode not in {"always", "contact"}:
+		raise ValueError(
+			f"Unknown latent_residual_gate_mode={cfg.latent_residual_gate_mode!r}. "
+			"Use always or contact."
+		)
+	if cfg.get('latent_residual_force_history_len', None) is None:
+		cfg.latent_residual_force_history_len = int(cfg.get('contact_history_len', 4))
+	if cfg.get('latent_residual_force_dim', None) is None:
+		cfg.latent_residual_force_dim = int(cfg.get('contact_force_dim', 6))
 	mode = eval_mode(cfg)
 	if mode in REAL_EVAL_MODES:
 		cfg.eval_mode = "real"

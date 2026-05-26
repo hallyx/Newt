@@ -511,6 +511,28 @@ def api_model_conversion(target_state_dict, source_state_dict):
 		if '._contact_encoder.' in key or key.startswith('_contact_encoder.'):
 			if key not in source_state_dict or source_state_dict[key].shape != target_state_dict[key].shape:
 				source_state_dict[key] = target_state_dict[key]
+		if (
+			key.endswith('_latent_residual_alpha_scale') or
+			'._latent_residual_adapter.' in key or
+			key.startswith('_latent_residual_adapter.')
+		):
+			if key not in source_state_dict or source_state_dict[key].shape != target_state_dict[key].shape:
+				source_state_dict[key] = target_state_dict[key]
+
+	if not any(
+		key.endswith('_latent_residual_alpha_scale') or
+		'._latent_residual_adapter.' in key or
+		key.startswith('_latent_residual_adapter.')
+		for key in target_state_dict.keys()
+	):
+		source_state_dict = {
+			key: value for key, value in source_state_dict.items()
+			if not (
+				key.endswith('_latent_residual_alpha_scale') or
+				'._latent_residual_adapter.' in key or
+				key.startswith('_latent_residual_adapter.')
+			)
+		}
 
 	return source_state_dict
 

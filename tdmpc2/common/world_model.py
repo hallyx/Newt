@@ -4,6 +4,7 @@ import torch.nn as nn
 from common import layers, math, init
 from models.axial_task_encoder import AxialTaskEncoder
 from models.contact_history_encoder import ContactHistoryEncoder
+from models.latent_residual import TaskConditionedLatentContactResidualAdapter
 from tensordict import TensorDict
 
 
@@ -20,6 +21,8 @@ class WorldModel(nn.Module):
 		self._task_emb = None
 		self._task_encoder = None
 		self._contact_encoder = None
+		self._latent_residual_adapter = None
+		self._latent_residual_enabled = bool(cfg.get('latent_residual_enabled', False))
 		self._contact_context_dim = 0
 		self._task_conditioning = str(cfg.get('task_conditioning', 'axial_params')).lower()
 		if self._task_conditioning in {'axial', 'axial_params', 'param', 'param_only'}:
@@ -84,10 +87,47 @@ class WorldModel(nn.Module):
 		self._encoder = layers.enc(cfg)
 		dynamics_in_dim = cfg.latent_dim + cfg.action_dim + cfg.task_dim + self._contact_context_dim
 		self._dynamics = layers.mlp(dynamics_in_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+		if self._latent_residual_enabled:
+			force_history_len = cfg.get('latent_residual_force_history_len', None)
+			force_dim = cfg.get('latent_residual_force_dim', None)
+			if force_history_len is None:
+				force_history_len = cfg.get('contact_history_len', 4)
+			if force_dim is None:
+				force_dim = cfg.get('contact_force_dim', 6)
+			self._latent_residual_adapter = TaskConditionedLatentContactResidualAdapter(
+				latent_dim=cfg.latent_dim,
+				action_dim=cfg.action_dim,
+				task_dim=cfg.task_dim,
+				force_history_len=int(force_history_len),
+				force_dim=int(force_dim),
+				contact_feature_dim=int(cfg.get('latent_residual_contact_feature_dim', 0)),
+				hidden_dim=int(cfg.get('latent_residual_hidden_dim', 256)),
+				num_layers=int(cfg.get('latent_residual_num_layers', 2)),
+				alpha=float(cfg.get('latent_residual_alpha', 0.1)),
+				delta_z_clip=float(cfg.get('latent_residual_clip', 0.1)),
+				gate_mode=str(cfg.get('latent_residual_gate_mode', 'always')),
+				use_force=bool(cfg.get('latent_residual_use_force', True)),
+				use_task_vec=bool(cfg.get('latent_residual_use_task_vec', True)),
+				use_z_next_base=bool(cfg.get('latent_residual_use_z_next_base', True)),
+				contact_force_threshold=float(cfg.get('latent_residual_contact_force_threshold', 0.0)),
+			)
+			self.register_buffer("_latent_residual_alpha_scale", torch.ones(()))
+			if cfg.rank == 0:
+				print(
+					'Using TaskConditionedLatentContactResidualAdapter: '
+					f'in_dim={self._latent_residual_adapter.input_dim} '
+					f'hidden={cfg.get("latent_residual_hidden_dim", 256)} '
+					f'layers={cfg.get("latent_residual_num_layers", 2)} '
+					f'alpha={cfg.get("latent_residual_alpha", 0.1)} '
+					f'clip={cfg.get("latent_residual_clip", 0.1)} '
+					f'gate={cfg.get("latent_residual_gate_mode", "always")}.'
+				)
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.QOnlineTargetEnsemble(cfg)
 		self.apply(init.weight_init)
+		if self._latent_residual_adapter is not None:
+			self._latent_residual_adapter.reset_residual_to_zero()
 		init.zero_(self._reward[-1].weight)
 		for i in range(cfg.num_q):
 			init.zero_(self._Qs.online._Qs[i][-1].weight)
@@ -103,6 +143,8 @@ class WorldModel(nn.Module):
 			modules.append(('Axial task encoder', self._task_encoder))
 		if self._contact_encoder is not None:
 			modules.append(('Contact history encoder', self._contact_encoder))
+		if self._latent_residual_adapter is not None:
+			modules.append(('Latent contact residual adapter', self._latent_residual_adapter))
 		modules.extend([
 			('Encoder', self._encoder),
 			('Dynamics', self._dynamics),
@@ -119,6 +161,25 @@ class WorldModel(nn.Module):
 	@property
 	def total_params(self):
 		return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+	def latent_residual_parameters(self):
+		if self._latent_residual_adapter is None:
+			return []
+		return list(self._latent_residual_adapter.parameters())
+
+	def freeze_base_world_model(self):
+		"""
+		Freeze the original world model trunk and leave only the residual adapter trainable.
+		"""
+		for name, param in self.named_parameters():
+			param.requires_grad_(name.startswith('_latent_residual_adapter.'))
+		if self._latent_residual_adapter is not None:
+			for param in self._latent_residual_adapter.parameters():
+				param.requires_grad_(True)
+
+	def set_latent_residual_alpha_scale(self, value):
+		if hasattr(self, '_latent_residual_alpha_scale'):
+			self._latent_residual_alpha_scale.fill_(float(value))
 
 	def to(self, *args, **kwargs):
 		super().to(*args, **kwargs)
@@ -324,11 +385,15 @@ class WorldModel(nn.Module):
 		force_history=None,
 		action_history=None,
 		ee_delta_history=None,
+		residual_force_history=None,
+		contact_feature=None,
+		return_info=False,
 	):
 		"""
 		Predicts the next latent state given the current latent state and action.
 		"""
-		z = self.task_emb(z, task)
+		z_base = z
+		z = self.task_emb(z_base, task)
 		z = self.contact_emb(
 			z,
 			contact_context=contact_context,
@@ -337,7 +402,26 @@ class WorldModel(nn.Module):
 			ee_delta_history=ee_delta_history,
 		)
 		z = torch.cat([z, a], dim=-1)
-		return self._dynamics(z)
+		z_next_base = self._dynamics(z)
+		if self._latent_residual_adapter is None:
+			if return_info:
+				return z_next_base, {"_z_next_base": z_next_base}
+			return z_next_base
+		task_context = self.task_context(z_base, task) if bool(self.cfg.get('latent_residual_use_task_vec', True)) else None
+		force_hist = residual_force_history if residual_force_history is not None else force_history
+		z_next_adapted, info = self._latent_residual_adapter(
+			z=z_base,
+			action=a,
+			z_next_base=z_next_base,
+			task_vec=task_context,
+			force_hist=force_hist,
+			contact_feature=contact_feature,
+			alpha_scale=getattr(self, '_latent_residual_alpha_scale', None),
+		)
+		if return_info:
+			info["_z_next_base"] = z_next_base
+			return z_next_adapted, info
+		return z_next_adapted
 
 	def reward(self, z, a, task):
 		"""

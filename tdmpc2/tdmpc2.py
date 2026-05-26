@@ -22,19 +22,58 @@ class TDMPC2(torch.nn.Module):
 		self.cfg.action_dim = cfg.action_dim
 		self.device = torch.device(f'cuda:{self.cfg.device_id}')
 		self.model = model
-		optim_groups = [
-			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
-			{'params': self.model._dynamics.parameters()},
-			{'params': self.model._reward.parameters()},
-			{'params': self.model._Qs.online.parameters()},
-			{'params': self.model._pi.parameters()},
-		]
-		if getattr(self.model, '_task_encoder', None) is not None:
-			optim_groups.append({'params': self.model._task_encoder.parameters()})
-		if getattr(self.model, '_task_emb', None) is not None and self.model._task_emb.weight.requires_grad:
-			optim_groups.append({'params': self.model._task_emb.parameters()})
-		if getattr(self.model, '_contact_encoder', None) is not None:
-			optim_groups.append({'params': self.model._contact_encoder.parameters()})
+		self._latent_residual_enabled = bool(getattr(self.model, '_latent_residual_enabled', False))
+		self._latent_residual_freeze_base = (
+			self._latent_residual_enabled and
+			bool(self.cfg.get('latent_residual_freeze_base_wm', True))
+		)
+		self._last_latent_residual_info = None
+		self._residual_force_history = None
+		self._optim_step = 0
+		if self._latent_residual_freeze_base:
+			self.model.freeze_base_world_model()
+		if self._latent_residual_enabled and self.cfg.compile:
+			self.cfg.compile = False
+			if self.cfg.rank == 0:
+				print('Disabled torch.compile for latent residual adapter mode.')
+		if self._latent_residual_enabled and self.cfg.rank == 0:
+			print(
+				'Latent residual adapter enabled: '
+				f'freeze_base_wm={self._latent_residual_freeze_base}, '
+				f'alpha={self.cfg.get("latent_residual_alpha", 0.1)}, '
+				f'gate={self.cfg.get("latent_residual_gate_mode", "always")}.'
+			)
+			if not bool(self.cfg.get('mpc', True)):
+				print(
+					'Actor-only mode is active: latent residual changes model prediction, '
+					'but actions will not improve unless MPC or an action residual/distillation path is used.'
+				)
+			if str(self.cfg.get('latent_residual_gate_mode', 'always')).lower() == 'contact':
+				print(
+					'Latent residual contact gate will use force/contact features when available; '
+					'calls without them fall back to always-on residual gating.'
+				)
+		if self._latent_residual_freeze_base:
+			residual_params = list(self.model.latent_residual_parameters())
+			if len(residual_params) == 0:
+				raise ValueError("latent_residual_freeze_base_wm=true but no residual adapter parameters exist.")
+			optim_groups = [{'params': residual_params}]
+		else:
+			optim_groups = [
+				{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
+				{'params': self.model._dynamics.parameters()},
+				{'params': self.model._reward.parameters()},
+				{'params': self.model._Qs.online.parameters()},
+				{'params': self.model._pi.parameters()},
+			]
+			if getattr(self.model, '_task_encoder', None) is not None:
+				optim_groups.append({'params': self.model._task_encoder.parameters()})
+			if getattr(self.model, '_task_emb', None) is not None and self.model._task_emb.weight.requires_grad:
+				optim_groups.append({'params': self.model._task_emb.parameters()})
+			if getattr(self.model, '_contact_encoder', None) is not None:
+				optim_groups.append({'params': self.model._contact_encoder.parameters()})
+			if self._latent_residual_enabled:
+				optim_groups.append({'params': self.model.latent_residual_parameters()})
 		self.optim = torch.optim.Adam(optim_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
 		if self.cfg.lr_schedule:
@@ -124,6 +163,111 @@ class TDMPC2(torch.nn.Module):
 			return task.unsqueeze(1).repeat(1, repeats, 1).reshape(-1, task.shape[-1])
 		return task.unsqueeze(1).repeat(1, repeats).reshape(-1)
 
+	def _set_latent_residual_alpha_scale(self, step=None):
+		if not self._latent_residual_enabled:
+			return
+		warmup = int(self.cfg.get('latent_residual_alpha_warmup_steps', 0) or 0)
+		if warmup <= 0:
+			scale = 1.0
+		else:
+			step_value = self._optim_step if step is None else int(step)
+			scale = min(1.0, max(0.0, float(step_value + 1) / float(warmup)))
+		self.model.set_latent_residual_alpha_scale(scale)
+
+	def _residual_force_dim(self):
+		return int(self.cfg.get('latent_residual_force_dim', self.cfg.get('contact_force_dim', 6)) or 0)
+
+	def _residual_force_history_len(self):
+		return int(self.cfg.get('latent_residual_force_history_len', self.cfg.get('contact_history_len', 4)) or 0)
+
+	def _extract_residual_force_obs(self, obs):
+		if not (self._latent_residual_enabled and bool(self.cfg.get('latent_residual_use_force', True))):
+			return None
+		if isinstance(obs, TensorDict):
+			if 'state' not in obs.keys():
+				return None
+			obs = obs['state']
+		if obs is None or not torch.is_tensor(obs) or obs.shape[-1] <= 14:
+			return None
+		if not bool(self.cfg.get('isaaclab_canonical_append_force', False)):
+			return None
+		force_dim = self._residual_force_dim()
+		if force_dim <= 0:
+			return None
+		available_dim = min(
+			int(obs.shape[-1]) - 14,
+			max(1, int(self.cfg.get('isaaclab_canonical_force_dim', min(force_dim, 3)) or min(force_dim, 3))),
+		)
+		if available_dim <= 0:
+			return None
+		force = obs[..., 14:14 + available_dim].to(device=self.device, dtype=torch.float32, non_blocking=True)
+		if available_dim < force_dim:
+			pad = force.new_zeros(*force.shape[:-1], force_dim - available_dim)
+			force = torch.cat([force, pad], dim=-1)
+		elif available_dim > force_dim:
+			force = force[..., :force_dim]
+		return force
+
+	def _update_residual_force_history(self, obs, t0=None):
+		force = self._extract_residual_force_obs(obs)
+		if force is None:
+			self._residual_force_history = None
+			return None
+		history_len = self._residual_force_history_len()
+		if history_len <= 0:
+			return None
+		batch_shape = force.shape[:-1]
+		expected_shape = (*batch_shape, history_len, force.shape[-1])
+		if self._residual_force_history is None or tuple(self._residual_force_history.shape) != tuple(expected_shape):
+			self._residual_force_history = force.new_zeros(*expected_shape)
+		if t0 is not None:
+			t0 = t0.to(device=force.device, dtype=torch.bool, non_blocking=True)
+			while t0.ndim < len(batch_shape):
+				t0 = t0.unsqueeze(-1)
+			reset = t0.reshape(*batch_shape, 1, 1)
+			self._residual_force_history = torch.where(
+				reset,
+				torch.zeros_like(self._residual_force_history),
+				self._residual_force_history,
+			)
+		self._residual_force_history = torch.cat(
+			[self._residual_force_history[..., 1:, :], force.unsqueeze(-2)],
+			dim=-2,
+		)
+		return self._residual_force_history
+
+	def _loss_residual_force_histories(self, obs):
+		force = self._extract_residual_force_obs(obs)
+		if force is None:
+			return [None] * self.cfg.horizon
+		history_len = self._residual_force_history_len()
+		if history_len <= 0:
+			return [None] * self.cfg.horizon
+		histories = []
+		for t in range(self.cfg.horizon):
+			start = max(0, t - history_len + 1)
+			window = force[start:t+1]
+			if window.shape[0] < history_len:
+				pad = window.new_zeros(history_len - window.shape[0], *window.shape[1:])
+				window = torch.cat([pad, window], dim=0)
+			histories.append(window.permute(1, 0, 2).contiguous())
+		return histories
+
+	def latent_residual_metrics(self):
+		if not self._latent_residual_enabled:
+			return {}
+		out = {
+			"latent_residual_enabled": torch.tensor(1.0, device=self.device),
+			"latent_residual_alpha": torch.tensor(float(self.cfg.get('latent_residual_alpha', 0.1)), device=self.device),
+		}
+		if self._last_latent_residual_info:
+			out.update({
+				k: v.detach() if torch.is_tensor(v) else torch.tensor(float(v), device=self.device)
+				for k, v in self._last_latent_residual_info.items()
+				if not str(k).startswith('_')
+			})
+		return out
+
 	def save(self, fp):
 		"""
 		Save state dict of the agent to filepath.
@@ -185,6 +329,8 @@ class TDMPC2(torch.nn.Module):
 			out = self.model.load_state_dict(state_dict)
 			print(out)
 			print('Successfully loaded checkpoint after converting from legacy API.')
+		if self._latent_residual_freeze_base:
+			self.model.freeze_base_world_model()
 		return
 	
 	@torch.no_grad()
@@ -219,19 +365,45 @@ class TDMPC2(torch.nn.Module):
 			task = torch.tensor([task], device=self.device)
 		if task is not None and task.device != self.device:
 			task = task.to(self.device, non_blocking=True)
+		self._set_latent_residual_alpha_scale(step)
+		residual_force_history = self._update_residual_force_history(obs, t0=t0)
 		mpc = mpc if mpc is not None else self.cfg.mpc
 		if mpc:
 			if t0.device != self.device:
 				t0 = t0.to(self.device, non_blocking=True)
-			action, info = self.plan(obs, t0=t0, step=step, eval_mode=eval_mode, task=task)
+			action, info = self.plan(
+				obs,
+				t0=t0,
+				step=step,
+				eval_mode=eval_mode,
+				task=task,
+				residual_force_history=residual_force_history,
+			)
 		else:
 			action, action_info = self.pi(obs, task)
 			if eval_mode:
 				action = action_info["mean"]
+			if self._latent_residual_enabled:
+				z = self.model.encode(obs, task)
+				_, residual_info = self.model.next(
+					z,
+					action,
+					task,
+					residual_force_history=residual_force_history,
+					return_info=True,
+				)
+				residual_info.pop("_z_next_base", None)
+				self._last_latent_residual_info = residual_info
 			info = TensorDict({
 				"pi_mean": action_info["mean"].mean(),
 				"pi_std": action_info["log_std"].exp().mean(),
 			})
+			if self._latent_residual_enabled and self._last_latent_residual_info:
+				info.update(TensorDict({
+					k: v.detach()
+					for k, v in self._last_latent_residual_info.items()
+					if torch.is_tensor(v) and not str(k).startswith('_')
+				}))
 		if (
 			self.cfg.task.startswith('isaaclab-') or
 			self.cfg.isaaclab_env_id.startswith('Isaac-') or
@@ -242,13 +414,18 @@ class TDMPC2(torch.nn.Module):
 		return action.cpu(), info
 	
 	@torch.no_grad()
-	def _estimate_value(self, z, actions, task):
+	def _estimate_value(self, z, actions, task, residual_force_history=None):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G = torch.zeros(self.cfg.num_envs, self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
 		discount = torch.ones(self.cfg.num_envs, self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
 		for t in range(self.cfg.horizon):
 			reward = math.two_hot_inv(self.model.reward(z, actions[:, t], task), self.cfg)
-			z = self.model.next(z, actions[:, t], task)
+			z = self.model.next(
+				z,
+				actions[:, t],
+				task,
+				residual_force_history=residual_force_history,
+			)
 			G = G + discount * reward
 			discount_update = self._discount_for(task, z.shape[:-1])
 			discount = discount * discount_update
@@ -257,20 +434,25 @@ class TDMPC2(torch.nn.Module):
 		return G + discount * value
 	
 	@torch.no_grad()
-	def _sample_pi_trajs(self, z, task=None):
+	def _sample_pi_trajs(self, z, task=None, residual_force_history=None):
 		pi_actions = torch.empty(self.cfg.num_envs, self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 		_z = z.unsqueeze(1).repeat(1, self.cfg.num_pi_trajs, 1).view(self.cfg.num_envs * self.cfg.num_pi_trajs, -1)
 		_task = self._repeat_task_for_trajs(task, self.cfg.num_pi_trajs)
+		_force_history = None
+		if residual_force_history is not None:
+			_force_history = residual_force_history.unsqueeze(1).repeat(
+				1, self.cfg.num_pi_trajs, 1, 1
+			).view(self.cfg.num_envs * self.cfg.num_pi_trajs, *residual_force_history.shape[-2:])
 		for t in range(self.cfg.horizon - 1):
 			a, _ = self.model.pi(_z, _task)
 			pi_actions[:, t] = a.view(self.cfg.num_envs, self.cfg.num_pi_trajs, self.cfg.action_dim)
-			_z = self.model.next(_z, a, _task)
+			_z = self.model.next(_z, a, _task, residual_force_history=_force_history)
 		a, _ = self.model.pi(_z, _task)
 		pi_actions[:, -1] = a.view(self.cfg.num_envs, self.cfg.num_pi_trajs, self.cfg.action_dim)
 		return pi_actions
 	
 	@torch.no_grad()
-	def _mppi(self, z, pi_actions, task, mean, std):
+	def _mppi(self, z, pi_actions, task, mean, std, residual_force_history=None):
 		"""
 		MPPI loop.
 		"""
@@ -289,7 +471,7 @@ class TDMPC2(torch.nn.Module):
 			actions = actions * action_mask
 
 			# Compute elite actions
-			value = self._estimate_value(z, actions, task).nan_to_num(0)
+			value = self._estimate_value(z, actions, task, residual_force_history=residual_force_history).nan_to_num(0)
 			elite_idxs = torch.topk(value.squeeze(2), self.cfg.num_elites, dim=1).indices
 			elite_value = torch.gather(value, 1, elite_idxs.unsqueeze(2))
 			elite_actions = actions.gather(
@@ -318,7 +500,7 @@ class TDMPC2(torch.nn.Module):
 		return action.clamp(-1, 1), mean, std_out
 
 	@torch.no_grad()
-	def plan(self, obs, t0, step, eval_mode=False, task=None):
+	def plan(self, obs, t0, step, eval_mode=False, task=None, residual_force_history=None):
 		"""
 		Plan a sequence of actions using the learned world model.
 
@@ -333,14 +515,17 @@ class TDMPC2(torch.nn.Module):
 			torch.Tensor: Action to take in the environment.
 		"""
 		# Sample policy trajectories
-		z = self.model.encode(obs, task)
+		z0 = self.model.encode(obs, task)
 		if self.cfg.num_pi_trajs > 0:
-			pi_actions = self.sample_pi_trajs(z, task)
+			pi_actions = self.sample_pi_trajs(z0, task, residual_force_history=residual_force_history)
 		else:
 			pi_actions = None
 
 		# Initialize state and parameters
-		z = z.unsqueeze(1).repeat(1, self.cfg.num_samples, 1)
+		z = z0.unsqueeze(1).repeat(1, self.cfg.num_samples, 1)
+		mppi_force_history = None
+		if residual_force_history is not None:
+			mppi_force_history = residual_force_history.unsqueeze(1)
 		shifted = torch.cat([self._prev_mean[:, 1:], torch.zeros_like(self._prev_mean[:, :1])], dim=1)
 		base_mean = torch.where(t0.view(self._prev_mean.shape[0], 1, 1), torch.zeros_like(shifted), shifted)
 		base_std = torch.full((self.cfg.num_envs, self.cfg.horizon, self.cfg.action_dim), self.cfg.max_std, device=self.device)
@@ -366,7 +551,14 @@ class TDMPC2(torch.nn.Module):
 			mean, std, w = base_mean, base_std, 0.
 
 		# Optimize with MPPI
-		action, out_mean, out_std = self.mppi(z, pi_actions, task, mean, std)
+		action, out_mean, out_std = self.mppi(
+			z,
+			pi_actions,
+			task,
+			mean,
+			std,
+			residual_force_history=mppi_force_history,
+		)
 		self._prev_mean = out_mean.clone()
 		if not eval_mode:
 			action = (action + out_std * torch.randn_like(action)).clamp(-1, 1)
@@ -375,6 +567,21 @@ class TDMPC2(torch.nn.Module):
 			"pi_mean": pi_actions.mean() if self.cfg.num_pi_trajs > 0 else None,
 			"pi_std": pi_actions.std() if self.cfg.num_pi_trajs > 0 else None,
 		})
+		if self._latent_residual_enabled:
+			_, residual_info = self.model.next(
+				z0,
+				action,
+				task,
+				residual_force_history=residual_force_history,
+				return_info=True,
+			)
+			residual_info.pop("_z_next_base", None)
+			self._last_latent_residual_info = residual_info
+			info.update(TensorDict({
+				k: v.detach()
+				for k, v in residual_info.items()
+				if torch.is_tensor(v) and not str(k).startswith('_')
+			}))
 
 		return action, info
 		
@@ -463,9 +670,43 @@ class TDMPC2(torch.nn.Module):
 		z = self.model.encode(obs[0], task[0])
 		zs[0] = z
 		consistency_loss = 0
+		consistency_loss_base = 0
+		latent_residual_reg_loss = 0
+		residual_infos = []
+		residual_force_histories = self._loss_residual_force_histories(obs)
 		for t, (_action, _next_z, _task) in enumerate(zip(action.unbind(0), next_z.unbind(0), task.unbind(0))):
-			z = self.model.next(z, _action, _task)
-			consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.rho[t]
+			if self._latent_residual_enabled:
+				z, residual_info = self.model.next(
+					z,
+					_action,
+					_task,
+					residual_force_history=residual_force_histories[t],
+					return_info=True,
+				)
+				z_next_base = residual_info.pop("_z_next_base")
+				consistency_loss_base = consistency_loss_base + F.mse_loss(z_next_base.detach(), _next_z) * self.rho[t]
+				if bool(self.cfg.get('latent_residual_train_only_contact_phase', False)):
+					gate = residual_info.get("_gate", None)
+					if gate is not None:
+						weight = gate.detach()
+						denom = weight.mean().clamp_min(1.0e-6)
+						per_sample_err = (z - _next_z).pow(2).mean(dim=-1, keepdim=True)
+						consistency_loss = consistency_loss + ((per_sample_err * weight).mean() / denom) * self.rho[t]
+						delta_sq = residual_info.get("_delta_z_sq", None)
+						if delta_sq is not None:
+							latent_residual_reg_loss = latent_residual_reg_loss + ((delta_sq * weight).mean() / denom) * self.rho[t]
+						else:
+							latent_residual_reg_loss = latent_residual_reg_loss + residual_info["delta_z_l2"] * self.rho[t]
+					else:
+						consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.rho[t]
+						latent_residual_reg_loss = latent_residual_reg_loss + residual_info["delta_z_l2"] * self.rho[t]
+				else:
+					consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.rho[t]
+					latent_residual_reg_loss = latent_residual_reg_loss + residual_info["delta_z_l2"] * self.rho[t]
+				residual_infos.append(residual_info)
+			else:
+				z = self.model.next(z, _action, _task)
+				consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.rho[t]
 			zs[t+1] = z
 
 		# Predictions
@@ -505,6 +746,8 @@ class TDMPC2(torch.nn.Module):
 			self.cfg.value_coef * value_loss +
 			self.cfg.prior_coef * pi_prior_loss
 		)
+		if self._latent_residual_enabled:
+			total_loss = total_loss + float(self.cfg.get('latent_residual_reg_coef', 1.0e-4)) * latent_residual_reg_loss
 
 		info = TensorDict({
 			"consistency_loss": consistency_loss,
@@ -512,6 +755,23 @@ class TDMPC2(torch.nn.Module):
 			"value_loss": value_loss,
 			"total_loss": total_loss,
 		})
+		if self._latent_residual_enabled:
+			info.update(TensorDict({
+				"consistency_loss_base": consistency_loss_base,
+				"consistency_loss_adapted": consistency_loss,
+				"latent_residual_reg_loss": latent_residual_reg_loss,
+				"latent_residual_reg_coef": torch.tensor(
+					float(self.cfg.get('latent_residual_reg_coef', 1.0e-4)),
+					device=self.device,
+				),
+			}))
+			if len(residual_infos) > 0:
+				for key in residual_infos[0].keys():
+					if key.startswith('_'):
+						continue
+					values = [step_info[key] for step_info in residual_infos if key in step_info]
+					if len(values) > 0 and torch.is_tensor(values[0]):
+						info[key] = torch.stack(values).mean()
 		info.update(pi_info)
 
 		return total_loss, zs.detach(), info.detach()
@@ -523,6 +783,7 @@ class TDMPC2(torch.nn.Module):
 		# Step the learning rate scheduler
 		if self.cfg.lr_schedule:
 			self.scheduler.step()
+		self._set_latent_residual_alpha_scale()
 
 		# Compute loss
 		torch.compiler.cudagraph_mark_step_begin()
@@ -537,10 +798,11 @@ class TDMPC2(torch.nn.Module):
 		# Update target Q-functions
 		self.model.soft_update_target_Q()
 
-		if self.maxq_pi:
+		if self.maxq_pi and not self._latent_residual_freeze_base:
 			# Max-Q policy update
 			pi_info = self.update_pi(zs, action, task[:1])
 			info.update(pi_info)
+		self._optim_step += 1
 		
 		# Return training statistics
 		self.model.eval()
