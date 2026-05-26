@@ -431,6 +431,8 @@ def _real_action_for_command_frame(action: torch.Tensor, obs: torch.Tensor, cfg,
 
 	command = action.clone()
 	for start, stop in ((0, 3), (3, 6)):
+		if action.shape[-1] <= start:
+			continue
 		part = action[..., start:stop]
 		if policy_frame == "socket":
 			part_socket = part

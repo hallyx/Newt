@@ -141,10 +141,14 @@ class ZMQActionPublisher:
 			delta = self._select_action(action)
 			raw_delta = list(delta)
 			delta = self._shape_delta(delta, step)
-		if len(delta) == 3:
+		expected_dim = len(self.action_order)
+		if len(delta) == 3 and expected_dim == 6:
 			delta = [*delta, 0.0, 0.0, 0.0]
-		if len(delta) != 6:
-			raise ValueError(f"Expected a 6D action for ZMQ robot control, got {len(delta)}D.")
+		if len(delta) != expected_dim:
+			raise ValueError(
+				f"Expected a {expected_dim}D action for ZMQ robot control "
+				f"with action_order={self.action_order}, got {len(delta)}D."
+			)
 		self._maybe_sleep_for_rate()
 		message = {
 			"seq": self._seq,
@@ -194,7 +198,7 @@ class ZMQActionPublisher:
 		if not self._send_done:
 			return
 		return self.send_action(
-			[0.0] * 6,
+			[0.0] * len(self.action_order),
 			step=step,
 			episode_step=episode_step,
 			task_id=task_id,
