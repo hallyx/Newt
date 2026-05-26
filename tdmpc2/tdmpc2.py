@@ -30,6 +30,9 @@ class TDMPC2(torch.nn.Module):
 		self._last_latent_residual_info = None
 		self._residual_force_history = None
 		self._optim_step = 0
+		self._proximal_reference = None
+		self._proximal_reference_filter = ("_encoder", "_dynamics")
+		self._warned_missing_proximal_reference = False
 		if self._latent_residual_freeze_base:
 			self.model.freeze_base_world_model()
 		if self._latent_residual_enabled and self.cfg.compile:
@@ -107,6 +110,61 @@ class TDMPC2(torch.nn.Module):
 			self.sample_pi_trajs = self._sample_pi_trajs
 			self.mppi = self._mppi
 			self.loss_fn = self._loss_fn
+
+	def set_proximal_reference(self, module_filter=("_encoder", "_dynamics")):
+		"""
+		Store a frozen copy of selected trunk parameters for optional continual-learning
+		proximal regularization.
+		"""
+		self._proximal_reference_filter = tuple(str(item) for item in module_filter)
+		self._proximal_reference = {}
+		for name, param in self.model.named_parameters():
+			if any(token in name for token in self._proximal_reference_filter):
+				self._proximal_reference[name] = param.detach().clone()
+		if self.cfg.rank == 0:
+			print(
+				"Stored proximal reference for "
+				f"{len(self._proximal_reference)} parameter tensors "
+				f"(filter={self._proximal_reference_filter})."
+			)
+
+	def _proximal_loss(self):
+		if not bool(self.cfg.get('multitask_prox_reg_enabled', False)):
+			return None
+		if not self._proximal_reference:
+			if self.cfg.rank == 0 and not self._warned_missing_proximal_reference:
+				print(
+					"Warning: multitask_prox_reg_enabled=true but no proximal reference is set; "
+					"skipping proximal loss."
+				)
+				self._warned_missing_proximal_reference = True
+			return None
+		loss = torch.zeros((), device=self.device)
+		for name, param in self.model.named_parameters():
+			ref = self._proximal_reference.get(name, None)
+			if ref is None:
+				continue
+			loss = loss + (param - ref.to(param.device, non_blocking=True)).pow(2).mean()
+		return loss
+
+	def _checkpoint_metadata(self):
+		metadata = {
+			"task_conditioning": self.cfg.get("task_conditioning", None),
+			"num_global_tasks": self.cfg.get("num_global_tasks", None),
+		}
+		if bool(self.cfg.get("multitask_continuation_enabled", False)):
+			metadata.update({
+				"multitask_continuation_enabled": True,
+				"task_ids": list(self.cfg.get("multitask_task_ids", []) or []),
+				"anchor_task_id": self.cfg.get("multitask_anchor_task_id", None),
+				"active_tasks": list(self.cfg.get("multitask_current_active_tasks", []) or []),
+				"task_vec_dim": int(self.cfg.get("axial_task_vec_dim", 6)),
+				"reference_checkpoint_path": self.cfg.get(
+					"multitask_reference_checkpoint_path",
+					self.cfg.get("checkpoint", ""),
+				),
+			})
+		return metadata
 
 	def _is_task_vec(self, task):
 		return (
@@ -280,6 +338,7 @@ class TDMPC2(torch.nn.Module):
 			"optim": self.optim.state_dict(),
 			"pi_optim": self.pi_optim.state_dict(),
 			"scale": self.scale.state_dict(),
+			"metadata": self._checkpoint_metadata(),
 		}, fp)
 
 	def load(self, fp):
@@ -788,6 +847,14 @@ class TDMPC2(torch.nn.Module):
 		# Compute loss
 		torch.compiler.cudagraph_mark_step_begin()
 		total_loss, zs, info = self.loss_fn(obs, action, reward, task)
+		proximal_loss = self._proximal_loss()
+		if proximal_loss is not None:
+			proximal_coef = float(self.cfg.get('multitask_prox_reg_coef', 1.0e-4))
+			total_loss = total_loss + proximal_coef * proximal_loss
+			info.update(TensorDict({
+				"multitask_proximal_loss": proximal_loss.detach(),
+				"multitask_proximal_coef": torch.tensor(proximal_coef, device=self.device),
+			}))
 
 		# Update model
 		total_loss.backward()

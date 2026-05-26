@@ -958,6 +958,63 @@ data/offline_manifest_policy_rollouts_from_00186.json
 data/offline_policy_rollouts_from_00186_compact.pt
 ```
 
+## 方案 A：共享模型 multitask continuation 的路径语义
+
+`checkpoint` 只表示初始化模型，例如 01125 的 `models/best.pt`。  
+`multitask_replay_manifest_fp` 表示离线 replay 数据清单，必须是 `.json`，不能指向 `models/best.pt` 或任何模型目录。
+
+推荐命令形态：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/train.py \
+  checkpoint=/path/to/01125/models/best.pt \
+  multitask_replay_manifest_fp=/path/to/data/offline_manifest_family.json \
+  exp_name=srsa_axial_family_continuation \
+  multitask_continuation_enabled=true \
+  multitask_task_ids='["01125","00004","00014","00062","00271"]' \
+  multitask_anchor_task_id=01125 \
+  multitask_curriculum_mode=progressive \
+  multitask_stage_steps=200000 \
+  multitask_sampling_mode=balanced \
+  task_conditioning=axial_params \
+  enable_wandb=false
+```
+
+`offline_manifest_fp` 仍作为兼容别名存在，但方案 A 新命令优先写
+`multitask_replay_manifest_fp`，避免和模型 checkpoint 混淆。若还没有 replay manifest，先运行 rollout
+采集脚本，或用已有 per-task rollout `.pt` 生成 manifest：
+
+`multitask_auto_collect_replay` 默认是 `false`，此时必须显式提供 replay manifest。若要边采集边继续训练，设置
+`multitask_auto_collect_replay=true` 并省略 `multitask_replay_manifest_fp`。当前 SRSA/IsaacLab wrapper
+中 `assembly_id` 是建环境时固定的，因此自动采集路径采用阶段式 fallback：
+
+1. 用当前共享 checkpoint 分别为 active tasks 采集 rollout；
+2. 把每个 stage 的 manifest 累积合并，形成持续扩展的 replay pool；
+3. 用 `MultiTaskReplayPool` 从所有 active tasks 混采更新同一个共享模型；
+4. 保存新的共享 checkpoint，进入下一 stage 继续采集。
+
+如果同时提供 `multitask_replay_manifest_fp` 和 `multitask_auto_collect_replay=true`，该 manifest 会作为初始
+replay 种子，后续 stage 的新 rollout 会继续累积进去。
+
+示例：
+
+```bash
+MULTITASK_AUTO_COLLECT_REPLAY=true \
+TASK_IDS="01125 00004 00014 00062 00271" \
+scripts/run_01125_family_multitask_continuation.sh
+```
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/scripts/build_family_offline_manifest.py \
+  --assembly-ids 01125 00004 00014 00062 00271 \
+  --source-template '/path/to/policy_rollouts/{assembly_id}/policy_eval_rollouts.pt' \
+  --output-manifest-fp data/offline_manifest_01125_family_multitask.json \
+  --srsa-mesh-geometry-fp docs/srsa_mesh_geometry_params.csv \
+  --expected-obs-dim 17 \
+  --expected-action-dim 3 \
+  --overwrite
+```
+
 离线 RL 微调完成后，对 manifest 中不同任务批量测试：
 
 更完整的 eval 参数说明、仿真/真机命令和排查 checklist 见：

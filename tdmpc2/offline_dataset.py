@@ -284,16 +284,19 @@ class OfflineSequenceDataset:
 		self.last_sample_task_counts = counts
 		return starts
 
-	@property
-	def stats(self) -> OfflineDatasetStats:
-		return self._stats
+	def _sample_task_valid_starts(self, task_id: int, batch_size: Optional[int] = None):
+		task_id = int(task_id)
+		task_starts = self._valid_starts_by_task.get(task_id, [])
+		if not task_starts:
+			raise ValueError(f"No valid subsequences available for task_id={task_id}.")
+		batch_size = self._batch_size if batch_size is None else int(batch_size)
+		indices = torch.randint(0, len(task_starts), (batch_size,))
+		starts = [task_starts[idx] for idx in indices.tolist()]
+		self.last_sample_task_counts = {task_id: batch_size}
+		return starts
 
-	def __len__(self) -> int:
-		return len(self._valid_starts)
-
-	def sample(self, device: Optional[str | torch.device] = None):
+	def _sample_from_starts(self, starts, device: Optional[str | torch.device] = None):
 		device = torch.device(device) if device is not None else self._device
-		starts = self._sample_valid_starts()
 
 		obs_batch = []
 		action_batch = []
@@ -325,3 +328,25 @@ class OfflineSequenceDataset:
 		reward = torch.stack(reward_batch, dim=1).to(device, non_blocking=True)
 		task = torch.stack(task_batch, dim=1).to(device, non_blocking=True)
 		return obs.contiguous(), action.contiguous(), reward.contiguous(), task
+
+	@property
+	def stats(self) -> OfflineDatasetStats:
+		return self._stats
+
+	@property
+	def task_ids(self) -> list[int]:
+		return sorted(self._valid_starts_by_task.keys())
+
+	def valid_start_count(self, task_id: int) -> int:
+		return len(self._valid_starts_by_task.get(int(task_id), []))
+
+	def __len__(self) -> int:
+		return len(self._valid_starts)
+
+	def sample(self, device: Optional[str | torch.device] = None):
+		starts = self._sample_valid_starts()
+		return self._sample_from_starts(starts, device=device)
+
+	def sample_task(self, task_id: int, batch_size: Optional[int] = None, device: Optional[str | torch.device] = None):
+		starts = self._sample_task_valid_starts(task_id, batch_size=batch_size)
+		return self._sample_from_starts(starts, device=device)

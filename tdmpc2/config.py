@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Any
 
@@ -248,6 +248,31 @@ class Config:
 	offline_log_freq: int = 200
 	offline_save_freq: int = 5_000
 	offline_eval_freq: int = 0
+
+	# scheme A: single shared model continual multi-task fine-tuning
+	multitask_continuation_enabled: bool = False
+	multitask_replay_manifest_fp: Optional[str] = None
+	multitask_auto_collect_replay: bool = False
+	multitask_task_ids: Any = field(default_factory=lambda: ["01125", "00004", "00014", "00062", "00271"])
+	multitask_anchor_task_id: str = "01125"
+	multitask_curriculum_mode: str = "progressive"
+	multitask_stage_steps: int = 200_000
+	multitask_total_steps: Optional[int] = None
+	multitask_sampling_mode: str = "balanced"
+	multitask_task_sampling_weights: Any = None
+	multitask_anchor_min_ratio: float = 0.2
+	multitask_new_task_min_ratio: float = 0.2
+	multitask_hard_case_ratio: float = 0.2
+	multitask_eval_task_ids: Any = field(default_factory=lambda: ["01125", "00004", "00014", "00062", "00271"])
+	multitask_eval_interval: int = 50_000
+	multitask_save_per_task_metrics: bool = True
+	multitask_forgetting_metric_enabled: bool = True
+	multitask_reference_checkpoint_path: str = ""
+	multitask_prox_reg_enabled: bool = False
+	multitask_prox_reg_coef: float = 1.0e-4
+	multitask_distill_old_policy_enabled: bool = False
+	multitask_distill_coef: float = 1.0e-3
+	multitask_no_forgetting_max_forgetting: float = 0.05
 
 	# policy rollout collection for offline RL
 	collect_assembly_ids: Any = "[00004,00014,00062,00271]"
@@ -894,6 +919,89 @@ def _cfg_value(cfg, key, default=None):
 	if hasattr(cfg, 'get'):
 		return cfg.get(key, default)
 	return getattr(cfg, key, default)
+
+
+def _absolute_cfg_path(path_value):
+	if path_value is None or str(path_value).strip() == "":
+		return None
+	path_text = str(path_value).strip().strip("'\"")
+	try:
+		return Path(hydra.utils.to_absolute_path(path_text)).expanduser().resolve()
+	except Exception:
+		path = Path(path_text).expanduser()
+		return (Path.cwd() / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def _same_cfg_path(left, right) -> bool:
+	return _absolute_cfg_path(left) == _absolute_cfg_path(right)
+
+
+def _looks_like_model_checkpoint_path(path: Path) -> bool:
+	parts = {part.lower() for part in path.parts}
+	name = path.name.lower()
+	return path.suffix.lower() == ".pt" or "models" in parts or name in {"best.pt", "latest.pt", "final.pt"}
+
+
+def _sync_multitask_replay_manifest_alias(cfg):
+	alias_fp = _cfg_value(cfg, "multitask_replay_manifest_fp", None)
+	offline_fp = _cfg_value(cfg, "offline_manifest_fp", None)
+	if alias_fp and offline_fp and not _same_cfg_path(alias_fp, offline_fp):
+		raise ValueError(
+			"Both multitask_replay_manifest_fp and offline_manifest_fp were provided, but they point to "
+			"different files. Use multitask_replay_manifest_fp for Scheme A replay manifests and reserve "
+			"checkpoint for the warm-start model .pt."
+		)
+	manifest_fp = alias_fp or offline_fp
+	if manifest_fp:
+		manifest_path = _absolute_cfg_path(manifest_fp)
+		_set_cfg_value(cfg, "multitask_replay_manifest_fp", str(manifest_path))
+		_set_cfg_value(cfg, "offline_manifest_fp", str(manifest_path))
+	return _cfg_value(cfg, "multitask_replay_manifest_fp", None)
+
+
+def _validate_multitask_continuation_paths(cfg):
+	if not _cfg_value(cfg, "multitask_continuation_enabled", False):
+		if _cfg_value(cfg, "multitask_replay_manifest_fp", None):
+			_sync_multitask_replay_manifest_alias(cfg)
+		return
+	manifest_fp = _sync_multitask_replay_manifest_alias(cfg)
+
+	checkpoint_fp = _cfg_value(cfg, "checkpoint", None)
+	if not checkpoint_fp:
+		raise ValueError(
+			"multitask_continuation_enabled=true requires checkpoint=<warm-start model .pt>. "
+			"checkpoint is only the initialization model, for example /.../models/best.pt."
+		)
+	checkpoint_path = _absolute_cfg_path(checkpoint_fp)
+	if checkpoint_path.suffix.lower() != ".pt":
+		raise ValueError(
+			f"checkpoint={checkpoint_path} is invalid: checkpoint must point to an initialization model .pt file, "
+			"for example /.../models/best.pt."
+		)
+	if not checkpoint_path.is_file():
+		raise FileNotFoundError(f"checkpoint model .pt file not found: {checkpoint_path}")
+	_set_cfg_value(cfg, "checkpoint", str(checkpoint_path))
+	if not _cfg_value(cfg, "multitask_reference_checkpoint_path", None):
+		_set_cfg_value(cfg, "multitask_reference_checkpoint_path", str(checkpoint_path))
+
+	if not manifest_fp:
+		if bool(_cfg_value(cfg, "multitask_auto_collect_replay", False)):
+			return
+		raise ValueError(
+			"Offline multitask continuation requires a replay manifest. To train without an existing manifest, "
+			"enable online rollout collection or run the replay collection script first."
+		)
+	manifest_path = _absolute_cfg_path(manifest_fp)
+	if _looks_like_model_checkpoint_path(manifest_path) or manifest_path.suffix.lower() != ".json":
+		raise ValueError(
+			f"multitask_replay_manifest_fp={manifest_path} is invalid: manifest should point to a replay/data "
+			"manifest json, not a model checkpoint. Use checkpoint=/.../models/best.pt for the warm-start model "
+			"and multitask_replay_manifest_fp=/.../data/offline_manifest_family.json for replay data."
+		)
+	if not manifest_path.is_file():
+		raise FileNotFoundError(f"multitask replay manifest .json file not found: {manifest_path}")
+	_set_cfg_value(cfg, "multitask_replay_manifest_fp", str(manifest_path))
+	_set_cfg_value(cfg, "offline_manifest_fp", str(manifest_path))
 
 
 def _normalize_srsa_assembly_id(value):
@@ -1566,6 +1674,24 @@ def parse_cfg(cfg):
 		)
 	if cfg.get('eval_success_metric', None) is not None:
 		cfg.srsa_eval_success_metric = cfg.eval_success_metric
+	_validate_multitask_continuation_paths(cfg)
+	if cfg.get('multitask_continuation_enabled', False):
+		if bool(cfg.get('latent_residual_enabled', False)):
+			raise ValueError(
+				"multitask_continuation_enabled is for the shared family model path; "
+				"leave latent_residual_enabled=false for this simulation multitask stage."
+			)
+		curriculum_mode = str(cfg.get('multitask_curriculum_mode', 'progressive')).lower()
+		if curriculum_mode not in {"progressive", "all_at_once"}:
+			raise ValueError("multitask_curriculum_mode must be one of: progressive, all_at_once.")
+		sampling_mode = str(cfg.get('multitask_sampling_mode', 'balanced')).lower()
+		if sampling_mode not in {"balanced", "weighted", "proportional"}:
+			raise ValueError("multitask_sampling_mode must be one of: balanced, weighted, proportional.")
+		if bool(cfg.get('multitask_distill_old_policy_enabled', False)):
+			raise ValueError(
+				"multitask_distill_old_policy_enabled is intentionally not part of the default "
+				"Scheme A path. Use replay/proximal regularization for this implementation."
+			)
 	angle_tol_rad = math.radians(float(cfg.get('strict_angle_tol_deg', 3.0)))
 	cfg.srsa_process_success_depth_ratio = float(cfg.get('strict_depth_fraction', 0.90))
 	cfg.srsa_process_success_stable_steps = int(cfg.get('strict_success_steps', 10))

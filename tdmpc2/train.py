@@ -209,6 +209,52 @@ def launch(cfg: Config):
 	cfg = parse_cfg(cfg)
 	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.work_dir)
 
+	if cfg.get('multitask_continuation_enabled', False):
+		if bool(cfg.get('multitask_auto_collect_replay', False)):
+			from auto_multitask_continuation import run_auto_collect_multitask_continuation
+			run_auto_collect_multitask_continuation(cfg)
+			print(colored('Auto-collect multitask continuation completed successfully.', 'green', attrs=['bold']))
+			return
+		replay_manifest_fp = cfg.get('multitask_replay_manifest_fp', None) or cfg.get('offline_manifest_fp', None)
+		if not replay_manifest_fp:
+			raise ValueError(
+				"Offline multitask continuation requires a replay manifest. To train without an existing manifest, "
+				"enable online rollout collection or run the replay collection script first."
+			)
+		from offline_train import (
+			_offline_gpu_id,
+			_resolve_offline_dataset_fp,
+			_make_offline_dataset,
+			_make_hard_case_dataset,
+			_prepare_cfg_from_dataset,
+			_run_multitask_continuation,
+			make_agent as make_offline_agent,
+		)
+		set_seed(cfg.seed)
+		offline_gpu = _offline_gpu_id(cfg)
+		torch.cuda.set_device(offline_gpu)
+		offline_dataset_fp = _resolve_offline_dataset_fp(cfg)
+		offline_device = f'cuda:{offline_gpu}'
+		dataset = _make_offline_dataset(
+			cfg,
+			offline_dataset_fp,
+			filter_mode=cfg.get('offline_filter_mode', 'all'),
+			device=offline_device,
+		)
+		hard_dataset = _make_hard_case_dataset(cfg, offline_dataset_fp, device=offline_device)
+		cfg = _prepare_cfg_from_dataset(cfg, dataset)
+		logger = Logger(cfg)
+		agent = make_offline_agent(cfg)
+		if not cfg.checkpoint:
+			raise ValueError('multitask_continuation_enabled=true requires `checkpoint` for the 01125 warm start.')
+		if not os.path.exists(cfg.checkpoint):
+			raise FileNotFoundError(f'Checkpoint file not found: {cfg.checkpoint}')
+		agent.load(cfg.checkpoint)
+		print(colored(f'Loaded shared warm-start checkpoint from {cfg.checkpoint}.', 'blue', attrs=['bold']))
+		_run_multitask_continuation(agent, dataset, hard_dataset, logger, cfg)
+		print(colored('Multitask continuation completed successfully.', 'green', attrs=['bold']))
+		return
+
 	# Set batch size
 	available_gpus = torch.cuda.device_count() - cfg.gpu_id
 	assert available_gpus > 0, \
