@@ -1128,3 +1128,42 @@ python tdmpc2/batch_eval_tasks.py \
   eval_success_metric=relaxed \
   batch_eval_output_dir=data/success_compare \
   batch_eval_overwrite=true
+
+
+python3 tdmpc2/eval.py   eval_mode=real   eval_real_mode=closed_loop   eval_real_obs_server=tcp://192.168.10.37:5556   eval_real_obs_socket_type=sub   eval_zmq_server=tcp://192.168.10.37:5555   model_size=S   assembly_id=00186   srsa_task_template_fp=data/srsa_axial_task_templates.json   srsa_param_template_id=2   srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv   eval_real_state_format=libfranka   eval_real_use_msg_task_vec=false   'eval_real_socket_pos=[0.4943, -0.0111, 0.3259]'   'eval_real_socket_quat_wxyz=[1, 0.0, 0.0, 0.0]'   eval_real_force_scale=50.0   eval_real_zero_missing_force=true   eval_zmq_action_frame=base   eval_zmq_command_frame=tcp   eval_zmq_action_scale=1.0   eval_zmq_max_trans_delta=0.5   eval_zmq_max_rot_delta=0.3   eval_zmq_warmup_steps=5   eval_zmq_send_timeout_ms=100   eval_zmq_rate=10   eval_real_steps=150   eval_real_obs_timeout_ms=5000   eval_real_debug_log_fp=logs/real_closed_loop_debug_01125.jsonl   compile=false   checkpoint=logs/srsa_axial_relaxed/best.pt
+
+python3 tdmpc2/eval.py   eval_mode=real   eval_real_mode=closed_loop   eval_real_obs_server=tcp://192.168.10.37:5556   eval_real_obs_socket_type=sub   eval_zmq_server=tcp://192.168.10.37:5555   model_size=S   assembly_id=00186   srsa_task_template_fp=data/srsa_axial_task_templates.json   srsa_param_template_id=2   srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv   eval_real_state_format=libfranka   eval_real_use_msg_task_vec=false   'eval_real_socket_pos=[0.4763, -0.0085, 0.3254]'   'eval_real_socket_quat_wxyz=[1, 0.0, 0.0, 0.0]'   eval_real_force_scale=50.0   eval_real_zero_missing_force=true   eval_zmq_action_frame=base   eval_zmq_command_frame=tcp   eval_zmq_action_scale=1.0   eval_zmq_max_trans_delta=0.5   eval_zmq_max_rot_delta=0.3   eval_zmq_warmup_steps=5   eval_zmq_send_timeout_ms=100   eval_zmq_rate=10   eval_real_steps=150   eval_real_obs_timeout_ms=5000   eval_real_debug_log_fp=logs/real_closed_loop_debug_00186.jsonl   compile=false   checkpoint=logs/srsa_axial_relaxed/00186/best.pt
+
+python3 tdmpc2/collect_real_hil_rollouts.py \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://192.168.10.37:5556 \
+  eval_real_obs_socket_type=sub \
+  eval_zmq_server=tcp://192.168.10.37:5555 \
+  model_size=S \
+  assembly_id=00186 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_param_template_id=2 \
+  srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
+  eval_real_state_format=libfranka \
+  eval_real_use_msg_task_vec=false \
+  'eval_real_socket_pos=[0.4763, -0.0085, 0.3254]' \
+  'eval_real_socket_quat_wxyz=[1, 0.0, 0.0, 0.0]' \
+  eval_real_force_scale=50.0 \
+  eval_real_zero_missing_force=true \
+  eval_zmq_action_frame=base \
+  eval_zmq_command_frame=tcp \
+  eval_zmq_action_scale=0.0001 \
+  eval_zmq_max_trans_delta=0.00005 \
+  eval_zmq_max_rot_delta=0.00003 \
+  eval_zmq_warmup_steps=5 \
+  eval_zmq_send_timeout_ms=100 \
+  eval_zmq_rate=10 \
+  eval_real_steps=150 \
+  eval_real_obs_timeout_ms=5000 \
+  hil_collect_episodes=20 \
+  hil_collect_output_fp=data/real_hil_00186.pt \
+  hil_collect_manifest_fp=data/real_hil_00186_manifest.json \
+  hil_collect_require_actual_action=true \
+  compile=false \
+  checkpoint=logs/srsa_axial_relaxed/00186/best.pt
