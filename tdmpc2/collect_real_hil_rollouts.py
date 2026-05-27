@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from time import monotonic
 from typing import Optional
@@ -21,6 +22,7 @@ from common import set_seed
 from common.logger import Logger
 from common.world_model import WorldModel
 from config import Config, parse_cfg
+from eval import _real_action_for_command_frame, _shape_real_policy_action
 from offline_io import summarize_compact_dataset
 from tdmpc2 import TDMPC2
 from zmq_action_publisher import make_eval_zmq_observation_receiver, make_eval_zmq_publisher
@@ -45,7 +47,7 @@ def _get_state_tensor(state_dict, key: str):
 	return None
 
 
-def _infer_checkpoint_io(checkpoint_fp):
+def _infer_checkpoint_io(checkpoint_fp, cfg=None):
 	state_dict = _checkpoint_state_dict(checkpoint_fp)
 	enc_weight = _get_state_tensor(state_dict, "_encoder.state.0.weight")
 	if enc_weight is None:
@@ -70,12 +72,49 @@ def _infer_checkpoint_io(checkpoint_fp):
 		)
 	action_masks = _get_state_tensor(state_dict, "_action_masks")
 	action_dim = int(action_masks.shape[-1]) if action_masks is not None else 6
-	return {
+	compat = {
 		"obs_dim": obs_dim,
 		"action_dim": action_dim,
 		"task_dim": task_dim,
 		"task_conditioning": task_conditioning,
 	}
+	contact_input = _get_state_tensor(state_dict, "_contact_encoder.net.0.weight")
+	if contact_input is not None:
+		linear_indices = []
+		for key, value in state_dict.items():
+			match = re.match(r"^(?:module\.)?_contact_encoder\.net\.(\d+)\.weight$", key)
+			if match and getattr(value, "ndim", 0) == 2:
+				linear_indices.append(int(match.group(1)))
+		final_linear_idx = max(linear_indices) if linear_indices else 0
+		final_linear = _get_state_tensor(state_dict, f"_contact_encoder.net.{final_linear_idx}.weight")
+		history_len = int(cfg.get("contact_history_len", 4) if cfg is not None else 4)
+		force_dim = int(cfg.get("contact_force_dim", 6) if cfg is not None else 6)
+		input_dim = int(contact_input.shape[1])
+		if history_len <= 0 or input_dim % history_len != 0:
+			raise ValueError(
+				f"Could not infer contact history dimensions from checkpoint={checkpoint_fp}: "
+				f"contact_input_dim={input_dim}, contact_history_len={history_len}."
+			)
+		step_dim = input_dim // history_len
+		contact_action_dim = min(action_dim, step_dim)
+		ee_delta_dim = step_dim - force_dim - contact_action_dim
+		if ee_delta_dim < 0:
+			force_dim = max(0, step_dim - contact_action_dim)
+			ee_delta_dim = 0
+		compat.update({
+			"contact_history_enabled": True,
+			"contact_history_len": history_len,
+			"contact_force_dim": force_dim,
+			"contact_action_dim": contact_action_dim,
+			"contact_ee_delta_dim": ee_delta_dim,
+			"contact_history_use_ee_delta": ee_delta_dim > 0,
+			"contact_context_dim": int(final_linear.shape[0]) if final_linear is not None else 64,
+			"contact_history_hidden_dim": int(contact_input.shape[0]),
+			"contact_history_layers": max(1, final_linear_idx // 3),
+		})
+	else:
+		compat["contact_history_enabled"] = False
+	return compat
 
 
 def _configure_real_hil_cfg(cfg):
@@ -84,7 +123,7 @@ def _configure_real_hil_cfg(cfg):
 	if cfg.num_envs != 1:
 		print(colored("Forcing num_envs=1 for real HIL collection.", "yellow", attrs=["bold"]))
 		cfg.num_envs = 1
-	compat = _infer_checkpoint_io(cfg.checkpoint)
+	compat = _infer_checkpoint_io(cfg.checkpoint, cfg)
 	if str(cfg.task_conditioning).lower() != compat["task_conditioning"]:
 		raise ValueError(
 			"Real HIL config does not match checkpoint task conditioning: "
@@ -96,6 +135,19 @@ def _configure_real_hil_cfg(cfg):
 	cfg.obs = "state"
 	cfg.obs_shape = {"state": (int(compat["obs_dim"]),)}
 	cfg.action_dim = int(compat["action_dim"])
+	if bool(compat.get("contact_history_enabled", False)):
+		cfg.contact_history_enabled = True
+		for key in (
+			"contact_history_len",
+			"contact_force_dim",
+			"contact_action_dim",
+			"contact_ee_delta_dim",
+			"contact_history_use_ee_delta",
+			"contact_context_dim",
+			"contact_history_hidden_dim",
+			"contact_history_layers",
+		):
+			setattr(cfg, key, compat[key])
 	cfg.action_dims = [cfg.action_dim] if not cfg.action_dims else [
 		cfg.action_dim if int(dim) <= 0 else min(int(dim), cfg.action_dim)
 		for dim in cfg.action_dims
@@ -171,12 +223,50 @@ def _executed_action_from_message(message: dict, cfg, fallback: torch.Tensor) ->
 			continue
 		action = _as_float_tensor(message[key], shape=tuple(fallback.shape), name=key)
 		return action, True, key
+	for key in ("executed_delta", "actual_delta", "applied_delta"):
+		if key not in message:
+			continue
+		delta = torch.as_tensor(message[key], dtype=torch.float32).reshape(-1)
+		if delta.numel() == 3:
+			delta = torch.cat([delta, delta.new_zeros(3)])
+		if delta.numel() < fallback.numel():
+			raise ValueError(
+				f"Expected `{key}` with at least {fallback.numel()} values, got {delta.numel()}."
+			)
+		return delta.contiguous(), True, key
 	if bool(cfg.get("hil_collect_require_actual_action", False)):
 		raise KeyError(
 			"Robot observation message did not include an executed action. "
-			f"Expected one of {tuple(_action_key_candidates(cfg))}."
+			f"Expected one of {tuple(_action_key_candidates(cfg))} or executed_delta/actual_delta/applied_delta."
 		)
 	return fallback.detach().cpu().to(torch.float32).reshape(tuple(fallback.shape)).contiguous(), False, None
+
+
+def _maybe_convert_executed_action_to_policy_frame(
+	action: torch.Tensor,
+	message: dict,
+	cfg,
+	obs: torch.Tensor,
+	obs_receiver,
+	action_key: Optional[str],
+) -> torch.Tensor:
+	frame = None
+	if action_key:
+		frame = message.get(f"{action_key}_frame", None)
+	if frame is None:
+		frame = message.get("executed_action_frame", message.get("executed_command_frame", None))
+	if frame is None:
+		return action
+	policy_frame = str(cfg.get("eval_zmq_action_frame", "socket"))
+	if str(frame).strip().lower() == policy_frame.strip().lower():
+		return action
+	reverse_cfg = {
+		"eval_zmq_action_frame": frame,
+		"eval_zmq_command_frame": policy_frame,
+	}
+	action_device = action.to(device=obs.device, dtype=obs.dtype).reshape(1, -1)
+	converted = _real_action_for_command_frame(action_device, obs, reverse_cfg, obs_receiver)
+	return converted.detach().cpu().reshape(tuple(action.shape)).to(torch.float32).contiguous()
 
 
 def _intervened_from_message(message: dict, cfg, action_key: Optional[str]) -> bool:
@@ -331,11 +421,17 @@ def collect_real_hil(agent: TDMPC2, cfg):
 					task=model_tasks,
 					mpc=use_mpc,
 				)
+				policy_delta = _shape_real_policy_action(policy_action, step_id, cfg)
+				command_action = _real_action_for_command_frame(policy_delta, obs, cfg, obs_receiver)
 				action_publisher.send_action(
-					policy_action,
+					command_action,
 					step=total_steps,
 					episode_step=step_id,
 					task_id=policy_task_id,
+					state_seq=message.get("seq", None),
+					state_timestamp=message.get("timestamp", None),
+					preprocessed=True,
+					raw_action=policy_delta.detach().reshape(-1).to("cpu", dtype=torch.float32).tolist(),
 				)
 				next_message = obs_receiver.recv()
 				next_obs = obs_receiver.obs_tensor(next_message, obs_dim=obs_dim, device=device)
@@ -346,6 +442,18 @@ def collect_real_hil(agent: TDMPC2, cfg):
 					cfg,
 					policy_action_cpu,
 				)
+				executed_action = _maybe_convert_executed_action_to_policy_frame(
+					executed_action,
+					next_message,
+					cfg,
+					obs,
+					obs_receiver,
+					action_key,
+				)
+				if action_key is not None and "delta" in action_key:
+					executed_action = executed_action[:policy_action_cpu.numel()] / float(
+						cfg.get("eval_zmq_action_scale", 1.0)
+					)
 				intervened = _intervened_from_message(next_message, cfg, action_key)
 				if intervened:
 					intervention_steps += 1

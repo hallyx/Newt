@@ -383,9 +383,16 @@ class TDMPC2(torch.nn.Module):
 				state_dict[source_key] = target_state[key]
 		try:
 			self.model.load_state_dict(state_dict)
-		except Exception:
-			state_dict = legacy_api_model_conversion(self.model.state_dict(), state_dict)
-			out = self.model.load_state_dict(state_dict)
+		except Exception as load_error:
+			try:
+				legacy_state_dict = legacy_api_model_conversion(self.model.state_dict(), state_dict)
+				out = self.model.load_state_dict(legacy_state_dict)
+			except Exception:
+				raise RuntimeError(
+					"Failed to load checkpoint into the current model. "
+					"The checkpoint does not appear to be compatible with the current config, "
+					"and legacy API conversion also failed."
+				) from load_error
 			print(out)
 			print('Successfully loaded checkpoint after converting from legacy API.')
 		if self._latent_residual_freeze_base:
