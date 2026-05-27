@@ -9,7 +9,7 @@ warnings.filterwarnings('ignore')
 
 from copy import deepcopy
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 import csv
 import json
 import math
@@ -135,6 +135,32 @@ def _parse_assembly_ids(raw) -> list[str]:
 		items = list(raw)
 	ids = [_normalize_assembly_id(item) for item in items]
 	return list(dict.fromkeys(ids))
+
+
+def _parse_int_list(raw) -> list[int]:
+	if raw is None:
+		return []
+	if isinstance(raw, str):
+		text = raw.strip().strip("'\"")
+		if text.startswith("[") and text.endswith("]"):
+			text = text[1:-1]
+		items = [item for item in text.replace(";", ",").replace(" ", ",").split(",") if item.strip()]
+	else:
+		items = list(raw)
+	return [int(str(item).strip().strip("'\"")) for item in items]
+
+
+def _collect_gpu_ids(cfg) -> list[int]:
+	explicit = _parse_int_list(cfg.get("collect_parallel_gpu_ids", None))
+	if explicit:
+		return explicit
+	base_gpu = int(cfg.get("gpu_id", 0))
+	num_gpus = cfg.get("num_gpus", None)
+	try:
+		num_gpus = int(num_gpus) if num_gpus is not None else 1
+	except (TypeError, ValueError):
+		num_gpus = 1
+	return list(range(base_gpu, base_gpu + max(1, num_gpus)))
 
 
 def _resolve_assembly_ids(cfg) -> list[str]:
@@ -532,7 +558,7 @@ def _override_value(value):
 	return str(value)
 
 
-def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
+def _child_overrides(cfg, *, assembly_id: str, output_dir: Path, gpu_id: int | None = None):
 	fields = [
 		"checkpoint",
 		"eval_success_metric",
@@ -655,13 +681,26 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 		"progress_log_interval_sec",
 		"eval_task_template_exact",
 		"eval_task_template_print",
+		"contact_history_enabled",
+		"contact_history_len",
+		"contact_context_dim",
+		"contact_history_hidden_dim",
+		"contact_history_layers",
+		"contact_force_dim",
+		"contact_action_dim",
+		"contact_ee_delta_dim",
+		"contact_history_use_ee_delta",
 	]
 	overrides = []
 	for field in fields:
+		if field == "gpu_id" and gpu_id is not None:
+			continue
 		value = cfg.get(field, None)
 		if value is None:
 			continue
 		overrides.append(f"{field}={_override_value(value)}")
+	if gpu_id is not None:
+		overrides.append(f"gpu_id={int(gpu_id)}")
 	overrides.extend([
 		f"collect_assembly_ids=[{assembly_id}]",
 		f"collect_worker_assembly_id={assembly_id}",
@@ -673,24 +712,96 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path):
 
 def _collect_via_subprocesses(cfg, assembly_ids: list[str], output_dir: Path):
 	script = Path(__file__).resolve()
-	entries = []
-	skipped = []
+	jobs = []
+	gpu_ids = _collect_gpu_ids(cfg)
+	workers = max(1, int(cfg.get("collect_parallel_workers", 1) or 1))
+	workers = min(workers, len(assembly_ids))
+	if workers > 1:
+		print(colored(
+			f"Parallel collection enabled: workers={workers}, gpu_ids={gpu_ids}.",
+			"cyan",
+			attrs=["bold"],
+		), flush=True)
+		if workers > len(gpu_ids):
+			print(colored(
+				"Warning: collect_parallel_workers exceeds available collect GPU ids; "
+				"multiple IsaacLab collection processes will share a GPU.",
+				"yellow",
+				attrs=["bold"],
+			), flush=True)
 	for task_id, assembly_id in enumerate(assembly_ids):
 		result_fp = output_dir / assembly_id / "manifest_entry.json"
 		if result_fp.exists() and cfg.get('collect_overwrite', False):
 			result_fp.unlink()
+		child_gpu_id = gpu_ids[task_id % len(gpu_ids)]
 		cmd = [
 			sys.executable,
 			str(script),
-			*_child_overrides(cfg, assembly_id=assembly_id, output_dir=output_dir),
+			*_child_overrides(cfg, assembly_id=assembly_id, output_dir=output_dir, gpu_id=child_gpu_id),
 		]
+		jobs.append({
+			"task_id": task_id,
+			"assembly_id": assembly_id,
+			"gpu_id": child_gpu_id,
+			"result_fp": result_fp,
+			"cmd": cmd,
+		})
+
+	if workers == 1:
+		for job in jobs:
+			print(colored(
+				f"Launching isolated collection process for assembly_id={job['assembly_id']} "
+				f"({job['task_id'] + 1}/{len(assembly_ids)}) on cuda:{job['gpu_id']}.",
+				"cyan",
+				attrs=["bold"],
+			), flush=True)
+			subprocess.run(job["cmd"], cwd=hydra.utils.get_original_cwd(), check=True)
+	else:
+		active = []
+		next_job = 0
+		while next_job < len(jobs) or active:
+			while next_job < len(jobs) and len(active) < workers:
+				job = jobs[next_job]
+				next_job += 1
+				print(colored(
+					f"Launching isolated collection process for assembly_id={job['assembly_id']} "
+					f"({job['task_id'] + 1}/{len(assembly_ids)}) on cuda:{job['gpu_id']}.",
+					"cyan",
+					attrs=["bold"],
+				), flush=True)
+				proc = subprocess.Popen(job["cmd"], cwd=hydra.utils.get_original_cwd())
+				active.append((proc, job))
+			still_active = []
+			for proc, job in active:
+				code = proc.poll()
+				if code is None:
+					still_active.append((proc, job))
+					continue
+				if code != 0:
+					for other_proc, _ in still_active:
+						other_proc.terminate()
+					for other_proc, _ in active:
+						if other_proc.poll() is None:
+							other_proc.terminate()
+					raise subprocess.CalledProcessError(code, job["cmd"])
+				print(colored(
+					f"Finished collection process for assembly_id={job['assembly_id']} on cuda:{job['gpu_id']}.",
+					"green",
+					attrs=["bold"],
+				), flush=True)
+			active = still_active
+			if active:
+				sleep(1.0)
+
+	entries = []
+	skipped = []
+	for job in jobs:
+		result_fp = job["result_fp"]
+		task_id = job["task_id"]
 		print(colored(
-			f"Launching isolated collection process for assembly_id={assembly_id} "
-			f"({task_id + 1}/{len(assembly_ids)}).",
+			f"Reading worker manifest entry for assembly_id={job['assembly_id']}: {result_fp}",
 			"cyan",
-			attrs=["bold"],
 		), flush=True)
-		subprocess.run(cmd, cwd=hydra.utils.get_original_cwd(), check=True)
 		if not result_fp.exists():
 			raise FileNotFoundError(f"Worker did not write manifest entry: {result_fp}")
 		entry = _read_json(result_fp)
@@ -890,8 +1001,6 @@ def _collect_for_assembly(base_cfg, assembly_id: str, output_dir: Path, task_id:
 		torch.save(dataset, output_fp)
 
 		summary = summarize_compact_dataset(dataset)
-		if getattr(agent.model, "_task_vecs", None) is not None:
-			task_vec = agent.model._task_vecs[0].detach().cpu().tolist()
 		if task_vec is None:
 			task_vec = _current_task_vec_6(cfg, env)
 		metric_means = {

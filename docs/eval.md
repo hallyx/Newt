@@ -446,7 +446,7 @@ cd /home/gpuserver/hx/github/Newt
 
 ```
 /home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
-  checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260521_105015_asm-01125/models/best.pt \
+  checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
   eval_mode=sim \
   isaaclab_backend=srsa \
   task=isaaclab-srsa-assembly \
@@ -472,7 +472,16 @@ cd /home/gpuserver/hx/github/Newt
   eval_trace_steps=20 \
   eval_trace_fp=traces/no_force_01125.jsonl \
   enable_wandb=false \
-  exp_name=eval_sim_17d_no_force_sensor
+  exp_name=eval_sim_17d_no_force_sensor \
+  contact_history_enabled=true \
+  contact_history_len=4  \
+  contact_context_dim=64 \
+  contact_history_hidden_dim=128 \
+  contact_history_layers=2 \
+  contact_force_dim=6 \
+  contact_action_dim=3 \
+  contact_ee_delta_dim=3 \
+  contact_history_use_ee_delta=true
 
 
 ### 带 Debug 输出的 Eval

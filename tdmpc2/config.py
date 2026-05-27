@@ -294,6 +294,8 @@ class Config:
 	collect_match_checkpoint: bool = True
 	collect_expected_obs_dim: Optional[int] = None
 	collect_spawn_per_assembly: bool = True
+	collect_parallel_workers: int = 1
+	collect_parallel_gpu_ids: Any = None
 	collect_worker_assembly_id: Optional[str] = None
 
 	# real-robot human-in-the-loop rollout collection

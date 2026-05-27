@@ -75,6 +75,7 @@ COLLECT_OVERRIDE_FIELDS = (
 	"srsa_env_action_dim",
 	"num_envs",
 	"gpu_id",
+	"num_gpus",
 	"model_size",
 	"horizon",
 	"compile",
@@ -136,6 +137,8 @@ COLLECT_OVERRIDE_FIELDS = (
 	"collect_skip_deferred_tasks",
 	"collect_match_checkpoint",
 	"collect_expected_obs_dim",
+	"collect_parallel_workers",
+	"collect_parallel_gpu_ids",
 	"collect_mpc",
 	"collect_max_env_steps",
 	"eval_hang_guard_factor",
@@ -311,6 +314,7 @@ def _train_stage(cfg, *, checkpoint_fp: Path, manifest_fp: Path, active_tasks: l
 	_cfg_set(stage_cfg, "offline_export_fp", str(Path(_cfg_get(cfg, "work_dir")) / "auto_replay" / f"stage_{stage_idx:02d}" / "offline_compact.pt"))
 	_cfg_set(stage_cfg, "offline_export_overwrite", True)
 	_cfg_set(stage_cfg, "multitask_task_ids", list(active_tasks))
+	_cfg_set(stage_cfg, "multitask_eval_task_ids", list(active_tasks))
 	_cfg_set(stage_cfg, "multitask_curriculum_mode", "all_at_once")
 	_cfg_set(stage_cfg, "multitask_total_steps", int(num_updates))
 	_cfg_set(stage_cfg, "steps", int(num_updates))

@@ -48,11 +48,14 @@ EVAL_SUCCESS_METRIC=${EVAL_SUCCESS_METRIC:-strict}
 BATCH_EVAL_EPISODES_PER_TASK=${BATCH_EVAL_EPISODES_PER_TASK:-100}
 
 GPU_ID=${GPU_ID:-0}
+NUM_GPUS=${NUM_GPUS:-1}
 NUM_ENVS=${NUM_ENVS:-200}
 MODEL_SIZE=${MODEL_SIZE:-S}
 BATCH_SIZE=${BATCH_SIZE:-1024}
 HORIZON=${HORIZON:-3}
 COLLECT_EPISODES_PER_TASK=${COLLECT_EPISODES_PER_TASK:-300}
+COLLECT_PARALLEL_WORKERS=${COLLECT_PARALLEL_WORKERS:-1}
+COLLECT_PARALLEL_GPU_IDS=${COLLECT_PARALLEL_GPU_IDS:-}
 COLLECT_MAX_ENV_STEPS=${COLLECT_MAX_ENV_STEPS:-}
 OFFLINE_LOG_FREQ=${OFFLINE_LOG_FREQ:-200}
 OFFLINE_SAVE_FREQ=${OFFLINE_SAVE_FREQ:-5000}
@@ -176,8 +179,12 @@ if [[ -n "${OFFLINE_SOURCE_FP}" && ! -f "${OFFLINE_SOURCE_FP}" ]]; then
 fi
 if [[ "${DRY_RUN}" != "1" && "${CHECK_CUDA}" == "1" ]]; then
   AVAILABLE_GPUS=$(PYTHONWARNINGS=ignore "${PYTHON}" -c 'import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)')
-  if (( AVAILABLE_GPUS - GPU_ID < 1 )); then
-    echo "[launcher] CUDA not ready: available_gpus=${AVAILABLE_GPUS}, gpu_id=${GPU_ID}" >&2
+  REQUIRED_GPUS=${NUM_GPUS}
+  if (( REQUIRED_GPUS < 1 )); then
+    REQUIRED_GPUS=1
+  fi
+  if (( AVAILABLE_GPUS - GPU_ID < REQUIRED_GPUS )); then
+    echo "[launcher] CUDA not ready: available_gpus=${AVAILABLE_GPUS}, gpu_id=${GPU_ID}, required_gpus=${REQUIRED_GPUS}" >&2
     echo "[launcher] Fix CUDA visibility, or set CHECK_CUDA=0 to skip this preflight." >&2
     exit 1
   fi
@@ -203,6 +210,7 @@ echo "[launcher] curriculum=${CURRICULUM_MODE} stage_steps=${STAGE_STEPS} total_
 echo "[launcher] sampling=${SAMPLING_MODE} anchor_min=${ANCHOR_MIN_RATIO} new_min=${NEW_TASK_MIN_RATIO} hard_case=${HARD_CASE_RATIO}"
 echo "[launcher] eval_interval=${MULTITASK_EVAL_INTERVAL} eval_episodes_per_task=${BATCH_EVAL_EPISODES_PER_TASK}"
 echo "[launcher] num_envs=${NUM_ENVS} collect_episodes_per_task=${COLLECT_EPISODES_PER_TASK}"
+echo "[launcher] collect_parallel_workers=${COLLECT_PARALLEL_WORKERS} collect_parallel_gpu_ids=${COLLECT_PARALLEL_GPU_IDS:-auto-from-gpu_id-num_gpus} num_gpus=${NUM_GPUS} gpu_id=${GPU_ID}"
 echo "[launcher] srsa_task_template_fp=${SRSA_TASK_TEMPLATE_FP}"
 echo "[launcher] srsa_mesh_geometry_fp=${SRSA_MESH_GEOMETRY_FP}"
 echo "[launcher] srsa_param_template_id=${SRSA_PARAM_TEMPLATE_ID}"
@@ -248,6 +256,7 @@ train_cmd=(
   srsa_align_direct_reward_success=true
   srsa_if_sbc=false
   gpu_id="${GPU_ID}"
+  num_gpus="${NUM_GPUS}"
   num_envs="${NUM_ENVS}"
   multiproc=false
   steps="${TOTAL_STEPS}"
@@ -301,6 +310,7 @@ train_cmd=(
   batch_eval_overwrite=true
   collect_episodes_per_task="${COLLECT_EPISODES_PER_TASK}"
   collect_spawn_per_assembly=true
+  collect_parallel_workers="${COLLECT_PARALLEL_WORKERS}"
   collect_match_checkpoint=true
   progress_log_interval_sec=30
   exp_name="${EXP_NAME}"
@@ -335,6 +345,9 @@ if [[ -n "${TASK_SAMPLING_WEIGHTS}" ]]; then
 fi
 if [[ -n "${COLLECT_MAX_ENV_STEPS}" ]]; then
   train_cmd+=(collect_max_env_steps="${COLLECT_MAX_ENV_STEPS}")
+fi
+if [[ -n "${COLLECT_PARALLEL_GPU_IDS}" ]]; then
+  train_cmd+=(collect_parallel_gpu_ids="${COLLECT_PARALLEL_GPU_IDS}")
 fi
 train_cmd+=(offline_export_overwrite="${OFFLINE_EXPORT_OVERWRITE}")
 
