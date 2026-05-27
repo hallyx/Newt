@@ -14,6 +14,7 @@ from termcolor import colored
 from common import set_seed
 from common.logger import Logger
 from common.multitask_replay import get_active_tasks
+from offline_io import load_offline_manifest
 from offline_train import (
 	_make_hard_case_dataset,
 	_make_offline_dataset,
@@ -201,6 +202,28 @@ def _list_override(values: list[str]) -> str:
 	return json.dumps([str(value) for value in values])
 
 
+def _normalize_task_id(value) -> str:
+	text = str(value).strip().strip("'\"")
+	return text.zfill(5) if text.isdigit() and len(text) < 5 else text
+
+
+def _manifest_assembly_ids(manifest_fp: Path) -> set[str]:
+	assembly_ids: set[str] = set()
+	try:
+		entries = load_offline_manifest(manifest_fp)
+	except Exception as exc:
+		print(colored(
+			f"Warning: could not inspect manifest task ids from {manifest_fp}: {exc}",
+			"yellow",
+		), flush=True)
+		return assembly_ids
+	for entry in entries:
+		assembly_id = entry.get("assembly_id")
+		if assembly_id is not None:
+			assembly_ids.add(_normalize_task_id(assembly_id))
+	return assembly_ids
+
+
 def _stage_plan(cfg) -> list[dict]:
 	task_ids = _coerce_str_list(_cfg_get(cfg, "multitask_task_ids", []))
 	if not task_ids:
@@ -229,7 +252,7 @@ def _stage_plan(cfg) -> list[dict]:
 	return plans
 
 
-def _collect_overrides(cfg, *, checkpoint_fp: Path, active_tasks: list[str], output_dir: Path, manifest_fp: Path, stage_idx: int):
+def _collect_overrides(cfg, *, checkpoint_fp: Path, collect_tasks: list[str], output_dir: Path, manifest_fp: Path, stage_idx: int):
 	overrides = [f"checkpoint={checkpoint_fp}"]
 	for field in COLLECT_OVERRIDE_FIELDS:
 		value = _cfg_get(cfg, field, None)
@@ -237,7 +260,7 @@ def _collect_overrides(cfg, *, checkpoint_fp: Path, active_tasks: list[str], out
 			continue
 		overrides.append(f"{field}={_override_value(value)}")
 	overrides.extend([
-		f"collect_assembly_ids={_list_override(active_tasks)}",
+		f"collect_assembly_ids={_list_override(collect_tasks)}",
 		f"collect_output_dir={output_dir}",
 		f"collect_manifest_fp={manifest_fp}",
 		"collect_source_assembly_id=null",
@@ -251,7 +274,7 @@ def _collect_overrides(cfg, *, checkpoint_fp: Path, active_tasks: list[str], out
 	return overrides
 
 
-def _run_collect_stage(cfg, *, checkpoint_fp: Path, active_tasks: list[str], stage_idx: int) -> Path:
+def _run_collect_stage(cfg, *, checkpoint_fp: Path, collect_tasks: list[str], stage_idx: int) -> Path:
 	stage_dir = Path(_cfg_get(cfg, "work_dir")) / "auto_replay" / f"stage_{stage_idx:02d}"
 	output_dir = stage_dir / "rollouts"
 	manifest_fp = stage_dir / "offline_manifest_stage.json"
@@ -262,14 +285,14 @@ def _run_collect_stage(cfg, *, checkpoint_fp: Path, active_tasks: list[str], sta
 		*_collect_overrides(
 			cfg,
 			checkpoint_fp=checkpoint_fp,
-			active_tasks=active_tasks,
+			collect_tasks=collect_tasks,
 			output_dir=output_dir,
 			manifest_fp=manifest_fp,
 			stage_idx=stage_idx,
 		),
 	]
 	print(colored(
-		f"auto_collect stage={stage_idx} active_tasks={active_tasks} checkpoint={checkpoint_fp}",
+		f"auto_collect stage={stage_idx} collect_tasks={collect_tasks} checkpoint={checkpoint_fp}",
 		"cyan",
 		attrs=["bold"],
 	), flush=True)
@@ -369,12 +392,15 @@ def run_auto_collect_multitask_continuation(cfg):
 		raise FileNotFoundError(f"Warm-start checkpoint not found: {current_checkpoint}")
 	plans = _stage_plan(cfg)
 	stage_manifests: list[Path] = []
+	collected_task_ids: set[str] = set()
+	recollect_active_tasks = bool(_cfg_get(cfg, "multitask_auto_collect_recollect_active_tasks", False))
 	initial_manifest = _cfg_get(cfg, "multitask_replay_manifest_fp", None) or _cfg_get(cfg, "offline_manifest_fp", None)
 	if initial_manifest:
 		initial_manifest = Path(initial_manifest).expanduser().resolve()
 		if not initial_manifest.exists():
 			raise FileNotFoundError(f"Initial replay manifest not found: {initial_manifest}")
 		stage_manifests.append(initial_manifest)
+		collected_task_ids.update(_manifest_assembly_ids(initial_manifest))
 		print(colored(f"Seeded auto-collect replay pool with manifest: {initial_manifest}", "cyan", attrs=["bold"]))
 	print(colored(
 		"Starting auto-collect multitask continuation. "
@@ -386,13 +412,39 @@ def run_auto_collect_multitask_continuation(cfg):
 		stage_idx = int(plan["stage_idx"])
 		active_tasks = list(plan["active_tasks"])
 		num_updates = int(plan["num_updates"])
-		stage_manifest = _run_collect_stage(
-			cfg,
-			checkpoint_fp=current_checkpoint,
-			active_tasks=active_tasks,
-			stage_idx=stage_idx,
-		)
-		stage_manifests.append(stage_manifest)
+		if recollect_active_tasks:
+			collect_tasks = active_tasks
+		else:
+			collect_tasks = [
+				task_id for task_id in active_tasks
+				if _normalize_task_id(task_id) not in collected_task_ids
+			]
+		print(colored(
+			f"stage={stage_idx} active_tasks={active_tasks} collect_tasks={collect_tasks} "
+			f"recollect_active_tasks={recollect_active_tasks}",
+			"cyan",
+			attrs=["bold"],
+		), flush=True)
+		if collect_tasks:
+			stage_manifest = _run_collect_stage(
+				cfg,
+				checkpoint_fp=current_checkpoint,
+				collect_tasks=collect_tasks,
+				stage_idx=stage_idx,
+			)
+			stage_manifests.append(stage_manifest)
+			manifest_ids = _manifest_assembly_ids(stage_manifest)
+			collected_task_ids.update(manifest_ids or {_normalize_task_id(task_id) for task_id in collect_tasks})
+		else:
+			print(colored(
+				f"Skipping auto_collect stage={stage_idx}: all active tasks already have replay.",
+				"yellow",
+			), flush=True)
+		if not stage_manifests:
+			raise ValueError(
+				"No replay data is available for multitask continuation. "
+				"Provide multitask_replay_manifest_fp or enable collection for at least one task."
+			)
 		accumulated_manifest = _merge_manifests(stage_manifests, work_dir=work_dir, stage_idx=stage_idx)
 		current_checkpoint = _train_stage(
 			cfg,

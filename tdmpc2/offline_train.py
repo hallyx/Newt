@@ -574,7 +574,17 @@ def _run_multitask_continuation(
 		raise ValueError(f"Expected positive multitask total steps, got {total_steps}.")
 	log_freq = max(1, int(cfg.offline_log_freq))
 	save_freq = max(1, int(cfg.offline_save_freq))
-	eval_interval = int(cfg.get('multitask_eval_interval', 0) or 0)
+	eval_enabled = bool(cfg.get('multitask_eval_enabled', True))
+	eval_interval = int(cfg.get('multitask_eval_interval', 0) or 0) if eval_enabled else 0
+	if eval_enabled and eval_interval <= 0:
+		eval_interval = max(1, min(50_000, total_steps))
+		if logger.rank == 0:
+			print(colored(
+				f"multitask_eval_enabled=true but multitask_eval_interval<=0; "
+				f"using eval_interval={eval_interval}. Set multitask_eval_enabled=false to disable success eval.",
+				"yellow",
+				attrs=["bold"],
+			))
 	eval_state = {
 		"anchor_success_initial": None,
 		"best_family_avg": -float("inf"),

@@ -25,7 +25,14 @@ from termcolor import colored
 from common import set_seed
 from common import MODEL_SIZE
 from common.world_model import WorldModel
-from config import Config, SRSA_SAMPLER_CFG_KEYS, make_axial_task_vec, parse_cfg, safe_run_token
+from config import (
+	Config,
+	SRSA_SAMPLER_CFG_KEYS,
+	apply_eval_task_template,
+	make_axial_task_vec,
+	parse_cfg,
+	safe_run_token,
+)
 from envs import make_env
 from offline_io import load_offline_manifest, summarize_compact_dataset
 from tdmpc2 import TDMPC2
@@ -251,6 +258,8 @@ def _adapt_obs_to_checkpoint(obs: torch.Tensor, expected_obs_dim: int | None) ->
 def _task_cfg(base_cfg, assembly_id: str):
 	cfg = deepcopy(base_cfg)
 	cfg.assembly_id = assembly_id
+	cfg.srsa_task_template_applied_id = None
+	cfg = apply_eval_task_template(cfg)
 	cfg.rank = 0
 	cfg.world_size = 1
 	cfg.device_id = int(cfg.gpu_id)
@@ -702,6 +711,7 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path, gpu_id: int | N
 	if gpu_id is not None:
 		overrides.append(f"gpu_id={int(gpu_id)}")
 	overrides.extend([
+		f"assembly_id={assembly_id}",
 		f"collect_assembly_ids=[{assembly_id}]",
 		f"collect_worker_assembly_id={assembly_id}",
 		"collect_spawn_per_assembly=false",
@@ -1074,7 +1084,9 @@ def launch(cfg: Config):
 	assert torch.cuda.is_available()
 	worker_assembly_id = cfg.get('collect_worker_assembly_id', None)
 	if worker_assembly_id is not None:
-		assembly_ids = [_normalize_assembly_id(worker_assembly_id)]
+		worker_assembly_id = _normalize_assembly_id(worker_assembly_id)
+		cfg.assembly_id = worker_assembly_id
+		assembly_ids = [worker_assembly_id]
 	else:
 		assembly_ids = _resolve_assembly_ids(cfg)
 	if cfg.get('collect_source_assembly_id', None) is not None:

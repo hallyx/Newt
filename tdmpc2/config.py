@@ -253,6 +253,7 @@ class Config:
 	multitask_continuation_enabled: bool = False
 	multitask_replay_manifest_fp: Optional[str] = None
 	multitask_auto_collect_replay: bool = False
+	multitask_auto_collect_recollect_active_tasks: bool = False
 	multitask_task_ids: Any = field(default_factory=lambda: ["01125", "00004", "00014", "00062", "00271"])
 	multitask_anchor_task_id: str = "01125"
 	multitask_curriculum_mode: str = "progressive"
@@ -264,6 +265,7 @@ class Config:
 	multitask_new_task_min_ratio: float = 0.2
 	multitask_hard_case_ratio: float = 0.2
 	multitask_eval_task_ids: Any = field(default_factory=lambda: ["01125", "00004", "00014", "00062", "00271"])
+	multitask_eval_enabled: bool = True
 	multitask_eval_interval: int = 50_000
 	multitask_save_per_task_metrics: bool = True
 	multitask_forgetting_metric_enabled: bool = True

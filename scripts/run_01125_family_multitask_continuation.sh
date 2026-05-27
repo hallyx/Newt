@@ -20,6 +20,7 @@ ANCHOR_TASK_ID=${ANCHOR_TASK_ID:-01125}
 OFFLINE_MANIFEST_FP=${OFFLINE_MANIFEST_FP:-}
 MULTITASK_REPLAY_MANIFEST_FP=${MULTITASK_REPLAY_MANIFEST_FP:-${OFFLINE_MANIFEST_FP}}
 MULTITASK_AUTO_COLLECT_REPLAY=${MULTITASK_AUTO_COLLECT_REPLAY:-false}
+MULTITASK_AUTO_COLLECT_RECOLLECT_ACTIVE_TASKS=${MULTITASK_AUTO_COLLECT_RECOLLECT_ACTIVE_TASKS:-false}
 OFFLINE_DATASET_FP=${OFFLINE_DATASET_FP:-}
 OFFLINE_SOURCE_FP=${OFFLINE_SOURCE_FP:-}
 OFFLINE_EXPORT_FP=${OFFLINE_EXPORT_FP:-}
@@ -34,6 +35,7 @@ TASK_SAMPLING_WEIGHTS=${TASK_SAMPLING_WEIGHTS:-}
 ANCHOR_MIN_RATIO=${ANCHOR_MIN_RATIO:-0.2}
 NEW_TASK_MIN_RATIO=${NEW_TASK_MIN_RATIO:-0.2}
 HARD_CASE_RATIO=${HARD_CASE_RATIO:-0.2}
+MULTITASK_EVAL_ENABLED=${MULTITASK_EVAL_ENABLED:-true}
 MULTITASK_EVAL_INTERVAL=${MULTITASK_EVAL_INTERVAL:-50000}
 MULTITASK_NO_FORGETTING_MAX_FORGETTING=${MULTITASK_NO_FORGETTING_MAX_FORGETTING:-0.05}
 MULTITASK_PROX_REG_ENABLED=${MULTITASK_PROX_REG_ENABLED:-false}
@@ -56,7 +58,9 @@ HORIZON=${HORIZON:-3}
 COLLECT_EPISODES_PER_TASK=${COLLECT_EPISODES_PER_TASK:-300}
 COLLECT_PARALLEL_WORKERS=${COLLECT_PARALLEL_WORKERS:-1}
 COLLECT_PARALLEL_GPU_IDS=${COLLECT_PARALLEL_GPU_IDS:-}
+COLLECT_MPC=${COLLECT_MPC:-}
 COLLECT_MAX_ENV_STEPS=${COLLECT_MAX_ENV_STEPS:-}
+ISAACLAB_GPU_COLLISION_STACK_SIZE=${ISAACLAB_GPU_COLLISION_STACK_SIZE:-}
 OFFLINE_LOG_FREQ=${OFFLINE_LOG_FREQ:-200}
 OFFLINE_SAVE_FREQ=${OFFLINE_SAVE_FREQ:-5000}
 EXP_NAME=${EXP_NAME:-srsa_axial_family_continuation}
@@ -120,6 +124,15 @@ read -r -a TASK_ID_ARRAY <<< "${TASK_IDS}"
 read -r -a EVAL_TASK_ID_ARRAY <<< "${EVAL_TASK_IDS}"
 TASK_IDS_JSON=$(json_list "${TASK_ID_ARRAY[@]}")
 EVAL_TASK_IDS_JSON=$(json_list "${EVAL_TASK_ID_ARRAY[@]}")
+COLLECT_PARALLEL_GPU_IDS_HYDRA=""
+if [[ -n "${COLLECT_PARALLEL_GPU_IDS}" ]]; then
+  if [[ "${COLLECT_PARALLEL_GPU_IDS}" == \[* ]]; then
+    COLLECT_PARALLEL_GPU_IDS_HYDRA="${COLLECT_PARALLEL_GPU_IDS}"
+  else
+    read -r -a COLLECT_PARALLEL_GPU_ID_ARRAY <<< "${COLLECT_PARALLEL_GPU_IDS//,/ }"
+    COLLECT_PARALLEL_GPU_IDS_HYDRA=$(json_list "${COLLECT_PARALLEL_GPU_ID_ARRAY[@]}")
+  fi
+fi
 
 if [[ ! -x "${PYTHON}" ]]; then
   echo "[launcher] python not found or not executable: ${PYTHON}" >&2
@@ -190,6 +203,19 @@ if [[ "${DRY_RUN}" != "1" && "${CHECK_CUDA}" == "1" ]]; then
   fi
 fi
 
+case "${MULTITASK_EVAL_ENABLED}" in
+  false|False|FALSE|0|no|No|NO)
+    MULTITASK_EVAL_ENABLED=false
+    MULTITASK_EVAL_INTERVAL=0
+    ;;
+  *)
+    MULTITASK_EVAL_ENABLED=true
+    if [[ "${MULTITASK_EVAL_INTERVAL}" == "0" ]]; then
+      MULTITASK_EVAL_INTERVAL=50000
+    fi
+    ;;
+esac
+
 mkdir -p "${LOG_ROOT}"
 TRAIN_LOG="${LOG_ROOT}/family_multitask_continuation.log"
 
@@ -201,6 +227,7 @@ echo "[launcher] srsa_dir=${SRSA_DIR}"
 echo "[launcher] checkpoint=${CHECKPOINT}"
 echo "[launcher] multitask_replay_manifest_fp=${MULTITASK_REPLAY_MANIFEST_FP}"
 echo "[launcher] multitask_auto_collect_replay=${MULTITASK_AUTO_COLLECT_REPLAY}"
+echo "[launcher] multitask_auto_collect_recollect_active_tasks=${MULTITASK_AUTO_COLLECT_RECOLLECT_ACTIVE_TASKS}"
 echo "[launcher] offline_dataset_fp=${OFFLINE_DATASET_FP}"
 echo "[launcher] offline_source_fp=${OFFLINE_SOURCE_FP}"
 echo "[launcher] task_ids=${TASK_IDS_JSON}"
@@ -208,9 +235,10 @@ echo "[launcher] eval_task_ids=${EVAL_TASK_IDS_JSON}"
 echo "[launcher] anchor_task_id=${ANCHOR_TASK_ID}"
 echo "[launcher] curriculum=${CURRICULUM_MODE} stage_steps=${STAGE_STEPS} total_steps=${TOTAL_STEPS}"
 echo "[launcher] sampling=${SAMPLING_MODE} anchor_min=${ANCHOR_MIN_RATIO} new_min=${NEW_TASK_MIN_RATIO} hard_case=${HARD_CASE_RATIO}"
-echo "[launcher] eval_interval=${MULTITASK_EVAL_INTERVAL} eval_episodes_per_task=${BATCH_EVAL_EPISODES_PER_TASK}"
+echo "[launcher] eval_enabled=${MULTITASK_EVAL_ENABLED} eval_interval=${MULTITASK_EVAL_INTERVAL} eval_episodes_per_task=${BATCH_EVAL_EPISODES_PER_TASK}"
 echo "[launcher] num_envs=${NUM_ENVS} collect_episodes_per_task=${COLLECT_EPISODES_PER_TASK}"
-echo "[launcher] collect_parallel_workers=${COLLECT_PARALLEL_WORKERS} collect_parallel_gpu_ids=${COLLECT_PARALLEL_GPU_IDS:-auto-from-gpu_id-num_gpus} num_gpus=${NUM_GPUS} gpu_id=${GPU_ID}"
+echo "[launcher] collect_parallel_workers=${COLLECT_PARALLEL_WORKERS} collect_parallel_gpu_ids=${COLLECT_PARALLEL_GPU_IDS_HYDRA:-auto-from-gpu_id-num_gpus} num_gpus=${NUM_GPUS} gpu_id=${GPU_ID}"
+echo "[launcher] collect_mpc=${COLLECT_MPC:-inherit} isaaclab_gpu_collision_stack_size=${ISAACLAB_GPU_COLLISION_STACK_SIZE:-inherit}"
 echo "[launcher] srsa_task_template_fp=${SRSA_TASK_TEMPLATE_FP}"
 echo "[launcher] srsa_mesh_geometry_fp=${SRSA_MESH_GEOMETRY_FP}"
 echo "[launcher] srsa_param_template_id=${SRSA_PARAM_TEMPLATE_ID}"
@@ -224,6 +252,7 @@ train_cmd=(
   multitask_reference_checkpoint_path="${CHECKPOINT}"
   multitask_continuation_enabled=true
   multitask_auto_collect_replay="${MULTITASK_AUTO_COLLECT_REPLAY}"
+  multitask_auto_collect_recollect_active_tasks="${MULTITASK_AUTO_COLLECT_RECOLLECT_ACTIVE_TASKS}"
   multitask_task_ids="${TASK_IDS_JSON}"
   multitask_anchor_task_id="${ANCHOR_TASK_ID}"
   multitask_curriculum_mode="${CURRICULUM_MODE}"
@@ -234,6 +263,7 @@ train_cmd=(
   multitask_new_task_min_ratio="${NEW_TASK_MIN_RATIO}"
   multitask_hard_case_ratio="${HARD_CASE_RATIO}"
   multitask_eval_task_ids="${EVAL_TASK_IDS_JSON}"
+  multitask_eval_enabled="${MULTITASK_EVAL_ENABLED}"
   multitask_eval_interval="${MULTITASK_EVAL_INTERVAL}"
   multitask_save_per_task_metrics=true
   multitask_forgetting_metric_enabled=true
@@ -346,8 +376,14 @@ fi
 if [[ -n "${COLLECT_MAX_ENV_STEPS}" ]]; then
   train_cmd+=(collect_max_env_steps="${COLLECT_MAX_ENV_STEPS}")
 fi
-if [[ -n "${COLLECT_PARALLEL_GPU_IDS}" ]]; then
-  train_cmd+=(collect_parallel_gpu_ids="${COLLECT_PARALLEL_GPU_IDS}")
+if [[ -n "${COLLECT_MPC}" ]]; then
+  train_cmd+=(collect_mpc="${COLLECT_MPC}")
+fi
+if [[ -n "${ISAACLAB_GPU_COLLISION_STACK_SIZE}" ]]; then
+  train_cmd+=(isaaclab_gpu_collision_stack_size="${ISAACLAB_GPU_COLLISION_STACK_SIZE}")
+fi
+if [[ -n "${COLLECT_PARALLEL_GPU_IDS_HYDRA}" ]]; then
+  train_cmd+=(collect_parallel_gpu_ids="${COLLECT_PARALLEL_GPU_IDS_HYDRA}")
 fi
 train_cmd+=(offline_export_overwrite="${OFFLINE_EXPORT_OVERWRITE}")
 
