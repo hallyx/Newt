@@ -205,6 +205,102 @@ def _message_scalar(message: dict, key: str, default: float = 0.0) -> float:
 	return float(value)
 
 
+def _parse_vector3(value, *, name: str) -> Optional[torch.Tensor]:
+	if value is None:
+		return None
+	if isinstance(value, str):
+		value = value.strip().strip("[]()")
+		value = [item.strip() for item in value.split(",") if item.strip()]
+	tensor = torch.as_tensor(value, dtype=torch.float64).reshape(-1)
+	if tensor.numel() != 3:
+		raise ValueError(f"Expected `{name}` with 3 values, got {tensor.numel()}.")
+	return tensor
+
+
+def _message_tcp_pos_base(message: dict) -> Optional[torch.Tensor]:
+	ee = message.get("end_effector", {}) if isinstance(message.get("end_effector", {}), dict) else {}
+	pos = message.get("tcp_pos", message.get("position", ee.get("position", None)))
+	if pos is not None:
+		return _parse_vector3(pos, name="tcp_pos")
+	matrix = message.get("O_T_EE", ee.get("O_T_EE", None))
+	if matrix is None:
+		return None
+	matrix = torch.as_tensor(matrix, dtype=torch.float64).reshape(-1)
+	if matrix.numel() != 16:
+		return None
+	return torch.stack([matrix[12], matrix[13], matrix[14]])
+
+
+def _reward_target_pos_base(cfg, obs_receiver) -> torch.Tensor:
+	target = _parse_vector3(cfg.get("hil_collect_reward_target_pos", None), name="hil_collect_reward_target_pos")
+	if target is not None:
+		return target
+	socket_pos = getattr(obs_receiver, "_socket_pos", None)
+	if socket_pos is not None:
+		return torch.as_tensor(socket_pos, dtype=torch.float64).reshape(3)
+	target = _parse_vector3(cfg.get("eval_real_socket_pos", None), name="eval_real_socket_pos")
+	if target is not None:
+		return target
+	raise ValueError(
+		"hil_collect_reward_mode needs a target position. Set hil_collect_reward_target_pos=[x,y,z] "
+		"or eval_real_socket_pos=[x,y,z]."
+	)
+
+
+def _reward_target_pos_for_metadata(cfg) -> Optional[list[float]]:
+	raw = cfg.get("hil_collect_reward_target_pos", None)
+	if raw is None:
+		raw = cfg.get("eval_real_socket_pos", None)
+	if raw is None:
+		return None
+	return [float(x) for x in _parse_vector3(raw, name="hil_collect_reward_target_pos").tolist()]
+
+
+def _hil_reward_from_positions(
+	prev_message: dict,
+	next_message: dict,
+	cfg,
+	obs_receiver,
+	*,
+	done: bool,
+	success: float,
+) -> tuple[float, str]:
+	mode = str(cfg.get("hil_collect_reward_mode", "message") or "message").strip().lower()
+	if mode in {"message", "msg", "lower"}:
+		return _message_scalar(next_message, cfg.get("hil_collect_reward_key", "reward"), default=0.0), "message"
+	if mode in {"none", "zero"}:
+		return 0.0, "zero"
+	if mode not in {"distance", "distance_to_target", "target_distance", "progress", "distance_progress"}:
+		raise ValueError(
+			"hil_collect_reward_mode must be one of message, zero, distance_to_target, progress, distance_progress."
+		)
+
+	target_pos = _reward_target_pos_base(cfg, obs_receiver)
+	next_pos = _message_tcp_pos_base(next_message)
+	if next_pos is None:
+		raise KeyError("Could not compute HIL reward: next observation has no tcp_pos/position/end_effector.position/O_T_EE.")
+	next_dist = float(torch.linalg.norm(next_pos - target_pos).item())
+	reward = 0.0
+	source_parts = []
+	if mode in {"distance", "distance_to_target", "target_distance", "distance_progress"}:
+		reward += -float(cfg.get("hil_collect_reward_distance_scale", 1.0)) * next_dist
+		source_parts.append("distance")
+	if mode in {"progress", "distance_progress"}:
+		prev_pos = _message_tcp_pos_base(prev_message)
+		if prev_pos is None:
+			prev_dist = next_dist
+		else:
+			prev_dist = float(torch.linalg.norm(prev_pos - target_pos).item())
+		reward += float(cfg.get("hil_collect_reward_progress_scale", 1.0)) * (prev_dist - next_dist)
+		source_parts.append("progress")
+	if done:
+		if success > 0.5:
+			reward += float(cfg.get("hil_collect_reward_success_bonus", 0.0))
+		else:
+			reward -= float(cfg.get("hil_collect_reward_failure_penalty", 0.0))
+	return float(reward), "+".join(source_parts) or mode
+
+
 def _message_success(message: dict, key: str) -> float:
 	for candidate in (key, "success", "succeed", "is_success", "episode_success"):
 		if candidate in message:
@@ -215,6 +311,18 @@ def _message_success(message: dict, key: str) -> float:
 def _action_key_candidates(cfg) -> list[str]:
 	raw = str(cfg.get("hil_collect_action_keys", "") or "")
 	return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _intervention_active_key_candidates(cfg) -> list[str]:
+	raw = str(cfg.get("hil_collect_intervention_active_keys", "") or "")
+	return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _intervention_active_from_message(message: dict, cfg) -> bool:
+	for key in _intervention_active_key_candidates(cfg):
+		if key in message and bool(message[key]):
+			return True
+	return False
 
 
 def _executed_action_from_message(message: dict, cfg, fallback: torch.Tensor) -> tuple[torch.Tensor, bool, Optional[str]]:
@@ -366,12 +474,27 @@ def _make_agent(cfg):
 	return agent
 
 
+def _wait_until_episode_open(obs_receiver, message: dict, episode_id: int) -> dict:
+	waiting = False
+	while obs_receiver.is_done(message):
+		if not waiting:
+			print(colored(
+				f"Waiting for lower machine done=false before episode {episode_id + 1}...",
+				"yellow",
+				attrs=["bold"],
+			), flush=True)
+			waiting = True
+		message = obs_receiver.recv()
+	return message
+
+
 @torch.no_grad()
 def collect_real_hil(agent: TDMPC2, cfg):
 	device = torch.device(f"cuda:{cfg.device_id}")
 	obs_dim = int(cfg.obs_shape["state"][0])
 	max_steps = int(cfg.episode_length)
 	target_episodes = int(cfg.get("hil_collect_episodes", 10))
+	done_on_step_limit = bool(cfg.get("hil_collect_done_on_step_limit", True))
 	use_mpc = cfg.mpc if cfg.get("hil_collect_mpc", None) is None else bool(cfg.hil_collect_mpc)
 	policy_task_id = _real_task_id(cfg)
 	dataset_task_id = 0
@@ -386,7 +509,8 @@ def collect_real_hil(agent: TDMPC2, cfg):
 	print(colored(
 		"Starting real HIL collection: "
 		f"episodes={target_episodes}, obs_dim={obs_dim}, action_dim={cfg.action_dim}, "
-		f"max_steps={max_steps}, mpc={use_mpc}, "
+		f"max_steps={max_steps}, done_on_step_limit={done_on_step_limit}, mpc={use_mpc}, "
+		f"reward_mode={cfg.get('hil_collect_reward_mode', 'message')}, "
 		f"obs_endpoint={cfg.eval_real_obs_server}, action_endpoint={cfg.eval_zmq_server}.",
 		"cyan",
 		attrs=["bold"],
@@ -402,13 +526,13 @@ def collect_real_hil(agent: TDMPC2, cfg):
 	with make_eval_zmq_publisher(cfg) as action_publisher, make_eval_zmq_observation_receiver(cfg) as obs_receiver:
 		message = obs_receiver.recv()
 		for episode_id in range(target_episodes):
-			while obs_receiver.is_done(message):
-				message = obs_receiver.recv()
+			message = _wait_until_episode_open(obs_receiver, message, episode_id)
 			rows = []
 			running_return = 0.0
 			already_intervened = False
 			final_success = 0.0
-			for step_id in range(max_steps):
+			step_id = 0
+			while True:
 				obs = obs_receiver.obs_tensor(message, obs_dim=obs_dim, device=device)
 				model_tasks = _real_task_input(cfg, obs_receiver, message, device)
 				t0 = torch.tensor([step_id == 0], dtype=torch.bool, device=device)
@@ -423,16 +547,22 @@ def collect_real_hil(agent: TDMPC2, cfg):
 				)
 				policy_delta = _shape_real_policy_action(policy_action, step_id, cfg)
 				command_action = _real_action_for_command_frame(policy_delta, obs, cfg, obs_receiver)
-				action_publisher.send_action(
-					command_action,
-					step=total_steps,
-					episode_step=step_id,
-					task_id=policy_task_id,
-					state_seq=message.get("seq", None),
-					state_timestamp=message.get("timestamp", None),
-					preprocessed=True,
-					raw_action=policy_delta.detach().reshape(-1).to("cpu", dtype=torch.float32).tolist(),
+				intervention_active_before_action = _intervention_active_from_message(message, cfg)
+				send_policy = (
+					not intervention_active_before_action or
+					bool(cfg.get("hil_collect_send_policy_during_intervention", False))
 				)
+				if send_policy:
+					action_publisher.send_action(
+						command_action,
+						step=total_steps,
+						episode_step=step_id,
+						task_id=policy_task_id,
+						state_seq=message.get("seq", None),
+						state_timestamp=message.get("timestamp", None),
+						preprocessed=True,
+						raw_action=policy_delta.detach().reshape(-1).to("cpu", dtype=torch.float32).tolist(),
+					)
 				next_message = obs_receiver.recv()
 				next_obs = obs_receiver.obs_tensor(next_message, obs_dim=obs_dim, device=device)
 
@@ -454,22 +584,32 @@ def collect_real_hil(agent: TDMPC2, cfg):
 					executed_action = executed_action[:policy_action_cpu.numel()] / float(
 						cfg.get("eval_zmq_action_scale", 1.0)
 					)
-				intervened = _intervened_from_message(next_message, cfg, action_key)
+				intervened = (
+					_intervened_from_message(next_message, cfg, action_key) or
+					intervention_active_before_action
+				)
 				if intervened:
 					intervention_steps += 1
 					if not already_intervened:
 						intervention_segments += 1
 				already_intervened = intervened
 
-				reward = _message_scalar(next_message, cfg.get("hil_collect_reward_key", "reward"), default=0.0)
-				running_return += reward
 				done_by_robot = obs_receiver.is_done(next_message)
-				done_by_limit = step_id + 1 >= max_steps
+				done_by_limit = done_on_step_limit and step_id + 1 >= max_steps
 				done = bool(done_by_robot or done_by_limit)
 				terminated = bool(next_message.get("terminated", False))
 				truncated = bool(next_message.get("truncated", done_by_limit or (done and not terminated)))
 				if done:
 					final_success = _message_success(next_message, cfg.get("hil_collect_success_key", "success"))
+				reward, reward_source = _hil_reward_from_positions(
+					message,
+					next_message,
+					cfg,
+					obs_receiver,
+					done=done,
+					success=final_success,
+				)
+				running_return += reward
 
 				rows.append({
 					"obs": obs.detach().cpu().reshape(-1).to(torch.float32),
@@ -483,6 +623,7 @@ def collect_real_hil(agent: TDMPC2, cfg):
 					"truncated": torch.tensor(truncated, dtype=torch.bool),
 					"step_id": torch.tensor(step_id, dtype=torch.int32),
 					"episode_return_running": torch.tensor(running_return, dtype=torch.float32),
+					"reward_source": reward_source,
 				})
 				total_steps += 1
 				message = next_message
@@ -491,6 +632,7 @@ def collect_real_hil(agent: TDMPC2, cfg):
 					break
 				if not action_key_found and bool(cfg.get("hil_collect_require_actual_action", False)):
 					raise RuntimeError("Unreachable: missing actual action should have raised earlier.")
+				step_id += 1
 
 			_append_episode(
 				columns,
@@ -531,6 +673,12 @@ def collect_real_hil(agent: TDMPC2, cfg):
 		"episode_return_mean": float(sum(episode_returns) / max(1, len(episode_returns))),
 		"episode_success_mean": float(sum(episode_successes) / max(1, len(episode_successes))),
 		"mpc": bool(use_mpc),
+		"reward_mode": str(cfg.get("hil_collect_reward_mode", "message")),
+		"reward_target_pos_base": _reward_target_pos_for_metadata(cfg),
+		"reward_distance_scale": float(cfg.get("hil_collect_reward_distance_scale", 1.0)),
+		"reward_progress_scale": float(cfg.get("hil_collect_reward_progress_scale", 1.0)),
+		"reward_success_bonus": float(cfg.get("hil_collect_reward_success_bonus", 0.0)),
+		"reward_failure_penalty": float(cfg.get("hil_collect_reward_failure_penalty", 0.0)),
 		"obs_endpoint": cfg.eval_real_obs_server,
 		"action_endpoint": cfg.eval_zmq_server,
 		"summary": summary,

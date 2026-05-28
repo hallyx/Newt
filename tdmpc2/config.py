@@ -222,6 +222,13 @@ class Config:
 	eval_trace_include_next_obs: bool = True
 	eval_trace_include_action_info: bool = True
 	eval_trace_include_raw_msg: bool = False
+	real_interp_steps: int = 50
+	real_interp_step_size: float = 0.0001
+	real_interp_stop_distance: float = 0.001
+	real_interp_target_pos: Any = None
+	real_interp_obs_dim: int = 17
+	real_interp_dry_run: bool = True
+	real_interp_log_fp: Optional[str] = None
 
 	# offline training
 	offline_only: bool = False
@@ -308,10 +315,19 @@ class Config:
 	hil_collect_mpc: Optional[bool] = None
 	hil_collect_max_steps: Optional[int] = None
 	hil_collect_reward_key: str = "reward"
+	hil_collect_reward_mode: str = "message"
+	hil_collect_reward_target_pos: Any = None
+	hil_collect_reward_distance_scale: float = 1.0
+	hil_collect_reward_progress_scale: float = 1.0
+	hil_collect_reward_success_bonus: float = 0.0
+	hil_collect_reward_failure_penalty: float = 0.0
 	hil_collect_success_key: str = "success"
 	hil_collect_action_keys: str = "executed_action,actual_action,applied_action,intervene_action"
 	hil_collect_intervened_key: str = "intervened"
 	hil_collect_require_actual_action: bool = False
+	hil_collect_send_policy_during_intervention: bool = False
+	hil_collect_intervention_active_keys: str = "human_override_active,intervened"
+	hil_collect_done_on_step_limit: bool = True
 
 	# batch evaluation
 	batch_eval_assembly_ids: Any = None

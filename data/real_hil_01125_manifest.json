@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "task_id": 0,
+      "task_name": "soup-real-hil",
+      "assembly_id": "01125",
+      "source_fp": "/home/hally/github/Newt/data/real_hil_01125_2.pt",
+      "action_dim": 3,
+      "max_episode_steps": 150,
+      "task_vec_6": [
+        0.0,
+        -0.15519471742392005,
+        0.14568802005306952,
+        0.16564538970235798,
+        1.0,
+        0.0
+      ],
+      "num_episodes": 2,
+      "num_transitions": 1391,
+      "success_count": 2,
+      "failure_count": 0,
+      "success_rate": 1.0
+    }
+  ]
+}

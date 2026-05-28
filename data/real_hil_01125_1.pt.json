@@ -1,0 +1,56 @@
+{
+  "checkpoint": "/home/hally/github/Newt/logs/srsa_axial_relaxed/best.pt",
+  "output": "/home/hally/github/Newt/data/real_hil_01125_1.pt",
+  "task_id": 0,
+  "policy_eval_task_id": 2,
+  "task_vec_6": [
+    0.0,
+    -0.15519471742392005,
+    0.14568802005306952,
+    0.16564538970235798,
+    1.0,
+    0.0
+  ],
+  "num_episodes": 2,
+  "num_transitions": 4551,
+  "episode_return_mean": -1541.8933451568028,
+  "episode_success_mean": 1.0,
+  "mpc": true,
+  "reward_mode": "distance_to_target",
+  "reward_target_pos_base": [
+    0.561,
+    -0.0215,
+    0.3168
+  ],
+  "reward_distance_scale": 10.0,
+  "reward_progress_scale": 1.0,
+  "reward_success_bonus": 0.0,
+  "reward_failure_penalty": 0.0,
+  "obs_endpoint": "tcp://192.168.10.37:5556",
+  "action_endpoint": "tcp://192.168.10.37:5555",
+  "summary": {
+    "num_transitions": 4551,
+    "obs_shape": [
+      17
+    ],
+    "action_shape": [
+      3
+    ],
+    "reward_shape": [],
+    "num_episodes": 2,
+    "num_done": 2,
+    "obs_dtype": "torch.float32",
+    "action_dtype": "torch.float32",
+    "reward_dtype": "torch.float32",
+    "final_success_mean": 1.0,
+    "episode_failure_final_min": 0.0,
+    "episode_failure_final_max": 0.0,
+    "terminal_failure_count": 0,
+    "terminal_success_count": 2,
+    "episode_return_final_min": -1613.24951171875,
+    "episode_return_final_max": -1470.5372314453125,
+    "intervention_steps": 4268,
+    "intervention_segments": 9,
+    "intervention_step_fraction": 0.9378158646451329
+  }
+}

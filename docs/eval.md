@@ -696,7 +696,7 @@ cd /home/gpuserver/hx/github/Newt
 
 ### SpaceMouse HIRL 采集
 
-如果真机侧用 SpaceMouse 做人在回路接管，使用 `tdmpc2/collect_real_hil_rollouts.py`。Newt 每步先发 policy `[dx,dy,dz]`，真机侧可以用 SpaceMouse 覆盖实际执行动作，然后在下一条 observation 消息里返回 `executed_action` 和 `intervened`。
+如果真机侧用 SpaceMouse 做人在回路接管，使用 `tdmpc2/collect_real_hil_rollouts.py`。推荐语义是：Newt 每步仍然推理并记录 `policy_action`；人工接管激活时，Newt 不再把 policy command 发到机械臂，下位机只执行 SpaceMouse，并在下一条 observation 消息里返回 `executed_delta/human_override_active/intervened`。
 
 推荐使用仓库内置配置：
 
@@ -710,16 +710,21 @@ cd /home/gpuserver/hx/github/Newt
   eval_real_obs_server=tcp://<robot-host>:5556 \
   eval_zmq_server=tcp://<robot-host>:5555 \
   hil_collect_episodes=20 \
+  hil_collect_send_policy_during_intervention=false \
+  hil_collect_done_on_step_limit=false \
+  hil_collect_reward_mode=distance_to_target \
+  hil_collect_reward_distance_scale=10.0 \
   hil_collect_output_fp=data/real_hil_01125.pt \
   hil_collect_manifest_fp=data/real_hil_01125_manifest.json
 ```
 
-真机侧下一帧 observation 建议包含：
+真机侧下一帧 observation 建议包含 raw state 和执行反馈：
 
 ```json
 {
-  "obs": [17 floats],
-  "executed_action": [dx, dy, dz],
+  "executed_delta": [dx, dy, dz, 0, 0, 0],
+  "executed_delta_frame": "tcp",
+  "human_override_active": true,
   "intervened": true,
   "reward": 0.0,
   "done": false,
@@ -727,7 +732,42 @@ cd /home/gpuserver/hx/github/Newt
 }
 ```
 
-`executed_action` 应使用 Newt policy 的归一化 action 单位。如果真机实际执行的是 `delta = raw_action * eval_zmq_action_scale`，保存回 Newt 的 `executed_action` 应该是 `delta / eval_zmq_action_scale`。
+`collect_real_hil_rollouts.py` 会根据 `executed_delta_frame`、`eval_zmq_action_frame`、`eval_zmq_command_frame` 和 `eval_zmq_action_scale` 把实际执行的 delta 转回训练用 action。多条轨迹采集时，下位机可通过键盘 episode marker 发布 `done/success`；collector 收到 `done=true` 后结束当前 episode，并等待 `done=false` 进入下一条。需要完全由键盘标记分段时，设置 `hil_collect_done_on_step_limit=false`，这样 `eval_real_steps` 不会自动截断当前轨迹。`hil_collect_reward_mode=distance_to_target` 时，上位机会用下一帧 TCP base 位置到 `eval_real_socket_pos` 的距离计算 reward，并保存到 dataset 的 `reward` 列。
+
+### 插值轨迹坐标 Probe
+
+如果怀疑 socket/base/tcp 坐标变换有问题，可以先用 `real_interp_probe.py` 直接从当前 TCP 位置向 `eval_real_socket_pos` 生成一条 base-frame 插值轨迹，再按 `eval_zmq_command_frame` 转成下位机 command。默认 dry-run 只打印转换结果，不发送命令：
+
+```bash
+python3 tdmpc2/real_interp_probe.py \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://192.168.10.37:5556 \
+  eval_real_obs_socket_type=sub \
+  eval_zmq_server=tcp://192.168.10.37:5555 \
+  eval_real_state_format=libfranka \
+  'eval_real_socket_pos=[0.558, -0.0201, 0.3128]' \
+  'eval_real_socket_quat_wxyz=[1.0, 0., 0., 0.]' \
+  eval_zmq_command_frame=tcp \
+  eval_zmq_action_order=dx,dy,dz,droll,dpitch,dyaw \
+  real_interp_steps=5 \
+  real_interp_step_size=0.0001 \
+  real_interp_dry_run=true
+```
+
+确认打印的 `base_delta` 和 `cmd_delta` 方向符合预期后，再小步真实移动：
+
+```bash
+python3 tdmpc2/real_interp_probe.py \
+  ...同上参数... \
+  real_interp_steps=20 \
+  real_interp_step_size=0.00005 \
+  real_interp_stop_distance=0.001 \
+  real_interp_dry_run=false \
+  real_interp_log_fp=logs/real_interp_probe_01125.jsonl
+```
+
+如果 `distance_after - distance_before` 持续为正，说明当前 command frame 或 socket quat 转换有问题；如果 base->base 正常而 base->tcp 不正常，优先检查 TCP/socket 姿态。
 
 ### 真机低速 Smoke Test
 
@@ -1156,8 +1196,8 @@ python3 tdmpc2/collect_real_hil_rollouts.py \
   srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
   eval_real_state_format=libfranka \
   eval_real_use_msg_task_vec=false \
-  'eval_real_socket_pos=[0.4763, -0.0085, 0.3254]' \
-  'eval_real_socket_quat_wxyz=[1, 0.0, 0.0, 0.0]' \
+  'eval_real_socket_pos=[0.5541, -0.0153, 0.3024]' \
+  'eval_real_socket_quat_wxyz=[0.0016, 0.9998, -0.0218, 0.0009]' \
   eval_real_force_scale=50.0 \
   eval_real_zero_missing_force=true \
   eval_zmq_action_frame=base \
@@ -1174,5 +1214,118 @@ python3 tdmpc2/collect_real_hil_rollouts.py \
   hil_collect_output_fp=data/real_hil_00186.pt \
   hil_collect_manifest_fp=data/real_hil_00186_manifest.json \
   hil_collect_require_actual_action=true \
+  hil_collect_send_policy_during_intervention=false \
+  hil_collect_done_on_step_limit=false \
+  hil_collect_reward_mode=distance_to_target \
+  hil_collect_reward_distance_scale=10.0 \
   compile=false \
   checkpoint=logs/srsa_axial_relaxed/00186/best.pt
+
+
+python3 tdmpc2/collect_real_hil_rollouts.py \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://192.168.10.37:5556 \
+  eval_real_obs_socket_type=sub \
+  eval_zmq_server=tcp://192.168.10.37:5555 \
+  model_size=S \
+  assembly_id=01125 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_param_template_id=2 \
+  srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
+  eval_real_state_format=libfranka \
+  eval_real_use_msg_task_vec=false \
+  'eval_real_socket_pos=[0.561, -0.0215, 0.3168]' \
+  'eval_real_socket_quat_wxyz=[1.0, 0., 0., 0.]' \
+  eval_real_force_scale=50.0 \
+  eval_real_zero_missing_force=true \
+  eval_zmq_action_frame=base \
+  eval_zmq_command_frame=tcp \
+  eval_zmq_action_scale=0.00005 \
+  eval_zmq_max_trans_delta=0.00003 \
+  eval_zmq_max_rot_delta=0.00001 \
+  eval_zmq_warmup_steps=5 \
+  eval_zmq_send_timeout_ms=100 \
+  eval_zmq_rate=10 \
+  eval_real_steps=150 \
+  eval_real_obs_timeout_ms=60000 \
+  hil_collect_episodes=2 \
+  hil_collect_output_fp=data/real_hil_01125_1.pt \
+  hil_collect_manifest_fp=data/real_hil_01125_manifest.json \
+  hil_collect_require_actual_action=true \
+  hil_collect_send_policy_during_intervention=false \
+  hil_collect_done_on_step_limit=false \
+  hil_collect_reward_mode=distance_to_target \
+  hil_collect_reward_distance_scale=10.0 \
+  compile=false \
+  checkpoint=logs/srsa_axial_relaxed/best.pt
+
+
+python3 tdmpc2/collect_real_hil_rollouts.py \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://192.168.10.37:5556 \
+  eval_real_obs_socket_type=sub \
+  eval_zmq_server=tcp://192.168.10.37:5555 \
+  model_size=S \
+  assembly_id=01125 \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_param_template_id=2 \
+  srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
+  eval_real_state_format=libfranka \
+  eval_real_use_msg_task_vec=false \
+  'eval_real_socket_pos=[0.5506, -0.0061, 0.317]' \
+  'eval_real_socket_quat_wxyz=[1.0, 0., 0., 0.]' \
+  eval_real_force_scale=50.0 \
+  eval_real_zero_missing_force=true \
+  eval_zmq_action_frame=base \
+  eval_zmq_command_frame=tcp \
+  eval_zmq_action_scale=0.00005 \
+  eval_zmq_max_trans_delta=0.00003 \
+  eval_zmq_max_rot_delta=0.00001 \
+  eval_zmq_warmup_steps=5 \
+  eval_zmq_send_timeout_ms=100 \
+  eval_zmq_rate=10 \
+  eval_real_steps=150 \
+  eval_real_obs_timeout_ms=60000 \
+  hil_collect_episodes=2 \
+  hil_collect_output_fp=data/real_hil_01125_3.pt \
+  hil_collect_manifest_fp=data/real_hil_01125_manifest.json \
+  hil_collect_require_actual_action=true \
+  hil_collect_send_policy_during_intervention=false \
+  hil_collect_done_on_step_limit=false \
+  hil_collect_reward_mode=distance_to_target \
+  hil_collect_reward_distance_scale=10.0 \
+  compile=false \
+  checkpoint=logs/srsa_axial_relaxed/best.pt
+
+# 插值
+python3 tdmpc2/real_interp_probe.py \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://192.168.10.37:5556 \
+  eval_real_obs_socket_type=sub \
+  eval_zmq_server=tcp://192.168.10.37:5555 \
+  eval_real_state_format=libfranka \
+  'eval_real_socket_pos=[0.549, -0.0073, 0.3109]' \
+  'eval_real_socket_quat_wxyz=[1.0, 0., 0., 0.]' \
+  eval_zmq_command_frame=tcp \
+  real_interp_steps=20000 \
+  real_interp_step_size=0.0001 \
+  real_interp_dry_run=false
+
+  
+python3 tdmpc2/real_interp_probe.py \
+  eval_mode=real \
+  eval_real_mode=closed_loop \
+  eval_real_obs_server=tcp://192.168.10.37:5556 \
+  eval_real_obs_socket_type=sub \
+  eval_zmq_server=tcp://192.168.10.37:5555 \
+  eval_real_state_format=libfranka \
+  'eval_real_socket_pos=[0.527, -0.0215, 0.3371]' \
+  'eval_real_socket_quat_wxyz=[1.0, 0., 0., 0.]' \
+  eval_zmq_command_frame=tcp \
+  real_interp_steps=100000 \
+  real_interp_step_size=0.0001 \
+  real_interp_dry_run=false
+
