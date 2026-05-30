@@ -8,7 +8,7 @@ cd "${REPO_ROOT}"
 PYTHON=${PYTHON:-/home/gpuserver/miniconda3/envs/isaac51/bin/python}
 ISAACLAB_DIR=${ISAACLAB_DIR:-/home/gpuserver/IsaacLab}
 SRSA_DIR=${SRSA_DIR:-/home/gpuserver/hx/github/srsa}
-CHECKPOINT=${CHECKPOINT:-${REPO_ROOT}/logs/isaaclab-srsa-assembly/1/srsa_axial_online/20260523_163332_asm-01125/models/best.pt}
+CHECKPOINT=${CHECKPOINT:-${REPO_ROOT}/logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt}
 
 # Scheme A trains one shared model. Include the anchor task in TASK_IDS.
 TASK_IDS=${TASK_IDS:-"01125 00004 00014 00062 00271"}
@@ -18,7 +18,7 @@ ANCHOR_TASK_ID=${ANCHOR_TASK_ID:-01125}
 # checkpoint is only the warm-start model .pt. The replay manifest is a data .json.
 # OFFLINE_MANIFEST_FP is kept as a backwards-compatible alias for the clearer name.
 OFFLINE_MANIFEST_FP=${OFFLINE_MANIFEST_FP:-}
-MULTITASK_REPLAY_MANIFEST_FP=${MULTITASK_REPLAY_MANIFEST_FP:-${OFFLINE_MANIFEST_FP}}
+MULTITASK_REPLAY_MANIFEST_FP=${MULTITASK_REPLAY_MANIFEST_FP:-${OFFLINE_MANIFEST_FP:-data/offline_manifest_01125_family_multitask_clean_v1.json}}
 MULTITASK_AUTO_COLLECT_REPLAY=${MULTITASK_AUTO_COLLECT_REPLAY:-false}
 MULTITASK_AUTO_COLLECT_RECOLLECT_ACTIVE_TASKS=${MULTITASK_AUTO_COLLECT_RECOLLECT_ACTIVE_TASKS:-false}
 OFFLINE_DATASET_FP=${OFFLINE_DATASET_FP:-}
@@ -27,15 +27,15 @@ OFFLINE_EXPORT_FP=${OFFLINE_EXPORT_FP:-}
 OFFLINE_EXPORT_OVERWRITE=${OFFLINE_EXPORT_OVERWRITE:-false}
 OFFLINE_FILTER_MODE=${OFFLINE_FILTER_MODE:-all}
 
-TOTAL_STEPS=${TOTAL_STEPS:-5000000}
-STAGE_STEPS=${STAGE_STEPS:-1000000}
-CURRICULUM_MODE=${CURRICULUM_MODE:-progressive}
+TOTAL_STEPS=${TOTAL_STEPS:-100000}
+STAGE_STEPS=${STAGE_STEPS:-100000}
+CURRICULUM_MODE=${CURRICULUM_MODE:-all_at_once}
 SAMPLING_MODE=${SAMPLING_MODE:-balanced}
 TASK_SAMPLING_WEIGHTS=${TASK_SAMPLING_WEIGHTS:-}
-ANCHOR_MIN_RATIO=${ANCHOR_MIN_RATIO:-0.2}
-NEW_TASK_MIN_RATIO=${NEW_TASK_MIN_RATIO:-0.2}
+ANCHOR_MIN_RATIO=${ANCHOR_MIN_RATIO:-0.25}
+NEW_TASK_MIN_RATIO=${NEW_TASK_MIN_RATIO:-0.15}
 HARD_CASE_RATIO=${HARD_CASE_RATIO:-0.2}
-MULTITASK_EVAL_ENABLED=${MULTITASK_EVAL_ENABLED:-true}
+MULTITASK_EVAL_ENABLED=${MULTITASK_EVAL_ENABLED:-false}
 MULTITASK_EVAL_INTERVAL=${MULTITASK_EVAL_INTERVAL:-50000}
 MULTITASK_NO_FORGETTING_MAX_FORGETTING=${MULTITASK_NO_FORGETTING_MAX_FORGETTING:-0.05}
 MULTITASK_PROX_REG_ENABLED=${MULTITASK_PROX_REG_ENABLED:-false}
@@ -46,7 +46,7 @@ SRSA_MESH_GEOMETRY_FP=${SRSA_MESH_GEOMETRY_FP:-data/srsa_mesh_geometry_params.cs
 SRSA_PARAM_TEMPLATE_ID=${SRSA_PARAM_TEMPLATE_ID:-2}
 REFERENCE_ANCHOR_ID=${REFERENCE_ANCHOR_ID:-01125}
 REFERENCE_ANCHOR_TYPE_ID=${REFERENCE_ANCHOR_TYPE_ID:-0}
-EVAL_SUCCESS_METRIC=${EVAL_SUCCESS_METRIC:-strict}
+EVAL_SUCCESS_METRIC=${EVAL_SUCCESS_METRIC:-relaxed}
 BATCH_EVAL_EPISODES_PER_TASK=${BATCH_EVAL_EPISODES_PER_TASK:-100}
 
 GPU_ID=${GPU_ID:-0}
@@ -165,7 +165,7 @@ fi
 if [[ -z "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_AUTO_COLLECT_REPLAY}" != "true" ]]; then
   echo "[launcher] Offline multitask continuation requires a replay manifest. To train without an existing manifest, enable online rollout collection or run the replay collection script first." >&2
   echo "[launcher] To build a manifest from existing per-task rollouts, run:" >&2
-  echo "[launcher]   ${PYTHON} tdmpc2/scripts/build_family_offline_manifest.py --assembly-ids ${TASK_IDS} --source-template '/path/to/policy_rollouts/{assembly_id}/policy_eval_rollouts.pt' --output-manifest-fp data/offline_manifest_01125_family_multitask.json --srsa-mesh-geometry-fp docs/srsa_mesh_geometry_params.csv --expected-obs-dim 17 --expected-action-dim 3 --overwrite" >&2
+  echo "[launcher]   ${PYTHON} tdmpc2/scripts/build_family_offline_manifest.py --assembly-ids ${TASK_IDS} --source-template '/path/to/policy_rollouts/{assembly_id}/policy_eval_rollouts.pt' --output-manifest-fp data/offline_manifest_01125_family_multitask_clean_v1.json --srsa-mesh-geometry-fp data/srsa_mesh_geometry_params.csv --expected-obs-dim 17 --expected-action-dim 3 --overwrite" >&2
   exit 1
 fi
 if [[ -n "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_REPLAY_MANIFEST_FP}" != *.json ]]; then

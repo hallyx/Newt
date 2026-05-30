@@ -29,6 +29,7 @@ from config import (
 	Config,
 	SRSA_SAMPLER_CFG_KEYS,
 	apply_eval_task_template,
+	_load_srsa_task_template_tasks,
 	make_axial_task_vec,
 	parse_cfg,
 	safe_run_token,
@@ -157,6 +158,49 @@ def _parse_int_list(raw) -> list[int]:
 	return [int(str(item).strip().strip("'\"")) for item in items]
 
 
+SRSA_TEMPLATE_DERIVED_CFG_KEYS = (
+	"axial_task_vec_6",
+	"srsa_task_template_applied_id",
+	"srsa_mesh_geometry_task_id",
+	"srsa_axial_task_type_id",
+	"srsa_axial_scale_range",
+	"srsa_axial_fixed_plug_scale",
+	"srsa_axial_clearance_range",
+	"srsa_axial_clearance_ratio_range",
+	"srsa_axial_clearance_base",
+	"srsa_axial_clearance_anchor_multipliers",
+	"srsa_axial_clearance_anchors",
+	"srsa_axial_clearance_depth_templates",
+	"srsa_axial_clearance_depth_template_multipliers",
+	"srsa_axial_clearance_depth_template_weights",
+	"srsa_axial_clearance_jitter_ratio",
+	"srsa_axial_clearance_anchor_weights",
+	"srsa_axial_depth_range",
+	"srsa_axial_target_depth_range",
+	"srsa_axial_depth_base",
+	"srsa_axial_depth_anchor_multipliers",
+	"srsa_axial_depth_anchors",
+	"srsa_axial_depth_jitter_ratio",
+	"srsa_axial_depth_anchor_weights",
+	"srsa_axial_yaw_requirement",
+	"srsa_axial_reference_radius",
+	"srsa_axial_reference_depth",
+)
+
+
+def _set_cfg_value(cfg, key: str, value):
+	if hasattr(cfg, key):
+		setattr(cfg, key, value)
+	else:
+		cfg[key] = value
+
+
+def _clear_template_derived_fields(cfg):
+	for key in SRSA_TEMPLATE_DERIVED_CFG_KEYS:
+		_set_cfg_value(cfg, key, None)
+	return cfg
+
+
 def _collect_gpu_ids(cfg) -> list[int]:
 	explicit = _parse_int_list(cfg.get("collect_parallel_gpu_ids", None))
 	if explicit:
@@ -257,8 +301,8 @@ def _adapt_obs_to_checkpoint(obs: torch.Tensor, expected_obs_dim: int | None) ->
 
 def _task_cfg(base_cfg, assembly_id: str):
 	cfg = deepcopy(base_cfg)
+	_clear_template_derived_fields(cfg)
 	cfg.assembly_id = assembly_id
-	cfg.srsa_task_template_applied_id = None
 	cfg = apply_eval_task_template(cfg)
 	cfg.rank = 0
 	cfg.world_size = 1
@@ -423,7 +467,57 @@ def _stack_columns(columns):
 	return TensorDict(data, batch_size=(data["obs"].shape[0],))
 
 
-def _validate_manifest(manifest):
+def _vec6(entry, *, key_hint: str):
+	raw = entry.get("task_vec_6", entry.get("task_param_vec", None))
+	if raw is None:
+		raise ValueError(f"Missing task_vec_6/task_param_vec in {key_hint}.")
+	values = [float(value) for value in raw]
+	if len(values) != 6:
+		raise ValueError(f"Expected task_vec_6 dim 6 in {key_hint}, got {len(values)}: {values}")
+	return values
+
+
+def _template_task_vec_for_entry(cfg, entry):
+	template_fp = cfg.get("srsa_task_template_fp", None)
+	mesh_fp = cfg.get("srsa_mesh_geometry_fp", None)
+	param_template_id = cfg.get("srsa_param_template_id", cfg.get("srsa_task_template_id", None))
+	if template_fp is None or mesh_fp is None or param_template_id is None:
+		raise ValueError(
+			"Manifest task_vec_6 validation requires srsa_task_template_fp, srsa_mesh_geometry_fp, "
+			"and srsa_param_template_id/srsa_task_template_id."
+		)
+	assembly_id = _normalize_assembly_id(entry.get("assembly_id", ""))
+	template_cfg = deepcopy(cfg)
+	_clear_template_derived_fields(template_cfg)
+	_set_cfg_value(template_cfg, "assembly_id", assembly_id)
+	_set_cfg_value(template_cfg, "srsa_mesh_geometry_task_id", None)
+	_set_cfg_value(template_cfg, "offline_manifest_fp", None)
+	_set_cfg_value(template_cfg, "srsa_param_template_id", int(param_template_id))
+	_set_cfg_value(template_cfg, "srsa_task_template_id", int(param_template_id))
+	templates = _load_srsa_task_template_tasks(template_cfg, template_fp)
+	for template in templates:
+		if int(template.get("task_id", -1)) == int(param_template_id):
+			return _vec6(template, key_hint=f"template assembly_id={assembly_id}")
+	raise ValueError(
+		f"srsa_param_template_id={param_template_id} was not found in {template_fp} "
+		f"for assembly_id={assembly_id}."
+	)
+
+
+def _assert_task_vec_close(actual, expected, *, assembly_id: str, source: str, atol: float = 1.0e-5):
+	if len(actual) != len(expected):
+		raise ValueError(f"task_vec_6 dim mismatch for {assembly_id}: actual={actual} expected={expected}")
+	deltas = [abs(float(a) - float(e)) for a, e in zip(actual, expected)]
+	if any(delta > atol for delta in deltas):
+		raise ValueError(
+			f"task_vec_6 mismatch for assembly_id={assembly_id} from {source}: "
+			f"actual={[round(float(v), 9) for v in actual]} "
+			f"expected={[round(float(v), 9) for v in expected]} "
+			f"max_delta={max(deltas):.6g}."
+		)
+
+
+def _validate_manifest(manifest, cfg):
 	entries = list(manifest.get("tasks", []))
 	if not entries:
 		raise ValueError("No rollout tasks were collected; all targets may have been deferred for online boost.")
@@ -441,8 +535,14 @@ def _validate_manifest(manifest):
 			raise ValueError(f"Expected obs_shape=[17] for {entry['assembly_id']}, got {obs_shape}.")
 		if entry.get("assembly_id") is None:
 			raise ValueError(f"Missing assembly_id in manifest entry: {entry}")
-		if entry.get("task_vec_6", entry.get("task_param_vec", None)) is None:
-			raise ValueError(f"Missing task_vec_6/task_param_vec in manifest entry: {entry['assembly_id']}")
+		actual_task_vec = _vec6(entry, key_hint=f"manifest entry {entry['assembly_id']}")
+		expected_task_vec = _template_task_vec_for_entry(cfg, entry)
+		_assert_task_vec_close(
+			actual_task_vec,
+			expected_task_vec,
+			assembly_id=_normalize_assembly_id(entry["assembly_id"]),
+			source="manifest entry",
+		)
 		obj = torch.load(source_fp, map_location="cpu", weights_only=False)
 		if int(obj["action"].shape[-1]) != 3 or int(obj["obs"].shape[-1]) != 17:
 			raise ValueError(
@@ -595,18 +695,17 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path, gpu_id: int | N
 		"isaaclab_task_package",
 		"task",
 		"srsa_dir",
-		"srsa_sparse_reward",
-		"srsa_align_direct_reward_success",
-		"srsa_sil",
-		"srsa_if_sbc",
-		"srsa_task_template_fp",
-		"srsa_task_template_id",
-		"srsa_param_template_id",
-		"srsa_mesh_geometry_fp",
-		"srsa_mesh_geometry_task_id",
-		"srsa_mesh_plug_diameter_column",
-		"srsa_mesh_hole_diameter_column",
-		"srsa_mesh_clearance_column",
+			"srsa_sparse_reward",
+			"srsa_align_direct_reward_success",
+			"srsa_sil",
+			"srsa_if_sbc",
+			"srsa_task_template_fp",
+			"srsa_task_template_id",
+			"srsa_param_template_id",
+			"srsa_mesh_geometry_fp",
+			"srsa_mesh_plug_diameter_column",
+			"srsa_mesh_hole_diameter_column",
+			"srsa_mesh_clearance_column",
 		"srsa_mesh_clearance_mode",
 		"srsa_mesh_clearance_scale",
 		"srsa_mesh_depth_column",
@@ -627,43 +726,20 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path, gpu_id: int | N
 		"eval_terminate_min_step",
 		"isaaclab_headless",
 		"isaaclab_use_canonical_obs",
-		"isaaclab_gpu_collision_stack_size",
-		"isaaclab_disable_imitation_reward",
-		"srsa_task_family_name",
-		"srsa_task_param_obs",
-		"srsa_task_param_obs_mode",
-		"srsa_newt_obs",
-		"srsa_enable_axial_task_param_sampler",
-		"srsa_use_runtime_task_vec",
-		"srsa_axial_task_type_id",
-		"srsa_axial_scale_range",
-		"srsa_axial_fixed_plug_scale",
-		"srsa_axial_clearance_range",
-		"srsa_axial_clearance_ratio_range",
-		"srsa_axial_clearance_base",
-		"srsa_axial_clearance_anchor_multipliers",
-		"srsa_axial_clearance_anchors",
-		"srsa_axial_clearance_depth_templates",
-		"srsa_axial_clearance_depth_template_multipliers",
-		"srsa_axial_clearance_depth_template_weights",
-		"srsa_axial_clearance_jitter_ratio",
-		"srsa_axial_clearance_anchor_weights",
-		"srsa_axial_depth_range",
-		"srsa_axial_target_depth_range",
-		"srsa_axial_depth_base",
-		"srsa_axial_depth_anchor_multipliers",
-		"srsa_axial_depth_anchors",
-		"srsa_axial_depth_jitter_ratio",
-		"srsa_axial_depth_anchor_weights",
-		"srsa_axial_init_error_xy_range",
-		"srsa_axial_init_error_z_range",
-		"srsa_axial_init_error_yaw_range",
-		"srsa_axial_visual_noise_xy_range",
-		"srsa_axial_visual_noise_z_range",
-		"srsa_axial_yaw_requirement",
-		"srsa_axial_reference_radius",
-		"srsa_axial_reference_depth",
-		"srsa_enable_flange_force_sensor",
+			"isaaclab_gpu_collision_stack_size",
+			"isaaclab_disable_imitation_reward",
+			"srsa_task_family_name",
+			"srsa_task_param_obs",
+			"srsa_task_param_obs_mode",
+			"srsa_newt_obs",
+			"srsa_enable_axial_task_param_sampler",
+			"srsa_use_runtime_task_vec",
+			"srsa_axial_init_error_xy_range",
+			"srsa_axial_init_error_z_range",
+			"srsa_axial_init_error_yaw_range",
+			"srsa_axial_visual_noise_xy_range",
+			"srsa_axial_visual_noise_z_range",
+			"srsa_enable_flange_force_sensor",
 		"isaaclab_canonical_append_force",
 		"isaaclab_canonical_append_task_params",
 		"isaaclab_canonical_use_visual_noise",
@@ -1089,8 +1165,9 @@ def launch(cfg: Config):
 		assembly_ids = [worker_assembly_id]
 	else:
 		assembly_ids = _resolve_assembly_ids(cfg)
+		cfg.assembly_id = assembly_ids[0]
 	if cfg.get('collect_source_assembly_id', None) is not None:
-		cfg.assembly_id = _normalize_assembly_id(cfg.collect_source_assembly_id)
+		cfg.collect_source_assembly_id = _normalize_assembly_id(cfg.collect_source_assembly_id)
 	if not cfg.checkpoint:
 		raise ValueError("`checkpoint` must point to the source assembly checkpoint.")
 	checkpoint_fp = Path(hydra.utils.to_absolute_path(str(cfg.checkpoint))).expanduser().resolve()
@@ -1146,7 +1223,7 @@ def launch(cfg: Config):
 		"tasks": entries,
 		"skipped_tasks": skipped,
 	}
-	_validate_manifest(manifest)
+	_validate_manifest(manifest, cfg)
 	_write_json(manifest_fp, manifest)
 	total_episodes = sum(entry["num_episodes"] for entry in entries)
 	total_success = sum(entry["success_count"] for entry in entries)

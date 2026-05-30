@@ -82,6 +82,67 @@ def _load_task_template(
 	raise ValueError(f"srsa_param_template_id={param_template_id} not found in {template_fp}")
 
 
+def _vec6_from_mapping(mapping: dict, *, source: str) -> list[float]:
+	raw = mapping.get("task_vec_6", mapping.get("task_param_vec", None))
+	if raw is None:
+		raise ValueError(f"{source} is missing task_vec_6/task_param_vec.")
+	values = [float(value) for value in raw]
+	if len(values) != 6:
+		raise ValueError(f"{source} task_vec_6 must have 6 values, got {len(values)}: {values}")
+	return values
+
+
+def _assert_task_vec_close(actual: list[float], expected: list[float], *, assembly_id: str, source: str, atol: float = 1.0e-5):
+	deltas = [abs(float(a) - float(e)) for a, e in zip(actual, expected)]
+	if len(actual) != len(expected) or any(delta > atol for delta in deltas):
+		raise ValueError(
+			f"task_vec_6 mismatch for assembly_id={assembly_id} from {source}: "
+			f"actual={[round(float(v), 9) for v in actual]} "
+			f"expected={[round(float(v), 9) for v in expected]} "
+			f"max_delta={(max(deltas) if deltas else float('inf')):.6g}."
+		)
+
+
+def _load_source_metadata(source_fp: Path, *, allow_missing: bool) -> tuple[dict | None, Path]:
+	metadata_fp = Path(f"{source_fp}.json")
+	if not metadata_fp.exists():
+		if allow_missing:
+			return None, metadata_fp
+		raise FileNotFoundError(
+			f"Rollout metadata sidecar not found: {metadata_fp}. "
+			"Clean family manifests require the collector sidecar so assembly_id/task_vec_6 can be verified."
+		)
+	with open(metadata_fp, "r", encoding="utf-8") as f:
+		metadata = json.load(f)
+	if not isinstance(metadata, dict):
+		raise ValueError(f"Rollout metadata sidecar must be a JSON object: {metadata_fp}")
+	return metadata, metadata_fp
+
+
+def _validate_source_metadata(
+	assembly_id: str,
+	source_fp: Path,
+	template: dict,
+	*,
+	allow_missing_metadata: bool,
+):
+	metadata, metadata_fp = _load_source_metadata(source_fp, allow_missing=allow_missing_metadata)
+	if metadata is None:
+		return None
+	metadata_assembly_id = metadata.get("assembly_id", None)
+	if metadata_assembly_id is None:
+		raise ValueError(f"Rollout metadata {metadata_fp} is missing assembly_id.")
+	if _normalize_assembly_id(metadata_assembly_id) != assembly_id:
+		raise ValueError(
+			f"Rollout metadata assembly_id mismatch for {source_fp}: "
+			f"metadata={_normalize_assembly_id(metadata_assembly_id)} expected={assembly_id}."
+		)
+	expected_vec = _vec6_from_mapping(template, source=f"template assembly_id={assembly_id}")
+	actual_vec = _vec6_from_mapping(metadata, source=str(metadata_fp))
+	_assert_task_vec_close(actual_vec, expected_vec, assembly_id=assembly_id, source=str(metadata_fp))
+	return metadata_fp
+
+
 def _candidate_paths(assembly_id: str, source_templates: list[str], search_roots: list[Path]) -> list[Path]:
 	candidates: list[Path] = []
 	for template in source_templates:
@@ -197,6 +258,7 @@ def _manifest_entry(
 	source_fp: Path,
 	template: dict,
 	summary: dict,
+	source_metadata_fp: Path | None = None,
 ) -> dict:
 	task_vec = [float(value) for value in template.get("task_vec_6", template.get("task_param_vec"))]
 	entry = {
@@ -204,6 +266,7 @@ def _manifest_entry(
 		"task_name": template.get("task_name", f"isaaclab-srsa-assembly-{assembly_id}"),
 		"assembly_id": assembly_id,
 		"source_fp": str(source_fp),
+		"source_metadata_fp": str(source_metadata_fp) if source_metadata_fp is not None else None,
 		"action_dim": int(summary["action_dim"]),
 		"obs_shape": summary["obs_shape"],
 		"max_episode_steps": int(template.get("max_episode_steps", 74)),
@@ -260,6 +323,11 @@ def main():
 	parser.add_argument("--expected-action-dim", type=int, default=None, help="Optional rollout action dim guard.")
 	parser.add_argument("--prefer-newest", action="store_true", help="Use the newest matching rollout when multiple exist.")
 	parser.add_argument("--allow-missing", action="store_true", help="Write a partial manifest instead of failing on missing sources.")
+	parser.add_argument(
+		"--allow-missing-source-metadata",
+		action="store_true",
+		help="Do not require <rollout>.pt.json sidecars. This disables source task_vec_6 contamination checks.",
+	)
 	parser.add_argument("--overwrite", action="store_true")
 	parser.add_argument("--dry-run", action="store_true")
 	args = parser.parse_args()
@@ -303,12 +371,18 @@ def main():
 				expected_obs_dim=args.expected_obs_dim,
 				expected_action_dim=args.expected_action_dim,
 			)
+			source_metadata_fp = _validate_source_metadata(
+				assembly_id,
+				source_fp,
+				template,
+				allow_missing_metadata=args.allow_missing_source_metadata,
+			)
 		except Exception as exc:
 			if not args.allow_missing:
 				raise
 			missing.append({"assembly_id": assembly_id, "error": str(exc)})
 			continue
-		entries.append(_manifest_entry(len(entries), assembly_id, source_fp, template, summary))
+		entries.append(_manifest_entry(len(entries), assembly_id, source_fp, template, summary, source_metadata_fp))
 
 	if not entries:
 		raise RuntimeError("No manifest entries were built. Provide rollout sources or remove --allow-missing.")
