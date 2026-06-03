@@ -147,6 +147,7 @@ def _add_srsa_to_sys_path(srsa_dir: str | None):
 	paths = [
 		root / "source" / "SRSA",
 		root / "rl_games_sil",
+		root / "scripts" / "rl_games",
 	]
 	for path in paths:
 		if path.exists():
@@ -181,13 +182,25 @@ def _bool_env(value):
 	return "1" if bool(value) else "0"
 
 
+def _format_env_value(value):
+	if isinstance(value, (list, tuple)):
+		parts = []
+		for item in value:
+			if isinstance(item, (list, tuple)):
+				parts.append(":".join(_format_env_value(sub_item) for sub_item in item))
+			else:
+				parts.append(_format_env_value(item))
+		return ",".join(parts)
+	return str(value)
+
+
 def _set_env_if_value(name, value):
 	if value is None:
 		return
 	if isinstance(value, bool):
 		os.environ[name] = _bool_env(value)
 	else:
-		os.environ[name] = str(value)
+		os.environ[name] = _format_env_value(value)
 
 
 def _normalize_srsa_task_param_obs_mode(mode):
@@ -648,6 +661,10 @@ def _configure_srsa_runtime_env(cfg):
 		eval_filename = f"evaluation_{cfg.assembly_id}.h5"
 	_set_env_if_value("SRSA_EVAL_FILENAME", eval_filename)
 	_set_env_if_value("SRSA_NUM_EVAL_TRIALS", cfg.get('srsa_num_eval_trials', 100))
+	_set_env_if_value("SRSA_CAMERA_EYE", cfg.get('srsa_camera_eye', None))
+	_set_env_if_value("SRSA_CAMERA_LOOKAT", cfg.get('srsa_camera_lookat', None))
+	_set_env_if_value("SRSA_CAMERA_RESOLUTION", cfg.get('srsa_camera_resolution', None))
+	_set_env_if_value("SRSA_CAMERA_ENV_INDEX", cfg.get('srsa_camera_env_index', None))
 	_set_env_if_value("VISION_NOISE_XY_STD", cfg.get('srsa_vision_noise_xy_std', 0.0))
 	_set_env_if_value("VISION_NOISE_XY_JITTER_STD", cfg.get('srsa_vision_noise_xy_jitter_std', 0.0))
 	_set_env_if_value("VISION_NOISE_Z_STD", cfg.get('srsa_vision_noise_z_std', 0.0))
@@ -902,6 +919,16 @@ class IsaacLabWrapper(gym.Wrapper):
 		self._configure_srsa_direct_reward_success()
 		self._warned_missing_ep_success = False
 		self._warned_missing_eval_terminate_key = False
+		self._socket_camera_controller = None
+		self._socket_camera_follow_enabled = bool(cfg.get('srsa_socket_camera_follow', False))
+		self._socket_camera_warned = False
+		if self._socket_camera_follow_enabled and int(getattr(self.cfg, 'rank', 0)) == 0:
+			print(
+				"[Rank {rank}] SRSA socket-relative camera follow enabled: profile={profile}".format(
+					rank=getattr(self.cfg, 'rank', 0),
+					profile=self._resolve_socket_camera_profile_path(),
+				)
+			)
 		if self._debug_io and int(getattr(self.cfg, 'rank', 0)) == 0:
 			print(
 				"[isaaclab-debug] enabled "
@@ -913,6 +940,59 @@ class IsaacLabWrapper(gym.Wrapper):
 				f"task_param_mode={cfg.get('srsa_task_param_obs_mode', 'task_vec')} "
 				f"visual_noise={cfg.get('isaaclab_canonical_use_visual_noise', False)}"
 			)
+
+	def _resolve_socket_camera_profile_path(self):
+		raw_fp = self.cfg.get('srsa_socket_camera_profile_fp', 'camera_profiles/socket_camera_offset.json')
+		path = Path(str(raw_fp)).expanduser()
+		if not path.is_absolute():
+			srsa_dir = self.cfg.get('srsa_dir', None)
+			base_dir = Path(srsa_dir).expanduser().resolve() if srsa_dir else Path.cwd()
+			path = base_dir / path
+		return str(path)
+
+	def _resolve_socket_camera_prim_path(self):
+		cfg_value = self.cfg.get('srsa_socket_camera_camera_prim_path', None)
+		if cfg_value:
+			return str(cfg_value)
+		viewer = getattr(getattr(self.env.unwrapped, "cfg", None), "viewer", None)
+		return str(getattr(viewer, "cam_prim_path", "/OmniverseKit_Persp"))
+
+	def _get_socket_camera_controller(self):
+		if not self._socket_camera_follow_enabled:
+			return None
+		if self._socket_camera_controller is not None:
+			return self._socket_camera_controller
+		try:
+			_add_srsa_to_sys_path(self.cfg.get('srsa_dir', None))
+			from srsa_socket_camera import SocketRelativeCameraController
+
+			self._socket_camera_controller = SocketRelativeCameraController(
+				self.env,
+				profile_path=self._resolve_socket_camera_profile_path(),
+				calibrate=False,
+				follow=True,
+				env_index=self.cfg.get('srsa_socket_camera_env_index', None),
+				camera_prim_path=self._resolve_socket_camera_prim_path(),
+			)
+		except Exception as exc:
+			if not self._socket_camera_warned and int(getattr(self.cfg, 'rank', 0)) == 0:
+				print(f"[isaaclab-warning] Failed to enable SRSA socket camera follow: {exc}")
+				self._socket_camera_warned = True
+			self._socket_camera_follow_enabled = False
+			return None
+		return self._socket_camera_controller
+
+	def _maybe_update_socket_camera(self, *, force=False):
+		controller = self._get_socket_camera_controller()
+		if controller is None:
+			return
+		try:
+			controller.update(force=force)
+		except Exception as exc:
+			if not self._socket_camera_warned and int(getattr(self.cfg, 'rank', 0)) == 0:
+				print(f"[isaaclab-warning] SRSA socket camera update failed; disabling follow. {exc}")
+				self._socket_camera_warned = True
+			self._socket_camera_follow_enabled = False
 
 	def _debug_event_index(self, phase):
 		if not self._debug_io or int(getattr(self.cfg, 'rank', 0)) != 0:
@@ -1314,10 +1394,14 @@ class IsaacLabWrapper(gym.Wrapper):
 		return obs, reward, terminated, truncated, info
 
 	def render(self, *args, **kwargs):
+		self._maybe_update_socket_camera(force=False)
 		frame = self.env.render(*args, **kwargs)
 		return None if frame is None else frame.copy()
 
 	def close(self):
+		if self._socket_camera_controller is not None:
+			self._socket_camera_controller.close()
+			self._socket_camera_controller = None
 		return self.env.close()
 
 

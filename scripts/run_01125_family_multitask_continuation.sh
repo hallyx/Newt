@@ -11,7 +11,7 @@ SRSA_DIR=${SRSA_DIR:-/home/gpuserver/hx/github/srsa}
 CHECKPOINT=${CHECKPOINT:-${REPO_ROOT}/logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt}
 
 # Scheme A trains one shared model. Include the anchor task in TASK_IDS.
-TASK_IDS=${TASK_IDS:-"01125 00004 00014 00062 00271"}
+TASK_IDS=${TASK_IDS:-"01125 00186 00256 00062 00271 00726 01079 01029 01092 01102"}
 EVAL_TASK_IDS=${EVAL_TASK_IDS:-${TASK_IDS}}
 ANCHOR_TASK_ID=${ANCHOR_TASK_ID:-01125}
 
@@ -46,6 +46,12 @@ SRSA_MESH_GEOMETRY_FP=${SRSA_MESH_GEOMETRY_FP:-data/srsa_mesh_geometry_params.cs
 SRSA_PARAM_TEMPLATE_ID=${SRSA_PARAM_TEMPLATE_ID:-2}
 REFERENCE_ANCHOR_ID=${REFERENCE_ANCHOR_ID:-01125}
 REFERENCE_ANCHOR_TYPE_ID=${REFERENCE_ANCHOR_TYPE_ID:-0}
+SRSA_AXIAL_FIXED_PLUG_SCALE=${SRSA_AXIAL_FIXED_PLUG_SCALE:-true}
+SRSA_AXIAL_CLEARANCE_BASE=${SRSA_AXIAL_CLEARANCE_BASE:-0.000114}
+SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATES=${SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATES:-"0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"}
+SRSA_AXIAL_CLEARANCE_JITTER_RATIO=${SRSA_AXIAL_CLEARANCE_JITTER_RATIO:-0.10}
+SRSA_AXIAL_DEPTH_BASE=${SRSA_AXIAL_DEPTH_BASE:-0.015}
+SRSA_AXIAL_DEPTH_JITTER_RATIO=${SRSA_AXIAL_DEPTH_JITTER_RATIO:-0.10}
 EVAL_SUCCESS_METRIC=${EVAL_SUCCESS_METRIC:-relaxed}
 BATCH_EVAL_EPISODES_PER_TASK=${BATCH_EVAL_EPISODES_PER_TASK:-100}
 
@@ -70,6 +76,21 @@ LOG_ROOT=${LOG_ROOT:-${REPO_ROOT}/logs/family_multitask_01125_axial_hole/${RUN_S
 DRY_RUN=${DRY_RUN:-0}
 CHECK_CUDA=${CHECK_CUDA:-1}
 ENABLE_WANDB=${ENABLE_WANDB:-false}
+VIDEO_ONLY=${VIDEO_ONLY:-false}
+POST_TRAIN_VIDEO_EVAL=${POST_TRAIN_VIDEO_EVAL:-false}
+VIDEO_CHECKPOINT=${VIDEO_CHECKPOINT:-}
+VIDEO_TASK_IDS=${VIDEO_TASK_IDS:-${EVAL_TASK_IDS}}
+VIDEO_NUM_ENVS=${VIDEO_NUM_ENVS:-1}
+VIDEO_EVAL_EPISODES=${VIDEO_EVAL_EPISODES:-1}
+VIDEO_OUTPUT_DIR=${VIDEO_OUTPUT_DIR:-${LOG_ROOT}/video_eval}
+VIDEO_LOG=${VIDEO_LOG:-}
+VIDEO_FPS=${VIDEO_FPS:-15}
+VIDEO_FORMAT=${VIDEO_FORMAT:-mp4}
+VIDEO_MAX_EPISODES=${VIDEO_MAX_EPISODES:-1}
+VIDEO_SOCKET_CAMERA_FOLLOW=${VIDEO_SOCKET_CAMERA_FOLLOW:-true}
+VIDEO_SOCKET_CAMERA_PROFILE_FP=${VIDEO_SOCKET_CAMERA_PROFILE_FP:-camera_profiles/socket_camera_offset.json}
+VIDEO_SOCKET_CAMERA_ENV_INDEX=${VIDEO_SOCKET_CAMERA_ENV_INDEX:-0}
+VIDEO_SOCKET_CAMERA_PRIM_PATH=${VIDEO_SOCKET_CAMERA_PRIM_PATH:-}
 
 make_abs_path() {
   local path=$1
@@ -103,6 +124,35 @@ print_command() {
   printf '\n'
 }
 
+resolve_video_checkpoint() {
+  local ckpt="${VIDEO_CHECKPOINT}"
+  local latest_from_log=""
+  local candidate=""
+  if [[ -z "${ckpt}" && -f "${TRAIN_LOG}" ]]; then
+    latest_from_log=$(awk '/Updated latest checkpoint:/ {fp=$NF} END {print fp}' "${TRAIN_LOG}")
+    if [[ -n "${latest_from_log}" ]]; then
+      ckpt="${latest_from_log}"
+    fi
+  fi
+  if [[ -z "${ckpt}" && -n "${RUN_ID}" ]]; then
+    candidate="${REPO_ROOT}/logs/isaaclab-srsa-assembly/1/${EXP_NAME}/${RUN_ID}/models/latest.pt"
+    if [[ -f "${candidate}" ]]; then
+      ckpt="${candidate}"
+    fi
+  fi
+  if [[ -z "${ckpt}" ]]; then
+    ckpt="${CHECKPOINT}"
+    echo "[launcher] no post-train latest checkpoint found; video eval will use warm-start checkpoint=${ckpt}" >&2
+  fi
+  ckpt=$(make_abs_path "${ckpt}")
+  if [[ ! -f "${ckpt}" ]]; then
+    echo "[launcher] video checkpoint not found: ${ckpt}" >&2
+    echo "[launcher] Set VIDEO_CHECKPOINT=/path/to/models/latest.pt or disable POST_TRAIN_VIDEO_EVAL." >&2
+    exit 1
+  fi
+  printf '%s\n' "${ckpt}"
+}
+
 CHECKPOINT=$(make_abs_path "${CHECKPOINT}")
 SRSA_TASK_TEMPLATE_FP=$(make_abs_path "${SRSA_TASK_TEMPLATE_FP}")
 SRSA_MESH_GEOMETRY_FP=$(make_abs_path "${SRSA_MESH_GEOMETRY_FP}")
@@ -119,11 +169,19 @@ fi
 if [[ -n "${OFFLINE_EXPORT_FP}" ]]; then
   OFFLINE_EXPORT_FP=$(make_abs_path "${OFFLINE_EXPORT_FP}")
 fi
+VIDEO_OUTPUT_DIR=$(make_abs_path "${VIDEO_OUTPUT_DIR}")
+if [[ -z "${VIDEO_LOG}" ]]; then
+  VIDEO_LOG="${VIDEO_OUTPUT_DIR}/batch_eval_video.log"
+else
+  VIDEO_LOG=$(make_abs_path "${VIDEO_LOG}")
+fi
 
 read -r -a TASK_ID_ARRAY <<< "${TASK_IDS}"
 read -r -a EVAL_TASK_ID_ARRAY <<< "${EVAL_TASK_IDS}"
+read -r -a VIDEO_TASK_ID_ARRAY <<< "${VIDEO_TASK_IDS}"
 TASK_IDS_JSON=$(json_list "${TASK_ID_ARRAY[@]}")
 EVAL_TASK_IDS_JSON=$(json_list "${EVAL_TASK_ID_ARRAY[@]}")
+VIDEO_TASK_IDS_JSON=$(json_list "${VIDEO_TASK_ID_ARRAY[@]}")
 COLLECT_PARALLEL_GPU_IDS_HYDRA=""
 if [[ -n "${COLLECT_PARALLEL_GPU_IDS}" ]]; then
   if [[ "${COLLECT_PARALLEL_GPU_IDS}" == \[* ]]; then
@@ -133,6 +191,16 @@ if [[ -n "${COLLECT_PARALLEL_GPU_IDS}" ]]; then
     COLLECT_PARALLEL_GPU_IDS_HYDRA=$(json_list "${COLLECT_PARALLEL_GPU_ID_ARRAY[@]}")
   fi
 fi
+
+case "${VIDEO_ONLY}" in
+  true|True|TRUE|1|yes|Yes|YES)
+    VIDEO_ONLY=true
+    POST_TRAIN_VIDEO_EVAL=true
+    ;;
+  *)
+    VIDEO_ONLY=false
+    ;;
+esac
 
 if [[ ! -x "${PYTHON}" ]]; then
   echo "[launcher] python not found or not executable: ${PYTHON}" >&2
@@ -162,31 +230,31 @@ if [[ ! -f "${SRSA_MESH_GEOMETRY_FP}" ]]; then
   echo "[launcher] SRSA mesh geometry CSV not found: ${SRSA_MESH_GEOMETRY_FP}" >&2
   exit 1
 fi
-if [[ -z "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_AUTO_COLLECT_REPLAY}" != "true" ]]; then
+if [[ "${VIDEO_ONLY}" != "true" && -z "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_AUTO_COLLECT_REPLAY}" != "true" ]]; then
   echo "[launcher] Offline multitask continuation requires a replay manifest. To train without an existing manifest, enable online rollout collection or run the replay collection script first." >&2
   echo "[launcher] To build a manifest from existing per-task rollouts, run:" >&2
   echo "[launcher]   ${PYTHON} tdmpc2/scripts/build_family_offline_manifest.py --assembly-ids ${TASK_IDS} --source-template '/path/to/policy_rollouts/{assembly_id}/policy_eval_rollouts.pt' --output-manifest-fp data/offline_manifest_01125_family_multitask_clean_v1.json --srsa-mesh-geometry-fp data/srsa_mesh_geometry_params.csv --expected-obs-dim 17 --expected-action-dim 3 --overwrite" >&2
   exit 1
 fi
-if [[ -n "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_REPLAY_MANIFEST_FP}" != *.json ]]; then
+if [[ "${VIDEO_ONLY}" != "true" && -n "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_REPLAY_MANIFEST_FP}" != *.json ]]; then
   echo "[launcher] manifest should point to a replay/data manifest json, not a model checkpoint: ${MULTITASK_REPLAY_MANIFEST_FP}" >&2
   echo "[launcher] Use checkpoint=/.../models/best.pt and MULTITASK_REPLAY_MANIFEST_FP=/.../data/offline_manifest_family.json." >&2
   exit 1
 fi
-if [[ -n "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_REPLAY_MANIFEST_FP}" == */models/* ]]; then
+if [[ "${VIDEO_ONLY}" != "true" && -n "${MULTITASK_REPLAY_MANIFEST_FP}" && "${MULTITASK_REPLAY_MANIFEST_FP}" == */models/* ]]; then
   echo "[launcher] manifest should point to a replay/data manifest json, not a model checkpoint: ${MULTITASK_REPLAY_MANIFEST_FP}" >&2
   echo "[launcher] Use checkpoint=/.../models/best.pt and MULTITASK_REPLAY_MANIFEST_FP=/.../data/offline_manifest_family.json." >&2
   exit 1
 fi
-if [[ -n "${MULTITASK_REPLAY_MANIFEST_FP}" && ! -f "${MULTITASK_REPLAY_MANIFEST_FP}" ]]; then
+if [[ "${VIDEO_ONLY}" != "true" && -n "${MULTITASK_REPLAY_MANIFEST_FP}" && ! -f "${MULTITASK_REPLAY_MANIFEST_FP}" ]]; then
   echo "[launcher] multitask replay manifest not found: ${MULTITASK_REPLAY_MANIFEST_FP}" >&2
   exit 1
 fi
-if [[ -n "${OFFLINE_DATASET_FP}" && ! -f "${OFFLINE_DATASET_FP}" ]]; then
+if [[ "${VIDEO_ONLY}" != "true" && -n "${OFFLINE_DATASET_FP}" && ! -f "${OFFLINE_DATASET_FP}" ]]; then
   echo "[launcher] offline compact dataset not found: ${OFFLINE_DATASET_FP}" >&2
   exit 1
 fi
-if [[ -n "${OFFLINE_SOURCE_FP}" && ! -f "${OFFLINE_SOURCE_FP}" ]]; then
+if [[ "${VIDEO_ONLY}" != "true" && -n "${OFFLINE_SOURCE_FP}" && ! -f "${OFFLINE_SOURCE_FP}" ]]; then
   echo "[launcher] offline source dataset not found: ${OFFLINE_SOURCE_FP}" >&2
   exit 1
 fi
@@ -213,6 +281,24 @@ case "${MULTITASK_EVAL_ENABLED}" in
     if [[ "${MULTITASK_EVAL_INTERVAL}" == "0" ]]; then
       MULTITASK_EVAL_INTERVAL=50000
     fi
+    ;;
+esac
+
+case "${POST_TRAIN_VIDEO_EVAL}" in
+  true|True|TRUE|1|yes|Yes|YES)
+    POST_TRAIN_VIDEO_EVAL=true
+    ;;
+  *)
+    POST_TRAIN_VIDEO_EVAL=false
+    ;;
+esac
+
+case "${VIDEO_SOCKET_CAMERA_FOLLOW}" in
+  true|True|TRUE|1|yes|Yes|YES)
+    VIDEO_SOCKET_CAMERA_FOLLOW=true
+    ;;
+  *)
+    VIDEO_SOCKET_CAMERA_FOLLOW=false
     ;;
 esac
 
@@ -243,6 +329,9 @@ echo "[launcher] srsa_task_template_fp=${SRSA_TASK_TEMPLATE_FP}"
 echo "[launcher] srsa_mesh_geometry_fp=${SRSA_MESH_GEOMETRY_FP}"
 echo "[launcher] srsa_param_template_id=${SRSA_PARAM_TEMPLATE_ID}"
 echo "[launcher] reference_anchor=${REFERENCE_ANCHOR_ID} type=${REFERENCE_ANCHOR_TYPE_ID}"
+echo "[launcher] size_templates fixed_plug_scale=${SRSA_AXIAL_FIXED_PLUG_SCALE} clearance_base=${SRSA_AXIAL_CLEARANCE_BASE} templates=${SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATES} depth_base=${SRSA_AXIAL_DEPTH_BASE}"
+echo "[launcher] video_only=${VIDEO_ONLY} post_train_video_eval=${POST_TRAIN_VIDEO_EVAL} video_task_ids=${VIDEO_TASK_IDS_JSON} video_output_dir=${VIDEO_OUTPUT_DIR}"
+echo "[launcher] video_socket_camera_follow=${VIDEO_SOCKET_CAMERA_FOLLOW} profile=${VIDEO_SOCKET_CAMERA_PROFILE_FP} env_index=${VIDEO_SOCKET_CAMERA_ENV_INDEX}"
 echo "[launcher] train_log=${TRAIN_LOG}"
 echo "[launcher] dry_run=${DRY_RUN}"
 
@@ -310,6 +399,12 @@ train_cmd=(
   srsa_task_param_obs=false
   srsa_task_param_obs_mode=task_vec
   srsa_enable_axial_task_param_sampler=true
+  srsa_axial_fixed_plug_scale="${SRSA_AXIAL_FIXED_PLUG_SCALE}"
+  srsa_axial_clearance_base="${SRSA_AXIAL_CLEARANCE_BASE}"
+  srsa_axial_clearance_depth_templates="'${SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATES}'"
+  srsa_axial_clearance_jitter_ratio="${SRSA_AXIAL_CLEARANCE_JITTER_RATIO}"
+  srsa_axial_depth_base="${SRSA_AXIAL_DEPTH_BASE}"
+  srsa_axial_depth_jitter_ratio="${SRSA_AXIAL_DEPTH_JITTER_RATIO}"
   'srsa_axial_init_error_xy_range="0.009,0.0010"'
   'srsa_axial_init_error_z_range="0.0010,0.0020"'
   'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"'
@@ -391,11 +486,138 @@ echo "[launcher] command:"
 print_command "${train_cmd[@]}"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-  echo "[launcher] dry run complete; command was not executed."
-  exit 0
+  if [[ "${VIDEO_ONLY}" != "true" && "${POST_TRAIN_VIDEO_EVAL}" != "true" ]]; then
+    echo "[launcher] dry run complete; command was not executed."
+    exit 0
+  fi
+  echo "[launcher] dry run: training command will not be executed; continuing to print video eval command."
 fi
 
-echo "[launcher] $(date --iso-8601=seconds) start shared family multitask continuation"
-"${train_cmd[@]}" > "${TRAIN_LOG}" 2>&1
-echo "[launcher] $(date --iso-8601=seconds) done shared family multitask continuation"
-echo "[launcher] log saved to ${TRAIN_LOG}"
+if [[ "${VIDEO_ONLY}" == "true" ]]; then
+  echo "[launcher] video_only=true; skipping shared family multitask continuation."
+elif [[ "${DRY_RUN}" == "1" ]]; then
+  echo "[launcher] dry run: skipping shared family multitask continuation."
+else
+  echo "[launcher] $(date --iso-8601=seconds) start shared family multitask continuation"
+  "${train_cmd[@]}" > "${TRAIN_LOG}" 2>&1
+  echo "[launcher] $(date --iso-8601=seconds) done shared family multitask continuation"
+  echo "[launcher] log saved to ${TRAIN_LOG}"
+fi
+
+if [[ "${POST_TRAIN_VIDEO_EVAL}" == "true" ]]; then
+  mkdir -p "${VIDEO_OUTPUT_DIR}"
+  mkdir -p "$(dirname -- "${VIDEO_LOG}")"
+  VIDEO_CHECKPOINT_RESOLVED=$(resolve_video_checkpoint)
+  VIDEO_METRICS_DIR="${VIDEO_OUTPUT_DIR}/metrics"
+  VIDEO_SUMMARY_FP="${VIDEO_OUTPUT_DIR}/batch_eval_summary.json"
+  VIDEO_RUN_ID="${RUN_ID:-${RUN_STAMP}}_video_eval"
+  video_eval_cmd=(
+    "${PYTHON}" tdmpc2/batch_eval_tasks.py
+    checkpoint="${VIDEO_CHECKPOINT_RESOLVED}"
+    eval_assembly_ids="${VIDEO_TASK_IDS_JSON}"
+    isaaclab_backend=srsa
+    task=isaaclab-srsa-assembly
+    isaaclab_dir="${ISAACLAB_DIR}"
+    srsa_dir="${SRSA_DIR}"
+    srsa_task_template_fp="${SRSA_TASK_TEMPLATE_FP}"
+    srsa_mesh_geometry_fp="${SRSA_MESH_GEOMETRY_FP}"
+    srsa_param_template_id="${SRSA_PARAM_TEMPLATE_ID}"
+    eval_task_template_exact=true
+    eval_task_template_print=true
+    srsa_sparse_reward=false
+    isaaclab_disable_imitation_reward=false
+    srsa_align_direct_reward_success=true
+    srsa_if_sbc=false
+    num_envs="${VIDEO_NUM_ENVS}"
+    gpu_id="${GPU_ID}"
+    model_size="${MODEL_SIZE}"
+    horizon="${HORIZON}"
+    compile=false
+    mpc=true
+    isaaclab_headless=true
+    isaaclab_use_canonical_obs=true
+    srsa_task_family_name=normal_fit
+    srsa_task_param_obs=false
+    srsa_task_param_obs_mode=task_vec
+    srsa_enable_axial_task_param_sampler=true
+    srsa_axial_fixed_plug_scale="${SRSA_AXIAL_FIXED_PLUG_SCALE}"
+    srsa_axial_clearance_base="${SRSA_AXIAL_CLEARANCE_BASE}"
+    srsa_axial_clearance_depth_templates="'${SRSA_AXIAL_CLEARANCE_DEPTH_TEMPLATES}'"
+    srsa_axial_clearance_jitter_ratio="${SRSA_AXIAL_CLEARANCE_JITTER_RATIO}"
+    srsa_axial_depth_base="${SRSA_AXIAL_DEPTH_BASE}"
+    srsa_axial_depth_jitter_ratio="${SRSA_AXIAL_DEPTH_JITTER_RATIO}"
+    'srsa_axial_init_error_xy_range="0.009,0.0010"'
+    'srsa_axial_init_error_z_range="0.0010,0.0020"'
+    'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"'
+    'srsa_axial_visual_noise_xy_range="0.0,0.0"'
+    'srsa_axial_visual_noise_z_range="0.0,0.0"'
+    srsa_enable_flange_force_sensor=true
+    isaaclab_canonical_append_force=true
+    isaaclab_canonical_append_task_params=false
+    srsa_vision_noise_xy_std=0.0
+    srsa_vision_noise_xy_jitter_std=0.0
+    srsa_vision_noise_z_std=0.0
+    srsa_vision_noise_z_jitter_std=0.0
+    isaaclab_canonical_use_visual_noise=false
+    task_conditioning=axial_params
+    srsa_axial_reference_anchor_assembly_id="${REFERENCE_ANCHOR_ID}"
+    srsa_axial_reference_anchor_task_type_id="${REFERENCE_ANCHOR_TYPE_ID}"
+    srsa_axial_recompute_manifest_task_vecs=true
+    eval_success_metric="${EVAL_SUCCESS_METRIC}"
+    srsa_eval_success_metric="${EVAL_SUCCESS_METRIC}"
+    strict_depth_fraction=0.90
+    strict_success_steps=10
+    strict_lateral_tol_min=0.0005
+    strict_lateral_tol_max=0.0020
+    strict_keypoint_tol_min=0.0010
+    strict_keypoint_tol_max=0.0030
+    strict_angle_tol_deg=3.0
+    batch_eval_episodes_per_task="${VIDEO_EVAL_EPISODES}"
+    batch_eval_spawn_per_assembly=true
+    batch_eval_overwrite=true
+    batch_eval_output_dir="${VIDEO_METRICS_DIR}"
+    batch_eval_summary_fp="${VIDEO_SUMMARY_FP}"
+    save_video=true
+    eval_video_dir="${VIDEO_OUTPUT_DIR}"
+    eval_video_fps="${VIDEO_FPS}"
+    eval_video_format="${VIDEO_FORMAT}"
+    eval_video_max_episodes="${VIDEO_MAX_EPISODES}"
+    srsa_socket_camera_follow="${VIDEO_SOCKET_CAMERA_FOLLOW}"
+    srsa_socket_camera_profile_fp="${VIDEO_SOCKET_CAMERA_PROFILE_FP}"
+    srsa_socket_camera_env_index="${VIDEO_SOCKET_CAMERA_ENV_INDEX}"
+    enable_wandb=false
+    exp_name="${EXP_NAME}_video_eval"
+    run_id="${VIDEO_RUN_ID}"
+    seed=1
+    contact_history_enabled=true
+    contact_history_len=4
+    contact_context_dim=64
+    contact_history_hidden_dim=128
+    contact_history_layers=2
+    contact_force_dim=6
+    contact_action_dim=3
+    contact_ee_delta_dim=3
+    contact_history_use_ee_delta=true
+  )
+  if [[ -n "${ISAACLAB_GPU_COLLISION_STACK_SIZE}" ]]; then
+    video_eval_cmd+=(isaaclab_gpu_collision_stack_size="${ISAACLAB_GPU_COLLISION_STACK_SIZE}")
+  fi
+  if [[ -n "${VIDEO_SOCKET_CAMERA_PRIM_PATH}" ]]; then
+    video_eval_cmd+=(srsa_socket_camera_camera_prim_path="${VIDEO_SOCKET_CAMERA_PRIM_PATH}")
+  fi
+  echo "[launcher] $(date --iso-8601=seconds) start post-train video eval checkpoint=${VIDEO_CHECKPOINT_RESOLVED}"
+  echo "[launcher] video command:"
+  print_command "${video_eval_cmd[@]}"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "[launcher] dry run complete; video eval command was not executed."
+    exit 0
+  fi
+  "${video_eval_cmd[@]}" > "${VIDEO_LOG}" 2>&1
+  if [[ ! -f "${VIDEO_SUMMARY_FP}" || ! -f "${VIDEO_SUMMARY_FP%.json}.csv" ]]; then
+    echo "[launcher] video eval output missing under ${VIDEO_OUTPUT_DIR}" >&2
+    echo "[launcher] Check ${VIDEO_LOG}" >&2
+    exit 1
+  fi
+  echo "[launcher] $(date --iso-8601=seconds) done post-train video eval"
+  echo "[launcher] videos and summary saved under ${VIDEO_OUTPUT_DIR}"
+fi

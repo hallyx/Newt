@@ -615,6 +615,104 @@ logs/<task>/<seed>/<exp_name>/<run_id>/data/real_closed_loop_trace.jsonl
 {"type":"inference_step","step":0,"episode_step":0,"obs":[...],"action":[...],"sent_action":[...],"task":[...],"next_obs":[...],"reward":0.0,"done":false}
 ```
 
+### 录制视频
+
+仿真 eval 和 batch eval 都支持本地录制 mp4，核心开关是 `save_video=true`。录视频建议先用 `num_envs=1` 和 1 个 episode；正式成功率统计再单独跑大批量。
+
+单任务 eval：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
+  checkpoint=/path/to/checkpoint.pt \
+  eval_mode=sim \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=00186 \
+  num_envs=1 \
+  eval_trials=1 \
+  isaaclab_headless=true \
+  save_video=true \
+  eval_video_dir=videos/eval_00186 \
+  eval_video_fps=15 \
+  eval_video_max_episodes=1 \
+  enable_wandb=false
+```
+
+Newt batch eval 录一组 assembly：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/batch_eval_tasks.py \
+  checkpoint=/path/to/checkpoint.pt \
+  offline_manifest_fp=data/offline_manifest_policy_rollouts_from_00186.json \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  batch_eval_assembly_ids="[01125,00186,00256]" \
+  num_envs=1 \
+  batch_eval_episodes_per_task=1 \
+  save_video=true \
+  eval_video_dir=data/video_eval \
+  batch_eval_output_dir=data/video_eval/metrics \
+  batch_eval_overwrite=true \
+  enable_wandb=false
+```
+
+Newt 侧一行录同一个 `assembly_id` 下的不同任务尺寸：
+
+```bash
+cd /home/gpuserver/hx/github/Newt
+
+scripts/batch_record_task_sizes.py \
+  --assembly_id 00783 \
+  --checkpoint logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
+  --device cuda:0 \
+  --video_length 300 \
+  --templates "0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"
+```
+
+这个脚本会循环调用 Newt 的 `tdmpc2/eval.py`，按 `clearance_multiplier:depth_multiplier` 自动选择 `srsa_param_template_id`、设置 `srsa_axial_clearance_depth_templates`，并按尺寸命名视频，例如：
+
+```text
+00783_c0p5_d0p5.mp4
+00783_c1_d1.mp4
+00783_c4_d2.mp4
+```
+
+默认启用 `--socket_camera_follow`，读取 `camera_profiles/socket_camera_offset.json` 来保持不同尺寸任务视角一致。没有 profile 时会退回默认视角；关闭跟随相机加 `--no_socket_camera_follow`。
+
+Newt eval 支持 `eval_video_name`，批量脚本会自动传入尺寸名，通常不需要手动设置。
+
+使用 Newt eval 的 SRSA socket 相对相机时，先校准并保存 `camera_profiles/socket_camera_offset.json`，然后在录制命令里加：
+
+```bash
+srsa_socket_camera_follow=true \
+srsa_socket_camera_profile_fp=camera_profiles/socket_camera_offset.json \
+srsa_socket_camera_env_index=0
+```
+
+`srsa_socket_camera_profile_fp` 的相对路径按 `srsa_dir` 解析。录制时每次 `render()` 前会用当前 socket 世界坐标加 offset 更新相机。
+
+如果不用 socket 跟随，也可以固定静态相机：
+
+```bash
+'srsa_camera_eye=[1.05,-0.85,0.45]' \
+'srsa_camera_lookat=[0.55,0.0,0.18]' \
+'srsa_camera_resolution=[1280,720]' \
+srsa_camera_env_index=0
+```
+
+01125 family continuation 脚本已经封装了视频入口：
+
+```bash
+VIDEO_ONLY=true VIDEO_CHECKPOINT=/path/to/checkpoint.pt \
+  scripts/run_01125_family_multitask_continuation.sh
+
+POST_TRAIN_VIDEO_EVAL=true \
+  scripts/run_01125_family_multitask_continuation.sh
+```
+
+常用覆盖项：`VIDEO_TASK_IDS`、`VIDEO_OUTPUT_DIR`、`VIDEO_FPS`、`VIDEO_MAX_EPISODES`、`VIDEO_SOCKET_CAMERA_FOLLOW`、`VIDEO_SOCKET_CAMERA_PROFILE_FP`。
+
 ## 真机 Eval 命令
 
 真机侧需要先启动 action receiver，并监听与 `eval_zmq_server` 对应的地址。
@@ -711,7 +809,7 @@ cd /home/gpuserver/hx/github/Newt
   eval_zmq_server=tcp://<robot-host>:5555 \
   hil_collect_episodes=20 \
   hil_collect_send_policy_during_intervention=false \
-  hil_collect_done_on_step_limit=false \
+  hil_collect_done_on_step_limit=true \
   hil_collect_reward_mode=distance_to_target \
   hil_collect_reward_distance_scale=10.0 \
   hil_collect_output_fp=data/real_hil_01125.pt \
@@ -732,7 +830,7 @@ cd /home/gpuserver/hx/github/Newt
 }
 ```
 
-`collect_real_hil_rollouts.py` 会根据 `executed_delta_frame`、`eval_zmq_action_frame`、`eval_zmq_command_frame` 和 `eval_zmq_action_scale` 把实际执行的 delta 转回训练用 action。多条轨迹采集时，下位机可通过键盘 episode marker 发布 `done/success`；collector 收到 `done=true` 后结束当前 episode，并等待 `done=false` 进入下一条。需要完全由键盘标记分段时，设置 `hil_collect_done_on_step_limit=false`，这样 `eval_real_steps` 不会自动截断当前轨迹。`hil_collect_reward_mode=distance_to_target` 时，上位机会用下一帧 TCP base 位置到 `eval_real_socket_pos` 的距离计算 reward，并保存到 dataset 的 `reward` 列。
+`collect_real_hil_rollouts.py` 会根据 `executed_delta_frame`、`eval_zmq_action_frame`、`eval_zmq_command_frame` 和 `eval_zmq_action_scale` 把实际执行的 delta 转回训练用 action。多条轨迹采集时，下位机可通过键盘 episode marker 发布 `done/success`；collector 收到 `done=true` 后结束当前 episode，并等待 `done=false` 进入下一条。01125 HIL 微调默认使用 `hil_collect_done_on_step_limit=true` 和 `eval_real_steps=74`，避免长时间人工拖动片段主导离线训练；若真机链路确实需要更长，最多临时放宽到 120 步，并在训练前用 `tdmpc2/scripts/clean_real_hil_dataset.py` 做审计和窗口化。`hil_collect_reward_mode=distance_to_target` 时，上位机会用下一帧 TCP base 位置到 `eval_real_socket_pos` 的距离计算 reward，并保存到 dataset 的 `reward` 列。
 
 ### 插值轨迹坐标 Probe
 
@@ -949,6 +1047,46 @@ trace 输出文件。相对路径会写到当前 Hydra run 目录下；不设置
 `eval_trace_env_index`
 
 `num_envs > 1` 时选择记录哪个 env。默认跟随 `eval_zmq_env_index`。
+
+`save_video`
+
+开启本地视频录制。仿真 eval 和 batch eval 都支持，默认保存 mp4；输出路径会写入 metrics 的 `eval_video_fp`。
+
+`eval_video_dir`
+
+视频输出目录。不设置时写到当前 run 目录下；batch eval 设置后会按 `<eval_video_dir>/<assembly_id>/` 分目录。
+
+`eval_video_fps` / `eval_video_format`
+
+视频帧率和格式，默认 `15` / `mp4`。如果 mp4 编码不可用，会退回保存 npz。
+
+`eval_video_max_episodes` / `eval_video_max_frames`
+
+限制最多录几个 episode 或多少帧。调试视频通常设为 `1` 个 episode。
+
+`eval_video_record_every` / `eval_video_env_index`
+
+抽帧间隔和录制的 env index。多 env 时只录一个 env。
+
+`eval_video_name`
+
+可选的视频文件名主体。批量录不同尺寸时用它生成类似 `00783_c0p5_d0p5.mp4` 的名字。
+
+`srsa_socket_camera_follow`
+
+启用 SRSA socket 相对相机。需要先在 SRSA 侧保存 offset profile；录制时每帧 `render()` 前更新相机。
+
+`srsa_socket_camera_profile_fp`
+
+socket 相机 offset profile 路径。相对路径按 `srsa_dir` 解析，默认 `camera_profiles/socket_camera_offset.json`。
+
+`srsa_socket_camera_env_index`
+
+读取哪个 env 的 socket 坐标，录视频时通常设为 `0`。
+
+`srsa_camera_eye` / `srsa_camera_lookat` / `srsa_camera_resolution` / `srsa_camera_env_index`
+
+静态相机配置，会透传给 SRSA。一般和 `srsa_socket_camera_follow` 二选一使用。
 
 `eval_episodes`
 
@@ -1254,7 +1392,7 @@ python3 tdmpc2/collect_real_hil_rollouts.py \
   hil_collect_manifest_fp=data/real_hil_01125_manifest.json \
   hil_collect_require_actual_action=true \
   hil_collect_send_policy_during_intervention=false \
-  hil_collect_done_on_step_limit=false \
+  hil_collect_done_on_step_limit=true \
   hil_collect_reward_mode=distance_to_target \
   hil_collect_reward_distance_scale=10.0 \
   compile=false \
@@ -1293,7 +1431,7 @@ python3 tdmpc2/collect_real_hil_rollouts.py \
   hil_collect_manifest_fp=data/real_hil_01125_manifest.json \
   hil_collect_require_actual_action=true \
   hil_collect_send_policy_during_intervention=false \
-  hil_collect_done_on_step_limit=false \
+  hil_collect_done_on_step_limit=true \
   hil_collect_reward_mode=distance_to_target \
   hil_collect_reward_distance_scale=10.0 \
   compile=false \
@@ -1328,4 +1466,3 @@ python3 tdmpc2/real_interp_probe.py \
   real_interp_steps=100000 \
   real_interp_step_size=0.0001 \
   real_interp_dry_run=false
-

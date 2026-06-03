@@ -737,9 +737,12 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	episode_len = torch.zeros(trainer.cfg.num_envs, device=trainer._rollout_device)
 	completed = 0
 	trace_step = 0
+	video_fp = None
+	video_recorder = trainer.logger.video if trainer.cfg.save_video else None
+	video_max_episodes = max(1, int(trainer.cfg.get('eval_video_max_episodes', 1) or 1))
 
-	if trainer.cfg.save_video:
-		trainer.logger.video.init(trainer.env, enabled=trainer.cfg.rank == 0)
+	if video_recorder is not None:
+		video_recorder.init(trainer.env, enabled=trainer.cfg.rank == 0)
 
 	with EvalTraceRecorder(trainer.cfg, phase="sim") as trace, make_eval_zmq_publisher(trainer.cfg) as action_publisher:
 		if trace.enabled and not (0 <= trace.env_index < trainer.cfg.num_envs):
@@ -770,7 +773,10 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 					episode_step=int(episode_len[env_index].item()),
 					task_id=int(trainer._tasks[env_index].item()),
 				)
+			should_record_video = video_recorder is not None and completed < video_max_episodes
 			obs, reward, terminated, truncated, info = trainer.env.step(action)
+			if should_record_video:
+				video_recorder.record(trainer.env)
 
 			done = terminated | truncated
 			episode_reward += reward
@@ -819,11 +825,9 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 					episode_len[i] = 0.0
 					completed += 1
 
-			if trainer.cfg.save_video and completed == 0:
-				trainer.logger.video.record(trainer.env)
-
-	if trainer.cfg.save_video:
-		trainer.logger.video.save(trainer._step)
+	if video_recorder is not None:
+		video_name = trainer.cfg.get('eval_video_name', None) or f"eval_trials_{trainer.cfg.get('assembly_id', 'assembly')}"
+		video_fp = video_recorder.save(trainer._step, name=video_name)
 
 	barrier()
 
@@ -877,6 +881,8 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 		if len(metric_values) > 0:
 			metrics[f'episode_{metric_key}'] = sum(metric_values) / len(metric_values)
 	metrics['eval_trials'] = total_count
+	if video_fp is not None:
+		metrics['eval_video_fp'] = str(video_fp)
 	return metrics
 
 

@@ -31,11 +31,13 @@ eval_zmq_action_order: dx,dy,dz
 eval_zmq_send_done: true
 
 hil_collect_episodes: 20
+hil_collect_done_on_step_limit: true
 hil_collect_output_fp: data/real_hil_01125.pt
 hil_collect_manifest_fp: data/real_hil_01125_manifest.json
 hil_collect_action_keys: executed_action,actual_action,applied_action,intervene_action
 hil_collect_intervened_key: intervened
 hil_collect_require_actual_action: true
+hil_collect_send_policy_during_intervention: false
 
 compile: false
 mpc: true

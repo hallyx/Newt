@@ -67,6 +67,59 @@ cd /home/gpuserver/hx/github/Newt
   exp_name=srsa_smoke
 ```
 
+## 直接在线微调（不采集数据）
+
+如果目标是先把 01125 checkpoint 迁移到一组新 assembly，优先走直接在线微调，不要先做 rollout
+采集和离线 manifest。这个路径只用仿真环境继续训练：
+
+```text
+01125 checkpoint -> tdmpc2/train.py checkpoint=... finetune=true -> target assembly online replay
+```
+
+仓库提供了一个干净入口：
+
+```bash
+CHECKPOINT=logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
+TARGETS="00186 00256 00062 00271 00726 01079 01029 01092 01102" \
+STEPS=600000 \
+NUM_ENVS=300 \
+NUM_GPUS=2 \
+scripts/run_01125_direct_finetune_targets.sh
+```
+
+这个脚本做的是独立目标微调：每个 `assembly_id` 都从同一个 `CHECKPOINT` 启动，输出到：
+
+```text
+logs/isaaclab-srsa-assembly/1/srsa_axial_direct_finetune_from_01125/<run_id>/
+```
+
+关键实现语义：
+
+- `checkpoint=...`: 只表示初始化模型 `.pt`。
+- `finetune=true`: `Trainer` 会从第 0 步开始使用 checkpoint policy/MPC 采样，不走随机 warm-up 动作。
+- `seeding_coef=1`: 收集约一轮 rollout 后开始 update，避免空 replay buffer 直接更新。
+- `assembly_id + srsa_param_template_id`: 选择目标几何和 clearance/depth 模板。
+- 不需要 `offline_manifest_fp`、`multitask_replay_manifest_fp`、`offline_dataset_fp` 或 `collect_*` 参数。
+
+先 dry-run 检查命令：
+
+```bash
+DRY_RUN=1 TARGETS="00186" scripts/run_01125_direct_finetune_targets.sh
+```
+
+如果想让 checkpoint 在目标之间串行传递，而不是每个目标独立从 01125 初始化，用已有的 continual 入口：
+
+```bash
+SOURCE_CHECKPOINT=/path/to/01125/models/best.pt \
+TARGETS="00186 00256 00062" \
+STEPS_PER_TASK=1000000 \
+scripts/run_01125_continual_finetune_targets.sh
+```
+
+注意：直接微调要求 checkpoint 的结构和当前配置一致，尤其是 `17D` canonical+force observation、`3D`
+action、`task_conditioning=axial_params`、`contact_history_*` 配置。旧 `6D` action checkpoint 需要显式切回旧 action
+配置，不能和当前 3D 配置互载。
+
 ## Debug 输入输出
 
 打开 wrapper 级别的 I/O 检查：
@@ -775,6 +828,15 @@ cd /home/gpuserver/hx/github/Newt
   hil_collect_manifest_fp=data/real_hil_01125_manifest.json
 ```
 
+采集完成后先清洗 raw HIL 数据，避免超长人工操作片段按 transition 数量压过短而有效的成功轨迹：
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/scripts/clean_real_hil_dataset.py \
+  --input data/real_hil_01125.pt \
+  --output data/real_hil_01125_clean.pt \
+  --overwrite
+```
+
 真机侧返回的 observation JSON 至少包含：
 
 ```json
@@ -793,18 +855,9 @@ cd /home/gpuserver/hx/github/Newt
 采集完成后，先用 BC 做保守微调：
 
 ```bash
-/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/offline_train.py \
-  --config-dir configs/train \
-  --config-name srsa_01125_imitation_relaxed \
-  checkpoint=/path/to/checkpoint.pt \
-  offline_dataset_fp=data/real_hil_01125.pt \
-  offline_bc_steps=20000 \
-  offline_wm_steps=20000 \
-  offline_rl_steps=0 \
-  batch_size=256 \
-  compile=false \
-  enable_wandb=false \
-  exp_name=real_01125_hirl_offline_ft
+CHECKPOINT=/path/to/checkpoint.pt \
+OFFLINE_DATASET_FP=data/real_hil_01125_clean.pt \
+scripts/run_01125_hil_offline_finetune.sh
 ```
 
 如果真机侧的 `reward/done/success` 已经可靠，再逐步增加 `offline_wm_steps` 或打开少量 `offline_rl_steps`。
@@ -979,6 +1032,13 @@ data/offline_policy_rollouts_from_00186_compact.pt
   task_conditioning=axial_params \
   enable_wandb=false
 ```
+CHECKPOINT=logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
+TARGETS="00186 00256 00062 00271" \
+STEPS=600000 \
+NUM_ENVS=300 \
+NUM_GPUS=2 \
+scripts/run_01125_direct_finetune_targets.sh
+
 
 `offline_manifest_fp` 仍作为兼容别名存在，但方案 A 新命令优先写
 `multitask_replay_manifest_fp`，避免和模型 checkpoint 混淆。若还没有 replay manifest，先运行 rollout
@@ -1010,6 +1070,77 @@ COLLECT_EPISODES_PER_TASK=2 \
 MULTITASK_EVAL_INTERVAL=0 \
 scripts/run_01125_family_multitask_continuation.sh
 ```
+
+离线 replay 采集例子如下。只有明确要走 Scheme A 共享模型 continuation 时才需要这一步；直接在线微调不需要
+`collect_eval_rollouts.py`。
+
+```bash
+PYTHON=/home/gpuserver/miniconda3/envs/isaac51/bin/python
+CKPT=logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt
+
+$PYTHON tdmpc2/collect_eval_rollouts.py \
+  checkpoint=$CKPT \
+  isaaclab_backend=srsa \
+  task=isaaclab-srsa-assembly \
+  assembly_id=01125 \
+  isaaclab_dir=/home/gpuserver/IsaacLab \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
+  srsa_param_template_id=2 \
+  srsa_axial_reference_anchor_assembly_id=01125 \
+  srsa_axial_reference_anchor_task_type_id=0 \
+  srsa_axial_recompute_manifest_task_vecs=true \
+  eval_task_template_exact=true \
+  'collect_assembly_ids=[01125,00186,00256,00062,00271,00726,01079,01029,01092,01102]' \
+  collect_source_assembly_id=null \
+  collect_exclude_source_assembly=false \
+  collect_episodes_per_task=10 \
+  collect_output_dir=data/rollouts_01125_family \
+  collect_manifest_fp=data/offline_manifest_01125_family.json \
+  collect_overwrite=true \
+  collect_spawn_per_assembly=true \
+  collect_parallel_workers=1 \
+  num_envs=10 \
+  gpu_id=0 \
+  num_gpus=1 \
+  model_size=S \
+  task_conditioning=axial_params \
+  compile=false \
+  srsa_sparse_reward=false \
+  srsa_align_direct_reward_success=true \
+  srsa_if_sbc=false \
+  isaaclab_use_canonical_obs=true \
+  srsa_task_param_obs=false \
+  srsa_task_param_obs_mode=task_vec \
+  srsa_enable_axial_task_param_sampler=true \
+  srsa_use_runtime_task_vec=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  isaaclab_canonical_append_task_params=false \
+  isaaclab_canonical_use_visual_noise=false \
+  contact_history_enabled=true \
+  contact_history_len=4 \
+  contact_context_dim=64 \
+  contact_history_hidden_dim=128 \
+  contact_history_layers=2 \
+  contact_force_dim=6 \
+  contact_action_dim=3 \
+  contact_ee_delta_dim=3 \
+  contact_history_use_ee_delta=true \
+  eval_success_metric=relaxed \
+  srsa_eval_success_metric=relaxed
+```
+
+采集出 manifest 后再启动 Scheme A continuation：
+
+```bash
+TOTAL_STEPS=1000000 \
+MULTITASK_REPLAY_MANIFEST_FP=data/offline_manifest_01125_family_smoke.json \
+NUM_ENVS=300 \
+scripts/run_01125_family_multitask_continuation.sh
+```
+
 
 ```bash
 /home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/scripts/build_family_offline_manifest.py \

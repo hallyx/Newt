@@ -1,0 +1,143 @@
+{
+  "assembly_id": "00256",
+  "checkpoint": "/home/gpuserver/hx/github/Newt/logs/isaaclab-srsa-assembly/1/srsa_axial_family_continuation/20260601_164934_asm-00014_tid-2/models/final.pt",
+  "source_assembly_id": "01125",
+  "output": "/home/gpuserver/hx/github/Newt/data/rollouts_01125_family/00256/policy_eval_rollouts.pt",
+  "task_vec_6": [
+    0.0,
+    -0.1788714975118637,
+    0.09908102452754974,
+    0.11535294353961945,
+    1.2188985347747803,
+    0.0
+  ],
+  "task_param_vec": [
+    0.0,
+    -0.1788714975118637,
+    0.09908102452754974,
+    0.11535294353961945,
+    1.2188985347747803,
+    0.0
+  ],
+  "srsa_params": {
+    "task_family_id": 1.0,
+    "task_type_id_float": 0.0,
+    "plug_diameter": 0.006677999626845121,
+    "hole_diameter": 0.007448326796293259,
+    "clearance": 0.0007703269366174936,
+    "diametral_clearance": 0.0007703269366174936,
+    "radial_clearance": 0.0003851634683087468,
+    "clearance_ratio": 0.11535294353961945,
+    "clearance_multiplier": 1.0,
+    "clearance_anchor_id": -1.0,
+    "clearance_depth_template_id": -1.0,
+    "success_pos_tol": 0.014999999664723873,
+    "insertion_depth": 0.03488000109791756,
+    "target_insertion_depth": 0.03488000109791756,
+    "depth_multiplier": 1.0,
+    "depth_anchor_id": -1.0,
+    "plug_scale_xy": 0.8362133502960205,
+    "hole_scale_xy": 0.9195464849472046,
+    "scale_ratio": 0.8362133502960205,
+    "log_scale": -0.1788714975118637,
+    "clearance_abs_norm": 0.09908102452754974,
+    "clearance_rel_norm": 0.11535294353961945,
+    "depth_abs_norm": 1.2188985347747803,
+    "yaw_requirement_float": 0.0,
+    "task_vec": [
+      0.0,
+      -0.1788714975118637,
+      0.09908102452754974,
+      0.11535294353961945,
+      1.2188985347747803,
+      0.0
+    ],
+    "initial_error_pos": [
+      0.009999999776482582,
+      -0.009999999776482582,
+      0.009999999776482582
+    ],
+    "initial_error_yaw": -0.0,
+    "visual_noise_local": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "srsa_sampler": {
+    "srsa_enable_axial_task_param_sampler": true,
+    "srsa_axial_task_type_id": 0,
+    "srsa_axial_scale_range": "0.836213373403,0.836213373403",
+    "srsa_axial_fixed_plug_scale": false,
+    "srsa_axial_clearance_range": "0.000770326950674,0.000770326950674",
+    "srsa_axial_clearance_base": 0.0007703269506738463,
+    "srsa_axial_clearance_jitter_ratio": 0.0,
+    "srsa_axial_depth_range": "0.03488,0.03488",
+    "srsa_axial_target_depth_range": "0.03488,0.03488",
+    "srsa_axial_depth_base": 0.03488,
+    "srsa_axial_depth_jitter_ratio": 0.0,
+    "srsa_axial_yaw_requirement": false,
+    "srsa_axial_reference_radius": 0.003887358666732253,
+    "srsa_axial_reference_depth": 0.028616
+  },
+  "action_dim": 3,
+  "obs_shape": [
+    17
+  ],
+  "num_envs": 10,
+  "episodes_requested": 10,
+  "episodes_collected": 10,
+  "episode_return_mean": 436.81163635253904,
+  "episode_success_mean": 0.0,
+  "success_metrics": {
+    "official_success_latched": 1.0,
+    "official_success_terminal": 1.0,
+    "process_success_terminal": 0.0,
+    "relaxed_process_success_terminal": 0.0,
+    "relaxed_success_stable": 0.0,
+    "relaxed_success_episode": 0.0,
+    "strict_success_stable": 0.0,
+    "strict_success_episode": 0.0,
+    "official_success": 1.0,
+    "current_official_success": 1.0,
+    "process_success": 0.0,
+    "relaxed_process_success": 0.0,
+    "episode_relaxed_process_success": 0.0,
+    "relaxed_terminal_process_success": 0.0,
+    "episode_process_success": 0.0,
+    "terminal_process_success": 0.0,
+    "depth_fraction": 0.6147966682910919,
+    "lateral_error": 0.004724543076008558,
+    "angle_error": 0.025460377195850016,
+    "orientation_error": 0.011446696339407935,
+    "yaw_error": 0.022318126703612506,
+    "keypoint_error": 0.014272691123187542
+  },
+  "screen_decision": "",
+  "screen_strict_success": 1.0,
+  "screen_depth_fraction": 1.0,
+  "weak_task_requires_online_boost": false,
+  "mpc": true,
+  "summary": {
+    "num_transitions": 740,
+    "obs_shape": [
+      17
+    ],
+    "action_shape": [
+      3
+    ],
+    "reward_shape": [],
+    "num_episodes": 10,
+    "num_done": 10,
+    "obs_dtype": "torch.float32",
+    "action_dtype": "torch.float32",
+    "reward_dtype": "torch.float32",
+    "final_success_mean": 0.0,
+    "episode_failure_final_min": 1.0,
+    "episode_failure_final_max": 1.0,
+    "terminal_failure_count": 10,
+    "terminal_success_count": 0,
+    "episode_return_final_min": 402.3833312988281,
+    "episode_return_final_max": 453.55108642578125
+  }
+}

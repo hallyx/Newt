@@ -121,6 +121,14 @@ class Config:
 	srsa_if_logging_eval: bool = False
 	srsa_eval_filename: Optional[str] = None
 	srsa_num_eval_trials: int = 100
+	srsa_camera_eye: Any = None
+	srsa_camera_lookat: Any = None
+	srsa_camera_resolution: Any = None
+	srsa_camera_env_index: Optional[int] = None
+	srsa_socket_camera_follow: bool = False
+	srsa_socket_camera_profile_fp: str = "camera_profiles/socket_camera_offset.json"
+	srsa_socket_camera_env_index: Optional[int] = None
+	srsa_socket_camera_camera_prim_path: Optional[str] = None
 	srsa_align_direct_reward_success: bool = False
 	srsa_vision_noise_xy_std: float = 0.0
 	srsa_vision_noise_xy_jitter_std: float = 0.0
@@ -480,6 +488,14 @@ class Config:
 	port: Optional[str] = None
 	compile: bool = True
 	save_video: bool = False
+	eval_video_dir: Optional[str] = None
+	eval_video_fps: int = 15
+	eval_video_format: str = "mp4"
+	eval_video_max_frames: Optional[int] = None
+	eval_video_record_every: int = 1
+	eval_video_env_index: int = 0
+	eval_video_max_episodes: int = 1
+	eval_video_name: Optional[str] = None
 	render_size: int = 224
 	save_agent: bool = True
 	save_freq: Optional[int] = None
@@ -1379,6 +1395,12 @@ def _template_value(item, *keys):
 	return None
 
 
+def _coerce_sampler_cfg_value(cfg_key, value):
+	if cfg_key == "srsa_axial_task_type_id" and value is not None:
+		return int(float(value))
+	return value
+
+
 def _merge_template_params(item):
 	merged = dict(item)
 	params = merged.get("srsa_params", None)
@@ -1392,11 +1414,11 @@ def _apply_template_sampler_config(cfg, item):
 	for section in (_template_section(item, "srsa_sampler"), item):
 		if not isinstance(section, dict):
 			continue
-		for cfg_key in SRSA_SAMPLER_CFG_KEYS:
-			for source_key in _sampler_source_keys(cfg_key):
-				if source_key in section and section[source_key] is not None:
-					_set_cfg_value(cfg, cfg_key, section[source_key])
-					break
+			for cfg_key in SRSA_SAMPLER_CFG_KEYS:
+				for source_key in _sampler_source_keys(cfg_key):
+					if source_key in section and section[source_key] is not None:
+						_set_cfg_value(cfg, cfg_key, _coerce_sampler_cfg_value(cfg_key, section[source_key]))
+						break
 
 
 def _set_from_template_if_empty(cfg, item, cfg_key, *template_keys):
@@ -1411,6 +1433,12 @@ def _set_from_template(cfg, item, cfg_key, *template_keys):
 	value = _template_value(item, *template_keys)
 	if value is not None:
 		_set_cfg_value(cfg, cfg_key, value)
+
+
+def _set_int_from_template(cfg, item, cfg_key, *template_keys):
+	value = _template_value(item, *template_keys)
+	if value is not None:
+		_set_cfg_value(cfg, cfg_key, int(float(value)))
 
 
 def _fixed_pair(value):
@@ -1597,14 +1625,14 @@ def apply_eval_task_template(cfg, entry=None):
 		_set_cfg_value(cfg, "assembly_id", str(template["assembly_id"]).zfill(5))
 
 	_set_from_template(cfg, template, "srsa_task_family_name", "task_family_name")
-	_set_from_template(cfg, template, "srsa_task_family_id", "task_family_id")
+	_set_int_from_template(cfg, template, "srsa_task_family_id", "task_family_id")
 	_set_from_template(cfg, template, "srsa_plug_diameter", "plug_diameter", "male_diameter")
 	_set_from_template(cfg, template, "srsa_hole_diameter", "hole_diameter", "female_diameter")
 	_set_from_template(cfg, template, "srsa_clearance", "clearance", "diametral_clearance")
 	_set_from_template(cfg, template, "srsa_clearance_ratio", "clearance_ratio")
 	_set_from_template(cfg, template, "srsa_insertion_depth", "insertion_depth", "target_insertion_depth")
 	_set_from_template(cfg, template, "srsa_success_pos_tol", "success_pos_tol")
-	_set_from_template(cfg, template, "srsa_axial_task_type_id", "task_type_id", "task_type_id_float")
+	_set_int_from_template(cfg, template, "srsa_axial_task_type_id", "task_type_id", "task_type_id_float")
 	_set_from_template(cfg, template, "srsa_axial_reference_radius", "reference_radius")
 	_set_from_template(cfg, template, "srsa_axial_reference_depth", "reference_depth")
 	_apply_template_sampler_config(cfg, template)

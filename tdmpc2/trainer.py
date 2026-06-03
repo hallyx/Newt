@@ -144,8 +144,11 @@ class Trainer():
 		episode_len = torch.zeros(self.cfg.num_envs, device=self._rollout_device)
 		episodes_completed = torch.zeros(self.cfg.num_envs, dtype=torch.int32, device=self._rollout_device)
 
-		if self.cfg.save_video:
-			self.logger.video.init(self.env, enabled=self.cfg.rank==0)
+		video_recorder = self.logger.video if self.cfg.save_video else None
+		video_max_episodes = max(1, int(self.cfg.get('eval_video_max_episodes', 1) or 1))
+		video_fp = None
+		if video_recorder is not None:
+			video_recorder.init(self.env, enabled=self.cfg.rank==0)
 
 		eval_env_steps = 0
 		eval_guard_steps = int(
@@ -178,7 +181,11 @@ class Trainer():
 						episode_step=int(episode_len[env_index].item()),
 						task_id=int(self._tasks[env_index].item()),
 					)
+				episodes_completed_before = int(episodes_completed.sum().item())
+				should_record_video = video_recorder is not None and episodes_completed_before < video_max_episodes
 				obs, reward, terminated, truncated, info = self.env.step(action)
+				if should_record_video:
+					video_recorder.record(self.env)
 				eval_env_steps += 1
 
 				done = terminated | truncated
@@ -228,11 +235,9 @@ class Trainer():
 						"Check whether the environment is returning truncated/final_info."
 					)
 
-				if self.cfg.save_video and episodes_completed.min() == 0:
-					self.logger.video.record(self.env)
-
-		if self.cfg.save_video:
-			self.logger.video.save(self._step)
+		if video_recorder is not None:
+			video_name = self.cfg.get('eval_video_name', None) or f"eval_{self.cfg.get('assembly_id', 'assembly')}"
+			video_fp = video_recorder.save(self._step, name=video_name)
 
 		barrier()  # Ensure all processes have completed evaluation
 
@@ -277,6 +282,8 @@ class Trainer():
 		results['episode_score'] = sum(
 			sum(m['score']) / len(m['score']) for m in task_results.values()
 		) / num_tasks
+		if video_fp is not None:
+			results['eval_video_fp'] = str(video_fp)
 
 		return results
 

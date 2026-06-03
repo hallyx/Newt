@@ -21,6 +21,7 @@ from hydra.core.config_store import ConfigStore
 from termcolor import colored
 
 from common import set_seed
+from common.logger import VideoRecorder
 from config import Config, apply_eval_task_template, parse_cfg, safe_run_token
 from collect_eval_rollouts import (
 	_adapt_obs_to_checkpoint,
@@ -165,57 +166,50 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"srsa_align_direct_reward_success",
 		"srsa_sil",
 		"srsa_if_sbc",
+		"srsa_camera_eye",
+		"srsa_camera_lookat",
+		"srsa_camera_resolution",
+		"srsa_camera_env_index",
+		"srsa_socket_camera_follow",
+		"srsa_socket_camera_profile_fp",
+		"srsa_socket_camera_env_index",
+		"srsa_socket_camera_camera_prim_path",
 		"srsa_task_template_fp",
-		"srsa_task_template_id",
-		"srsa_param_template_id",
-		"srsa_mesh_geometry_fp",
-		"srsa_mesh_geometry_task_id",
-		"srsa_mesh_plug_diameter_column",
-		"srsa_mesh_hole_diameter_column",
-		"srsa_mesh_clearance_column",
+			"srsa_task_template_id",
+			"srsa_param_template_id",
+			"srsa_mesh_geometry_fp",
+			"srsa_mesh_plug_diameter_column",
+			"srsa_mesh_hole_diameter_column",
+			"srsa_mesh_clearance_column",
 		"srsa_mesh_clearance_mode",
 		"srsa_mesh_clearance_scale",
 		"srsa_mesh_depth_column",
-		"srsa_mesh_depth_scale",
-		"srsa_mesh_reference_radius_column",
-		"srsa_mesh_reference_depth_column",
-		"srsa_position_control_only",
-		"srsa_policy_action_dim",
-		"srsa_env_action_dim",
+			"srsa_mesh_depth_scale",
+			"srsa_mesh_reference_radius_column",
+			"srsa_mesh_reference_depth_column",
+			"srsa_axial_reference_anchor_assembly_id",
+			"srsa_axial_reference_anchor_task_type_id",
+			"srsa_axial_recompute_manifest_task_vecs",
+			"srsa_position_control_only",
+			"srsa_policy_action_dim",
+			"srsa_env_action_dim",
 		"srsa_task_param_obs",
-		"srsa_task_param_obs_mode",
-		"srsa_newt_obs",
-		"srsa_enable_axial_task_param_sampler",
-		"srsa_use_runtime_task_vec",
-		"srsa_axial_task_type_id",
-		"srsa_axial_scale_range",
-		"srsa_axial_fixed_plug_scale",
-		"srsa_axial_clearance_range",
-		"srsa_axial_clearance_ratio_range",
-		"srsa_axial_clearance_base",
-		"srsa_axial_clearance_anchor_multipliers",
-		"srsa_axial_clearance_anchors",
-		"srsa_axial_clearance_depth_templates",
-		"srsa_axial_clearance_depth_template_multipliers",
-		"srsa_axial_clearance_depth_template_weights",
-		"srsa_axial_clearance_jitter_ratio",
-		"srsa_axial_clearance_anchor_weights",
-		"srsa_axial_depth_range",
-		"srsa_axial_target_depth_range",
-		"srsa_axial_depth_base",
-		"srsa_axial_depth_anchor_multipliers",
-		"srsa_axial_depth_anchors",
-		"srsa_axial_depth_jitter_ratio",
-		"srsa_axial_depth_anchor_weights",
-		"srsa_axial_init_error_xy_range",
-		"srsa_axial_init_error_z_range",
-		"srsa_axial_init_error_yaw_range",
-		"srsa_axial_visual_noise_xy_range",
-		"srsa_axial_visual_noise_z_range",
-		"srsa_axial_yaw_requirement",
-		"srsa_axial_reference_radius",
-		"srsa_axial_reference_depth",
-		"num_envs",
+			"srsa_task_param_obs_mode",
+			"srsa_newt_obs",
+			"srsa_enable_axial_task_param_sampler",
+			"srsa_use_runtime_task_vec",
+			"srsa_axial_fixed_plug_scale",
+			"srsa_axial_clearance_base",
+			"srsa_axial_clearance_depth_templates",
+			"srsa_axial_clearance_jitter_ratio",
+			"srsa_axial_depth_base",
+			"srsa_axial_depth_jitter_ratio",
+			"srsa_axial_init_error_xy_range",
+			"srsa_axial_init_error_z_range",
+			"srsa_axial_init_error_yaw_range",
+			"srsa_axial_visual_noise_xy_range",
+			"srsa_axial_visual_noise_z_range",
+			"num_envs",
 		"gpu_id",
 		"model_size",
 		"horizon",
@@ -250,6 +244,15 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"batch_eval_overwrite",
 		"batch_eval_mpc",
 		"batch_eval_max_env_steps",
+		"save_video",
+		"eval_video_dir",
+		"eval_video_fps",
+		"eval_video_format",
+		"eval_video_max_frames",
+		"eval_video_record_every",
+		"eval_video_env_index",
+		"eval_video_max_episodes",
+		"eval_video_name",
 		"enable_wandb",
 		"exp_name",
 		"run_id",
@@ -360,9 +363,16 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 	torch.cuda.set_device(cfg.device_id)
 	task_output_dir = output_dir / assembly_id
 	result_fp = task_output_dir / "eval_metrics.json"
-	if result_fp.exists() and not cfg.batch_eval_overwrite:
+	if result_fp.exists() and not cfg.batch_eval_overwrite and not cfg.save_video:
 		print(colored(f"Reusing existing eval metrics: {result_fp}", "blue", attrs=["bold"]))
 		return _read_json(result_fp)
+	if result_fp.exists() and not cfg.batch_eval_overwrite and cfg.save_video:
+		print(colored(
+			f"save_video=true requested; rerunning eval for assembly_id={assembly_id} "
+			f"even though metrics exist: {result_fp}",
+			"yellow",
+			attrs=["bold"],
+		))
 
 	env = make_env(cfg)
 	try:
@@ -397,6 +407,12 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 		env_steps = 0
 		start_time = monotonic()
 		last_log = 0.0
+		video_save_dir = task_output_dir / "eval_video"
+		if cfg.get('eval_video_dir', None):
+			video_save_dir = Path(cfg.eval_video_dir).expanduser() / assembly_id
+		video_recorder = VideoRecorder(cfg, save_dir=video_save_dir) if cfg.save_video else None
+		video_max_episodes = max(1, int(cfg.get('eval_video_max_episodes', 1) or 1))
+		video_fp = None
 		guard_steps = cfg.get('batch_eval_max_env_steps', None)
 		if guard_steps is None:
 			waves = math.ceil(target_episodes / max(1, int(cfg.num_envs)))
@@ -404,6 +420,8 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 
 		obs, _ = env.reset()
 		obs = _adapt_obs_to_checkpoint(obs, expected_obs_dim)
+		if video_recorder is not None:
+			video_recorder.init(env, enabled=True)
 		print(colored(
 			f"Evaluating checkpoint={cfg.checkpoint} assembly_id={assembly_id} "
 			f"task_id={task_id} episodes={target_episodes} mpc={use_mpc}.",
@@ -423,7 +441,10 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 					task=model_tasks,
 					mpc=use_mpc,
 				)
+				should_record_video = video_recorder is not None and completed < video_max_episodes
 				raw_obs, reward, terminated, truncated, info = env.step(action)
+				if should_record_video:
+					video_recorder.record(env)
 				done = terminated | truncated
 				obs = _adapt_obs_to_checkpoint(raw_obs, expected_obs_dim)
 				next_return = episode_return + reward
@@ -464,6 +485,13 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 					raise RuntimeError(
 						f"Evaluation did not finish within guard_steps={guard_steps} for assembly_id={assembly_id}."
 					)
+		if video_recorder is not None:
+			video_name = cfg.get("eval_video_name", None) or f"batch_eval_{assembly_id}_task_{task_id}"
+			video_fp = video_recorder.save(
+				env_steps,
+				key=f"videos/batch_eval/{assembly_id}",
+				name=video_name,
+			)
 
 		metrics = {
 			"assembly_id": assembly_id,
@@ -480,6 +508,8 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 			"mpc": bool(use_mpc),
 			"env_steps": int(env_steps),
 		}
+		if video_fp is not None:
+			metrics["eval_video_fp"] = str(video_fp)
 		for metric_key, values in success_diagnostics.items():
 			if values:
 				metrics[f"episode_{metric_key}"] = _mean(values)

@@ -104,31 +104,131 @@ def _format_metric_token(value):
 
 
 class VideoRecorder:
-	"""Utility class for logging evaluation videos."""
+	"""Utility class for saving evaluation videos locally and optionally to wandb."""
 
-	def __init__(self, cfg, wandb, fps=15):
+	def __init__(self, cfg, wandb=None, fps=None, save_dir=None):
 		self.cfg = cfg
-		self._save_dir = make_dir(Path(cfg.work_dir) / 'eval_video')
+		raw_dir = save_dir if save_dir is not None else cfg.get("eval_video_dir", None)
+		if raw_dir is None:
+			raw_dir = Path(cfg.work_dir) / "eval_video"
+		else:
+			raw_dir = Path(raw_dir).expanduser()
+			if not raw_dir.is_absolute():
+				raw_dir = Path(cfg.work_dir) / raw_dir
+		self._save_dir = Path(make_dir(raw_dir))
 		self._wandb = wandb
-		self.fps = fps
+		self.fps = int(fps or cfg.get("eval_video_fps", 15) or 15)
 		self.frames = []
 		self.enabled = False
+		self._record_calls = 0
+		self._warned_render = False
+		self._saved_fp = None
+
+	def set_wandb(self, wandb):
+		self._wandb = wandb
 
 	def init(self, env, enabled=True):
 		self.frames = []
-		self.enabled = self._save_dir and self._wandb and enabled
+		self._record_calls = 0
+		self._saved_fp = None
+		self.enabled = bool(enabled)
 		self.record(env)
 
-	def record(self, env):
-		if self.enabled:
-			self.frames.append(env.render())
+	def _normalize_frame(self, frame):
+		if frame is None:
+			return None
+		if torch.is_tensor(frame):
+			frame = frame.detach().cpu().numpy()
+		frame = np.asarray(frame)
+		if frame.ndim == 4:
+			env_index = int(self.cfg.get("eval_video_env_index", 0) or 0)
+			env_index = min(max(env_index, 0), frame.shape[0] - 1)
+			frame = frame[env_index]
+		if frame.ndim == 3 and frame.shape[0] in {1, 3, 4} and frame.shape[-1] not in {1, 3, 4}:
+			frame = np.transpose(frame, (1, 2, 0))
+		if frame.ndim == 2:
+			frame = np.repeat(frame[..., None], 3, axis=-1)
+		if frame.ndim != 3:
+			return None
+		if frame.shape[-1] == 1:
+			frame = np.repeat(frame, 3, axis=-1)
+		elif frame.shape[-1] > 3:
+			frame = frame[..., :3]
+		if frame.dtype != np.uint8:
+			frame = frame.astype(np.float32, copy=False)
+			if frame.size > 0 and np.nanmax(frame) <= 1.0:
+				frame = frame * 255.0
+			frame = np.clip(frame, 0, 255).astype(np.uint8)
+		return np.ascontiguousarray(frame)
 
-	def save(self, step, key='videos/eval_video'):
-		if self.enabled and len(self.frames) > 1:
-			frames = np.stack(self.frames[:-1])
-			return self._wandb.log(
-				{key: self._wandb.Video(frames.transpose(0, 3, 1, 2), fps=self.fps, format='mp4')}, step=step
+	def record(self, env):
+		if not self.enabled:
+			return
+		self._record_calls += 1
+		record_every = max(1, int(self.cfg.get("eval_video_record_every", 1) or 1))
+		if (self._record_calls - 1) % record_every != 0:
+			return
+		max_frames = self.cfg.get("eval_video_max_frames", None)
+		if max_frames is not None and len(self.frames) >= int(max_frames):
+			return
+		try:
+			frame = self._normalize_frame(env.render())
+		except Exception as exc:
+			if not self._warned_render:
+				print(colored(f"Video render failed; disabling this recorder. {exc}", "yellow", attrs=["bold"]))
+				self._warned_render = True
+			self.enabled = False
+			return
+		if frame is None:
+			if not self._warned_render:
+				print(colored("Video render returned no frame; disabling this recorder.", "yellow", attrs=["bold"]))
+				self._warned_render = True
+			self.enabled = False
+			return
+		self.frames.append(frame)
+
+	def _local_video_fp(self, step, name=None):
+		fmt = str(self.cfg.get("eval_video_format", "mp4") or "mp4").strip().lower().lstrip(".")
+		if not fmt:
+			fmt = "mp4"
+		name = _safe_token(name or "eval_video")
+		try:
+			step_text = f"{int(step):08d}"
+		except (TypeError, ValueError):
+			step_text = _safe_token(step, fallback="step")
+		return self._save_dir / f"{name}_step-{step_text}.{fmt}"
+
+	def _save_local(self, frames, fp):
+		if fp.suffix.lower() == ".npz":
+			np.savez_compressed(fp, frames=frames, fps=np.array(self.fps, dtype=np.int32))
+			return fp
+		try:
+			import imageio.v2 as imageio
+			imageio.mimsave(fp, frames, fps=self.fps)
+			return fp
+		except Exception as exc:
+			fallback_fp = fp.with_suffix(".npz")
+			np.savez_compressed(fallback_fp, frames=frames, fps=np.array(self.fps, dtype=np.int32))
+			print(colored(
+				f"MP4 video save failed; saved raw frames instead: {fallback_fp}. {exc}",
+				"yellow",
+				attrs=["bold"],
+			))
+			return fallback_fp
+
+	def save(self, step, key='videos/eval_video', name=None):
+		if not self.enabled or len(self.frames) <= 1:
+			return None
+		frames = np.stack(self.frames)
+		fp = self._save_local(frames, self._local_video_fp(step, name=name))
+		self._saved_fp = fp
+		print(colored(f"Saved eval video: {fp}", "green", attrs=["bold"]))
+		if self._wandb:
+			self._wandb.log(
+				{key: self._wandb.Video(frames.transpose(0, 3, 1, 2), fps=self.fps, format='mp4')},
+				step=step,
 			)
+		return fp
 
 
 class Logger:
@@ -162,9 +262,10 @@ class Logger:
 		self._write_run_metadata(cfg)
 		print_run(cfg)
 		self._print_checkpoint_policy()
+		if cfg.save_video:
+			self._video = VideoRecorder(cfg)
 		if not cfg.enable_wandb or self.project is None:
 			print(colored("Wandb disabled. Using local logging only.", "blue", attrs=["bold"]))
-			cfg.save_video = False
 			return
 
 		os.environ["WANDB_SILENT"] = "true" if cfg.wandb_silent else "false"
@@ -182,9 +283,11 @@ class Logger:
 			dest = self.project if self.entity is None else f"{self.entity}/{self.project}"
 			print(colored(f"Logs will be synced with wandb: {dest}.", "blue", attrs=["bold"]))
 			self._wandb = wandb
-			self._video = VideoRecorder(cfg, self._wandb) if cfg.save_video else None
+			if self._video is not None:
+				self._video.set_wandb(self._wandb)
+			elif cfg.save_video:
+				self._video = VideoRecorder(cfg, self._wandb)
 		except Exception as exc:
-			cfg.save_video = False
 			print(colored(f"Wandb init failed; continuing with local logging only. {exc}", "yellow", attrs=["bold"]))
 
 	@staticmethod
