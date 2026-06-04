@@ -109,6 +109,33 @@ def _override(key: str, value) -> str:
     return f"{key}={_hydra_value(value)}"
 
 
+def _normalize_extra_overrides(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value == "--":
+            index += 1
+            continue
+        if value.startswith("--") and len(value) > 2:
+            key_value = value[2:]
+            if "=" in key_value:
+                key, raw = key_value.split("=", 1)
+                normalized.append(_override(key.replace("-", "_"), raw))
+                index += 1
+                continue
+            if index + 1 < len(values) and not values[index + 1].startswith("--"):
+                normalized.append(_override(key_value.replace("-", "_"), values[index + 1]))
+                index += 2
+                continue
+            normalized.append(_override(key_value.replace("-", "_"), True))
+            index += 1
+            continue
+        normalized.append(value)
+        index += 1
+    return normalized
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Record videos with Newt tdmpc2/eval.py over SRSA task-size templates.",
@@ -135,6 +162,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--eval_trials", type=int, default=1)
     parser.add_argument("--video_length", type=int, default=300, help="Maximum recorded frames per template.")
+    parser.add_argument(
+        "--video_episodes",
+        type=int,
+        default=1,
+        help="Number of completed episodes to include in each video. eval_trials is raised to at least this value.",
+    )
     parser.add_argument("--video_dir", default="data/video_eval_task_sizes", help="Video output directory.")
     parser.add_argument("--video_fps", type=int, default=15)
     parser.add_argument("--video_format", default="mp4")
@@ -144,21 +177,77 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizon", type=int, default=3)
     parser.add_argument("--srsa_task_template_fp", default="data/srsa_axial_task_templates.json")
     parser.add_argument("--srsa_mesh_geometry_fp", default="data/srsa_mesh_geometry_params.csv")
+    parser.add_argument(
+        "--size_source",
+        choices=("fixed", "mesh"),
+        default="fixed",
+        help=(
+            "fixed matches SRSA scripts/batch_record_task_sizes.py using clearance_base/depth_base; "
+            "mesh uses Newt mesh-derived task templates."
+        ),
+    )
     parser.add_argument("--clearance_base", type=float, default=0.000114)
     parser.add_argument("--depth_base", type=float, default=0.015)
     parser.add_argument("--clearance_jitter_ratio", type=float, default=0.0)
     parser.add_argument("--depth_jitter_ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--init_error_xy_range",
+        default="0.009,0.0010",
+        help="Initial lateral error magnitude range in meters. SRSA treats positive ranges as signed +/- magnitudes.",
+    )
+    parser.add_argument(
+        "--init_error_z_range",
+        default="0.0010,0.0020",
+        help="SRSA sampled z-error range in meters. The visible start height is controlled by --freespace_range.",
+    )
+    parser.add_argument(
+        "--init_error_yaw_range",
+        default="-0.0872665,0.0872665",
+        help="Initial yaw error range in radians.",
+    )
+    parser.add_argument(
+        "--no_terminate_on_success",
+        action="store_true",
+        help="Keep rolling after success instead of ending the episode early.",
+    )
+    parser.add_argument(
+        "--freespace_range",
+        type=float,
+        default=None,
+        help="Socket-top free-space height in meters. This is the visible vertical start offset above insertion depth.",
+    )
+    parser.add_argument(
+        "--episode_length_s",
+        type=float,
+        default=None,
+        help="IsaacLab episode length in seconds. Default SRSA/AutoMate value is 5s.",
+    )
     parser.add_argument("--success_metric", default="relaxed")
     parser.add_argument("--socket_camera_profile_fp", default="camera_profiles/socket_camera_offset.json")
     parser.add_argument("--socket_camera_env_index", type=int, default=0)
     parser.add_argument("--no_socket_camera_follow", action="store_true")
-    parser.add_argument("--interactive", action="store_true", help="Use a visible Isaac window.")
+    display_group = parser.add_mutually_exclusive_group()
+    display_group.add_argument(
+        "--interactive",
+        dest="interactive",
+        action="store_true",
+        default=True,
+        help="Use a visible Isaac window. This is the default.",
+    )
+    display_group.add_argument(
+        "--headless",
+        dest="interactive",
+        action="store_false",
+        help="Run IsaacLab headless.",
+    )
     parser.add_argument("--no_contact_preset", action="store_true", help="Do not add 17D/contact-history defaults.")
     parser.add_argument("--dry_run", action="store_true", help="Print Newt eval commands without running them.")
     return parser
 
 
 def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
+    eval_trials = max(int(args.eval_trials), int(args.video_episodes))
+    fixed_size_source = args.size_source == "fixed"
     overrides = [
         _override("checkpoint", args.checkpoint),
         _override("eval_mode", "sim"),
@@ -167,9 +256,9 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
         _override("assembly_id", args.assembly_id),
         _override("isaaclab_dir", args.isaaclab_dir),
         _override("srsa_dir", args.srsa_dir),
-        _override("srsa_task_template_fp", args.srsa_task_template_fp),
-        _override("srsa_mesh_geometry_fp", args.srsa_mesh_geometry_fp),
-        _override("eval_task_template_exact", True),
+        _override("eval_task_template_exact", not fixed_size_source),
+        _override("eval_task_template_apply_geometry", not fixed_size_source),
+        _override("eval_task_template_apply_sampler", not fixed_size_source),
         _override("eval_task_template_print", True),
         _override("srsa_sparse_reward", False),
         _override("isaaclab_disable_imitation_reward", False),
@@ -193,9 +282,9 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
         _override("srsa_axial_clearance_jitter_ratio", args.clearance_jitter_ratio),
         _override("srsa_axial_depth_base", args.depth_base),
         _override("srsa_axial_depth_jitter_ratio", args.depth_jitter_ratio),
-        _override("srsa_axial_init_error_xy_range", "0.009,0.0010"),
-        _override("srsa_axial_init_error_z_range", "0.0010,0.0020"),
-        _override("srsa_axial_init_error_yaw_range", "-0.0872665,0.0872665"),
+        _override("srsa_axial_init_error_xy_range", args.init_error_xy_range),
+        _override("srsa_axial_init_error_z_range", args.init_error_z_range),
+        _override("srsa_axial_init_error_yaw_range", args.init_error_yaw_range),
         _override("srsa_axial_visual_noise_xy_range", "0.0,0.0"),
         _override("srsa_axial_visual_noise_z_range", "0.0,0.0"),
         _override("srsa_vision_noise_xy_std", 0.0),
@@ -206,15 +295,15 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
         _override("task_conditioning", "axial_params"),
         _override("eval_success_metric", args.success_metric),
         _override("srsa_eval_success_metric", args.success_metric),
-        _override("eval_trials", args.eval_trials),
-        _override("eval_terminate_on_success", True),
+        _override("eval_trials", eval_trials),
+        _override("eval_terminate_on_success", not args.no_terminate_on_success),
         _override("eval_terminate_success_key", "terminal_process_success"),
         _override("save_video", True),
         _override("eval_video_dir", args.video_dir),
         _override("eval_video_fps", args.video_fps),
         _override("eval_video_format", args.video_format),
         _override("eval_video_max_frames", args.video_length),
-        _override("eval_video_max_episodes", 1),
+        _override("eval_video_max_episodes", args.video_episodes),
         _override("eval_video_record_every", args.video_record_every),
         _override("eval_video_env_index", 0),
         _override("enable_wandb", False),
@@ -222,6 +311,18 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
         _override("exp_name", "batch_record_task_sizes"),
         _override("seed", 1),
     ]
+    if args.freespace_range is not None:
+        overrides.append(_override("srsa_curriculum_freespace_range", args.freespace_range))
+    if args.episode_length_s is not None:
+        overrides.extend([
+            _override("isaaclab_episode_length_s", args.episode_length_s),
+            _override("isaaclab_max_episode_steps", max(1, int(round(float(args.episode_length_s) * 15.0)))),
+        ])
+    if not fixed_size_source:
+        overrides.extend([
+            _override("srsa_task_template_fp", args.srsa_task_template_fp),
+            _override("srsa_mesh_geometry_fp", args.srsa_mesh_geometry_fp),
+        ])
     if not args.no_socket_camera_follow:
         overrides.extend([
             _override("srsa_socket_camera_follow", True),
@@ -249,11 +350,15 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
 def main() -> int:
     parser = _build_parser()
     args, extra_overrides = parser.parse_known_args()
-    extra_overrides = [arg for arg in extra_overrides if arg != "--"]
+    extra_overrides = _normalize_extra_overrides(extra_overrides)
     repo_root = _repo_root()
     eval_script = repo_root / "tdmpc2" / "eval.py"
     templates = _parse_template_list(args.templates)
-    template_id_map = _load_template_id_map(args.srsa_task_template_fp, repo_root)
+    template_id_map = (
+        _load_template_id_map(args.srsa_task_template_fp, repo_root)
+        if args.size_source == "mesh"
+        else {}
+    )
     gpu_id = int(args.gpu_id if args.gpu_id is not None else _gpu_id_from_device(args.device))
     video_prefix = _safe_name(args.video_prefix or args.assembly_id)
     base_overrides = _base_overrides(args, gpu_id)
@@ -261,24 +366,35 @@ def main() -> int:
     for index, (clearance_mult, depth_mult) in enumerate(templates, start=1):
         template = f"{clearance_mult:g}:{depth_mult:g}"
         template_id = template_id_map.get(_template_key(clearance_mult, depth_mult), None)
-        if template_id is None:
+        if args.size_source == "mesh" and template_id is None:
             available = ", ".join(f"{c:g}:{d:g}" for c, d in sorted(template_id_map.keys()))
             raise ValueError(
                 f"Template {template!r} is not listed in {args.srsa_task_template_fp}. "
                 f"Available templates: {available}"
             )
         video_name = f"{video_prefix}_c{_safe_number(clearance_mult)}_d{_safe_number(depth_mult)}"
+        template_overrides = []
+        if args.size_source == "mesh":
+            template_overrides.append(_override("srsa_param_template_id", template_id))
+        template_overrides.extend([
+            _override("srsa_axial_clearance_depth_templates", template),
+            _override("eval_video_name", video_name),
+            _override("run_id", video_name),
+        ])
         command = [
             args.python,
             str(eval_script),
             *base_overrides,
-            _override("srsa_param_template_id", template_id),
-            _override("srsa_axial_clearance_depth_templates", template),
-            _override("eval_video_name", video_name),
-            _override("run_id", video_name),
+            *template_overrides,
             *extra_overrides,
         ]
-        print(f"[newt] ({index}/{len(templates)}) Newt eval template {template} -> {video_name}", flush=True)
+        if args.size_source == "fixed":
+            clearance = float(args.clearance_base) * float(clearance_mult)
+            depth = float(args.depth_base) * float(depth_mult)
+            size_text = f"diametral_clearance={clearance * 1.0e3:.3f}mm target_depth={depth * 1.0e3:.3f}mm"
+        else:
+            size_text = "mesh-derived size from Newt task template"
+        print(f"[newt] ({index}/{len(templates)}) Newt eval template {template} -> {video_name} ({size_text})", flush=True)
         print(f"[newt] command={shlex.join(command)}", flush=True)
         if not args.dry_run:
             subprocess.run(command, cwd=repo_root, check=True)

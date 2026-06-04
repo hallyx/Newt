@@ -787,6 +787,13 @@ def _configure_assembly_task(env_cfg, cfg):
 	task.disassembly_path_json = f"{assembly_dir}/disassemble_traj.json"
 	task.eval_filename = f"evaluation_{cfg.assembly_id}.h5"
 	task.if_logging_eval = False
+	if cfg.get('srsa_curriculum_freespace_range', None) is not None:
+		task.curriculum_freespace_range = float(cfg.srsa_curriculum_freespace_range)
+		if int(getattr(cfg, 'rank', 0)) == 0:
+			print(
+				f"[Rank {cfg.rank}] Set SRSA curriculum_freespace_range="
+				f"{task.curriculum_freespace_range:.6g}m."
+			)
 	task.fixed_asset.spawn.usd_path = f"{assembly_dir}/{task.fixed_asset_cfg.usd_path}"
 	task.held_asset.spawn.usd_path = f"{assembly_dir}/{task.held_asset_cfg.usd_path}"
 
@@ -1426,6 +1433,12 @@ def _maybe_update_axial_task_vector_from_env(cfg, env):
 		cfg.task_vectors[0] = task_vec
 	elif int(getattr(cfg, 'num_global_tasks', 1)) == 1:
 		cfg.task_vectors = [task_vec for _ in cfg.task_vectors]
+	elif getattr(cfg, 'eval_task_id', None) is not None:
+		task_id = int(getattr(cfg, 'eval_task_id'))
+		if 0 <= task_id < len(cfg.task_vectors):
+			cfg.task_vectors[task_id] = task_vec
+		else:
+			return
 	else:
 		return
 	if int(getattr(cfg, 'rank', 0)) == 0:
@@ -1457,9 +1470,13 @@ def make_env(cfg):
 		use_fabric=cfg.isaaclab_use_fabric,
 	)
 	env_cfg.seed = cfg.seed + cfg.rank
+	if cfg.get('isaaclab_episode_length_s', None) is not None:
+		env_cfg.episode_length_s = float(cfg.isaaclab_episode_length_s)
+		if int(getattr(cfg, 'rank', 0)) == 0:
+			print(f"[Rank {cfg.rank}] Set IsaacLab episode_length_s={env_cfg.episode_length_s:.6g}.")
 	if hasattr(env_cfg, 'task_name'):
 		env_cfg.task_name = cfg.isaaclab_task_name
-	if cfg.isaaclab_env_id == "Isaac-AutoMate-Assembly-Direct-v0":
+	if cfg.isaaclab_env_id == "Isaac-AutoMate-Assembly-Direct-v0" or _uses_srsa_backend(cfg):
 		_configure_assembly_task(env_cfg, cfg)
 	_configure_physx_buffers(env_cfg, cfg)
 	render_mode = 'rgb_array' if (cfg.save_video or cfg.obs == 'rgb') else None

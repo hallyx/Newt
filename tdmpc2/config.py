@@ -46,6 +46,7 @@ class Config:
 	isaaclab_canonical_use_visual_noise: bool = False
 	isaaclab_action_dim: int = 6
 	isaaclab_gpu_collision_stack_size: Optional[int] = None
+	isaaclab_episode_length_s: Optional[float] = None
 	srsa_position_control_only: bool = True
 	srsa_policy_action_dim: int = 3
 	srsa_env_action_dim: int = 6
@@ -118,6 +119,7 @@ class Config:
 	srsa_axial_reference_anchor_task_type_id: Optional[int] = None
 	srsa_axial_recompute_manifest_task_vecs: bool = False
 	srsa_if_sbc: Optional[bool] = None
+	srsa_curriculum_freespace_range: Optional[float] = None
 	srsa_if_logging_eval: bool = False
 	srsa_eval_filename: Optional[str] = None
 	srsa_num_eval_trials: int = 100
@@ -182,6 +184,8 @@ class Config:
 	eval_freq: Optional[int] = None
 	skip_initial_eval: bool = False
 	eval_task_template_exact: bool = True
+	eval_task_template_apply_geometry: bool = True
+	eval_task_template_apply_sampler: bool = True
 	eval_task_template_print: bool = True
 	eval_terminate_on_success: bool = False
 	eval_terminate_success_key: str = "terminal_process_success"
@@ -1624,18 +1628,22 @@ def apply_eval_task_template(cfg, entry=None):
 	if template.get("assembly_id", None) is not None:
 		_set_cfg_value(cfg, "assembly_id", str(template["assembly_id"]).zfill(5))
 
-	_set_from_template(cfg, template, "srsa_task_family_name", "task_family_name")
-	_set_int_from_template(cfg, template, "srsa_task_family_id", "task_family_id")
-	_set_from_template(cfg, template, "srsa_plug_diameter", "plug_diameter", "male_diameter")
-	_set_from_template(cfg, template, "srsa_hole_diameter", "hole_diameter", "female_diameter")
-	_set_from_template(cfg, template, "srsa_clearance", "clearance", "diametral_clearance")
-	_set_from_template(cfg, template, "srsa_clearance_ratio", "clearance_ratio")
-	_set_from_template(cfg, template, "srsa_insertion_depth", "insertion_depth", "target_insertion_depth")
-	_set_from_template(cfg, template, "srsa_success_pos_tol", "success_pos_tol")
-	_set_int_from_template(cfg, template, "srsa_axial_task_type_id", "task_type_id", "task_type_id_float")
-	_set_from_template(cfg, template, "srsa_axial_reference_radius", "reference_radius")
-	_set_from_template(cfg, template, "srsa_axial_reference_depth", "reference_depth")
-	_apply_template_sampler_config(cfg, template)
+	apply_geometry = bool(_cfg_value(cfg, "eval_task_template_apply_geometry", True))
+	apply_sampler = bool(_cfg_value(cfg, "eval_task_template_apply_sampler", True))
+	if apply_geometry:
+		_set_from_template(cfg, template, "srsa_task_family_name", "task_family_name")
+		_set_int_from_template(cfg, template, "srsa_task_family_id", "task_family_id")
+		_set_from_template(cfg, template, "srsa_plug_diameter", "plug_diameter", "male_diameter")
+		_set_from_template(cfg, template, "srsa_hole_diameter", "hole_diameter", "female_diameter")
+		_set_from_template(cfg, template, "srsa_clearance", "clearance", "diametral_clearance")
+		_set_from_template(cfg, template, "srsa_clearance_ratio", "clearance_ratio")
+		_set_from_template(cfg, template, "srsa_insertion_depth", "insertion_depth", "target_insertion_depth")
+		_set_from_template(cfg, template, "srsa_success_pos_tol", "success_pos_tol")
+		_set_int_from_template(cfg, template, "srsa_axial_task_type_id", "task_type_id", "task_type_id_float")
+		_set_from_template(cfg, template, "srsa_axial_reference_radius", "reference_radius")
+		_set_from_template(cfg, template, "srsa_axial_reference_depth", "reference_depth")
+	if apply_sampler:
+		_apply_template_sampler_config(cfg, template)
 
 	task_vec = _template_value(template, "task_vec", "task_vec_6", "axial_task_vec", "axial_task_vec_6")
 	if task_vec is not None and bool(_cfg_value(cfg, "eval_task_template_exact", True)):

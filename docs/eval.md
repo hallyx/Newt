@@ -623,20 +623,73 @@ logs/<task>/<seed>/<exp_name>/<run_id>/data/real_closed_loop_trace.jsonl
 
 ```bash
 /home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/eval.py \
-  checkpoint=/path/to/checkpoint.pt \
+  checkpoint=logs/isaaclab-srsa-assembly/1/srsa_axial_direct_finetune_from_01125/20260525_112528_asm-00186/models/best.pt \
   eval_mode=sim \
   isaaclab_backend=srsa \
   task=isaaclab-srsa-assembly \
   assembly_id=00186 \
+  srsa_dir=/home/gpuserver/hx/github/srsa \
+  srsa_task_template_fp=data/srsa_axial_task_templates.json \
+  srsa_mesh_geometry_fp=data/srsa_mesh_geometry_params.csv \
+  srsa_param_template_id=2 \
   num_envs=1 \
   eval_trials=1 \
+  model_size=S \
+  horizon=3 \
+  compile=false \
+  mpc=true \
   isaaclab_headless=true \
+  isaaclab_use_canonical_obs=true \
+  srsa_enable_flange_force_sensor=true \
+  isaaclab_canonical_append_force=true \
+  isaaclab_canonical_append_task_params=false \
+  task_conditioning=axial_params \
+  contact_history_enabled=true \
+  contact_history_len=4 \
+  contact_context_dim=64 \
+  contact_history_hidden_dim=128 \
+  contact_history_layers=2 \
+  contact_force_dim=6 \
+  contact_action_dim=3 \
+  contact_ee_delta_dim=3 \
+  contact_history_use_ee_delta=true \
   save_video=true \
   eval_video_dir=videos/eval_00186 \
-  eval_video_fps=15 \
+  eval_video_fps=24 \
   eval_video_max_episodes=1 \
+  eval_video_name=00186_c0.5_d1 \
+  srsa_socket_camera_follow=true \
+  srsa_socket_camera_profile_fp=camera_profiles/socket_camera_offset.json \
+  srsa_socket_camera_env_index=0 \
   enable_wandb=false
 ```
+
+01125
+
+scripts/batch_record_task_sizes.py \
+  --assembly_id 01125 \
+  --checkpoint logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
+  --templates "0.5:0.5;4.0:2.0" \
+  --freespace_range 0.10 \
+  --episode_length_s 10 \
+  --video_fps 24 \
+  --video_length 180 \
+  --eval_trials 10 \
+  --video_episodes 10
+  --no_terminate_on_success
+
+00062
+scripts/batch_record_task_sizes.py \
+  --assembly_id 00062 \
+  --checkpoint logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
+  --templates "0.5:0.5;4.0:2.0" \
+  --freespace_range 0.10 \
+  --episode_length_s 10 \
+  --video_fps 24 \
+  --video_length 180 \
+  --eval_trials 10 \
+  --video_episodes 10
+  --no_terminate_on_success
 
 Newt batch eval 录一组 assembly：
 
@@ -678,9 +731,46 @@ scripts/batch_record_task_sizes.py \
 00783_c4_d2.mp4
 ```
 
+默认 `--size_source fixed`，和 SRSA 原生批量录制脚本一致：`clearance_base=0.000114`、`depth_base=0.015`。因此 `c0.5:d0.5` 表示 `0.057mm` diametral clearance 和 `7.5mm` target depth。fixed 模式不再走 `srsa_task_template_fp` / `srsa_param_template_id`，只按命令里的倍率直接设置 SRSA sampler；需要回到 Newt mesh-derived 模板口径时，再显式加 `--size_source mesh`。
+
+默认起点是近场插入评估：XY 初始偏差约 `1-9mm`，起始高度由 AutoMate 的 `curriculum_freespace_range` 控制，默认约 `10mm`。想录更明显的对孔过程，用 `--freespace_range` 拉高起点，并用 `--episode_length_s` 拉长单个 rollout：
+
+```bash
+scripts/batch_record_task_sizes.py \
+  --assembly_id 00186 \
+  --checkpoint logs/isaaclab-srsa-assembly/1/srsa_axial_direct_finetune_from_01125/20260525_112528_asm-00186/models/best.pt \
+  --templates "0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0" \
+  --init_error_xy_range "0.015,0.020" \
+  --freespace_range 0.03 \
+  --episode_length_s 10 \
+  --video_fps 10 \
+  --video_length 180 \
+  --no_terminate_on_success
+```
+
+注意：`--init_error_z_range` 是 SRSA sampler 的 z-error 字段，当前 SRSA reset 不用它来移动可见起始高度；录视频看起点高度时用 `--freespace_range`。
+
+批量脚本默认关闭 headless，会打开 Isaac 窗口，便于确认录制起点。需要无窗口批量跑时加 `--headless`。
+
+脚本自身参数用 `--freespace_range 0.10` 这种 argparse 写法；直接透传给 Hydra 的额外参数要写成 `srsa_curriculum_freespace_range=0.10`。脚本也会兼容尾部的 `--srsa_curriculum_freespace_range 0.10`，自动转成 Hydra override。
+
 默认启用 `--socket_camera_follow`，读取 `camera_profiles/socket_camera_offset.json` 来保持不同尺寸任务视角一致。没有 profile 时会退回默认视角；关闭跟随相机加 `--no_socket_camera_follow`。
 
 Newt eval 支持 `eval_video_name`，批量脚本会自动传入尺寸名，通常不需要手动设置。
+
+视频时长由 episode step 数和 `eval_video_fps` 决定。SRSA 默认约 75 step，所以 1 个 episode 在 `24 fps` 下只有约 `75 / 24 = 3.1s`。`--video_length` / `eval_video_max_frames` 只是最大帧数上限，不会把 episode 拉长；要拉长单个 rollout，用 `--episode_length_s`。
+
+想录更长的视频，可以降低 fps，或录多个 episode：
+
+```bash
+scripts/batch_record_task_sizes.py \
+  --assembly_id 00186 \
+  --checkpoint logs/isaaclab-srsa-assembly/1/srsa_axial_direct_finetune_from_01125/20260525_112528_asm-00186/models/best.pt \
+  --templates "1.0:1.0" \
+  --video_fps 24 \
+  --video_episodes 4 \
+  --video_length 320
+```
 
 使用 Newt eval 的 SRSA socket 相对相机时，先校准并保存 `camera_profiles/socket_camera_offset.json`，然后在录制命令里加：
 
