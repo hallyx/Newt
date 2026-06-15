@@ -542,37 +542,92 @@ Recommended sequence:
 
 This makes failure attribution easier.
 
-## 9. Questions for Pro Review
+Implementation note:
 
-Please analyze these specific questions:
+- The current smoke launcher keeps `srsa_param_template_id=2`, whose template is `c1.0-d1.0`.
+- With `eval_task_template_exact=true`, this exact template is what fixes Phase A size.
+- Later size curriculum runs should deliberately revisit `eval_task_template_exact` / sampler-template behavior instead of assuming the semicolon template string alone controls the active distribution.
 
-1. Should the next implementation prioritize staged online family replay, or true mixed-assembly online environments?
-2. Is 50/20/30 current-anchor-history replay a reasonable starting ratio for TD-MPC2 here?
-3. Should old replay be sampled uniformly by task, proportional to buffer size, or weighted by recent retention failure?
-4. Which checkpoint metric should gate progression:
-   - `relaxed_success`,
-   - `terminal_process_success`,
-   - `strict_success`,
-   - or a composite including force/jam/lateral error?
-5. Should 00062/00271 be included early, or held out as hard cases until the family baseline stabilizes?
-6. Should the action history / force history context be frozen during multi-task replay, or trained normally?
-7. Is offline data useful only as replay regularization, or should it still be part of world-model pretraining?
-8. Should size templates be represented as separate task entries in replay manifests, or kept as continuous task vectors within each assembly?
+## 9. Adopted V1 Decisions
 
-## 10. Current Working-Tree Notes
+The next implementation should prioritize staged online family replay.
 
-Current uncommitted files include video/eval tooling changes:
+Resolved choices:
+
+- Do not build a true mixed-assembly IsaacLab environment for V1.
+- Use `online_family_replay_*` config names; keep `multitask_continuation_*` for the existing offline continuation route.
+- Start with 50/20/30 current-anchor-history replay.
+- Sample history replay uniformly by task for V1, not proportional to buffer size.
+- Train contact/action history normally; do not freeze it in the first implementation.
+- Keep size/clearance/depth as continuous `task_vec_6` values inside each assembly replay, not as separate manifest task ids.
+- Treat offline family data as smoke/format/debug data for now, not as the main learning signal.
+- Hold out `00062` and `00271` until the 5-task baseline has meaningful retention.
+
+Initial family checkpoint score:
 
 ```text
-M docs/eval.md
-M scripts/batch_record_task_sizes.py
-M tdmpc2/common/logger.py
-M tdmpc2/config.py
-M tdmpc2/envs/isaaclab.py
-M tdmpc2/eval.py
-?? scripts/batch_record_ids_task_sizes.py
-?? data/video_eval_ids_task_sizes/
+family_score = 0.7 * mean_relaxed_success + 0.3 * min_relaxed_success
 ```
 
-These are not directly part of the multi-task training redesign, but they are useful for diagnostics and should not be accidentally reverted.
+This is intentionally simple. Later versions can add terminal/process success, jam rate, force, and lateral error.
 
+## 10. Implemented Scaffold
+
+The online family replay scaffold now has these project surfaces:
+
+- `tdmpc2/common/buffer.py`
+  - `Buffer.sample(device, batch_size=None)`
+  - replay snapshot `save()` / `load()`
+  - `save_current()` for trainer integration
+- `tdmpc2/common/online_family_replay.py`
+  - `OnlineFamilyReplayBuffer`
+  - current-only warmup until `online_family_min_current_episodes`
+  - current / anchor / uniform-history mixed sampling
+- `tdmpc2/config.py`
+  - `online_family_replay_*` fields and validation
+- `tdmpc2/train.py`
+  - wraps the normal online buffer when `online_family_replay_enabled=true`
+- `tdmpc2/trainer.py`
+  - saves current replay at eval and finish when `online_family_replay_save_fp` is set
+- `scripts/update_online_family_replay_manifest.py`
+  - updates the manifest with real replay snapshot metadata
+- `scripts/run_01125_online_family_replay_targets.sh`
+  - staged training launcher
+  - replay save / manifest update / joined-task eval
+- `configs/train/srsa_01125_online_family_replay.yaml`
+  - smoke-default online family replay config
+- `data/replay_manifests/01125_online_family.json`
+  - empty manifest template
+
+## 11. First Commands
+
+Dry-run the V1 smoke route:
+
+```bash
+DRY_RUN=1 \
+CONFIG_NAME=srsa_01125_online_family_replay \
+TARGETS="01125 00256 00186" \
+STEPS_PER_TASK=50000 \
+NUM_ENVS=64 \
+MULTIPROC=false \
+NUM_GPUS=1 \
+scripts/run_01125_online_family_replay_targets.sh
+```
+
+Then run the smoke route:
+
+```bash
+CONFIG_NAME=srsa_01125_online_family_replay \
+TARGETS="01125 00256 00186" \
+STEPS_PER_TASK=50000 \
+NUM_ENVS=64 \
+MULTIPROC=false \
+NUM_GPUS=1 \
+scripts/run_01125_online_family_replay_targets.sh
+```
+
+After smoke passes, scale in this order:
+
+1. `01125 -> 00256 -> 00186 -> 00004 -> 00014`, still fixed at `1.0:1.0`.
+2. Full family with `00062` and `00271` added last.
+3. Size curriculum after assembly retention is stable.

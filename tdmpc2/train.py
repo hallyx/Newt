@@ -19,6 +19,7 @@ from tensordict import TensorDict
 from common import barrier, set_seed
 from common.buffer import Buffer, EnsembleBuffer
 from common.logger import Logger
+from common.online_family_replay import OnlineFamilyReplayBuffer
 from common.world_model import WorldModel
 from config import Config, split_by_rank, parse_cfg
 from envs import make_env
@@ -299,6 +300,17 @@ def launch(cfg: Config):
 	else:
 		# Default to regular buffer
 		buffer = Buffer(**buffer_args)
+
+	if cfg.get('online_family_replay_enabled', False):
+		if cfg.get('use_demos', False):
+			raise ValueError(
+				"online_family_replay_enabled expects the current writable buffer to contain only online rollouts. "
+				"Set use_demos=false for this staged family replay path."
+			)
+		buffer = OnlineFamilyReplayBuffer.from_manifest(
+			current_buffer=buffer,
+			cfg=cfg,
+		)
 
 	if cfg.world_size > 1:
 		cfg.port = os.getenv("MASTER_PORT", str(12355 + int(os.getpid()) % 1000))

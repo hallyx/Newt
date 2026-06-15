@@ -93,6 +93,40 @@ class Trainer():
 			metrics.update(self.agent.latent_residual_metrics())
 		return metrics
 
+	def _maybe_save_current_replay(self, reason):
+		save_fp = self.cfg.get('online_family_replay_save_fp', None)
+		if not save_fp:
+			return None
+		if reason == 'eval' and not self.cfg.get('online_family_replay_save_every_eval', True):
+			return None
+		if reason == 'finish' and not self.cfg.get('online_family_replay_save_on_finish', True):
+			return None
+		if self.cfg.world_size > 1:
+			barrier()
+		result = None
+		if self.cfg.rank == 0:
+			num_eps = int(getattr(self.buffer, 'num_eps', 0))
+			if num_eps <= 0:
+				print(colored(
+					f'Skipping replay save at {reason}: current buffer has no episodes yet.',
+					'yellow',
+					attrs=['bold'],
+				))
+			else:
+				metadata = {
+					'reason': reason,
+					'step': int(self._step),
+					'episode': int(self._ep_idx),
+					'assembly_id': str(self.cfg.get('assembly_id', '')),
+					'task_id': str(self.cfg.get('online_family_current_task_id', self.cfg.get('assembly_id', ''))),
+					'checkpoint': self.cfg.get('checkpoint', None),
+				}
+				save_fn = self.buffer.save_current if hasattr(self.buffer, 'save_current') else self.buffer.save
+				result = save_fn(save_fp, metadata=metadata)
+		if self.cfg.world_size > 1:
+			barrier()
+		return result
+
 	def _uses_runtime_task_vec(self):
 		return (
 			bool(self.cfg.get('srsa_use_runtime_task_vec', True)) and
@@ -411,6 +445,7 @@ class Trainer():
 						eval_metrics,
 						self._step,
 					)
+				self._maybe_save_current_replay('eval')
 
 				# Save agent
 				if self._step % self.cfg.save_freq == 0 and self._step > 0:
@@ -515,4 +550,5 @@ class Trainer():
 						force=True,
 					)
 		
+		self._maybe_save_current_replay('finish')
 		self.logger.finish()

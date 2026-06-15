@@ -296,6 +296,21 @@ class Config:
 	multitask_distill_coef: float = 1.0e-3
 	multitask_no_forgetting_max_forgetting: float = 0.05
 
+	# online staged family replay
+	online_family_replay_enabled: bool = False
+	online_family_replay_manifest_fp: Optional[str] = None
+	online_family_replay_save_fp: Optional[str] = None
+	online_family_current_task_id: Optional[str] = None
+	online_family_anchor_task_id: str = "01125"
+	online_family_current_ratio: float = 0.50
+	online_family_anchor_ratio: float = 0.20
+	online_family_history_ratio: float = 0.30
+	online_family_min_current_episodes: int = 5
+	online_family_replay_max_episodes_per_task: Optional[int] = None
+	online_family_replay_save_every_eval: bool = True
+	online_family_replay_save_on_finish: bool = True
+	online_family_replay_storage_device: str = "cpu"
+
 	# policy rollout collection for offline RL
 	collect_assembly_ids: Any = "[00004,00014,00062,00271]"
 	collect_source_assembly_id: Optional[str] = "01125"
@@ -1047,6 +1062,48 @@ def _validate_multitask_continuation_paths(cfg):
 	_set_cfg_value(cfg, "offline_manifest_fp", str(manifest_path))
 
 
+def _validate_online_family_replay_cfg(cfg):
+	if not _cfg_value(cfg, "online_family_replay_enabled", False):
+		return
+	if _cfg_value(cfg, "multitask_continuation_enabled", False):
+		raise ValueError(
+			"online_family_replay_enabled and multitask_continuation_enabled are separate training routes; "
+			"enable only one. Use online_family_replay_* for staged online replay and "
+			"multitask_continuation_* for offline continuation."
+		)
+	ratios = {
+		"online_family_current_ratio": float(_cfg_value(cfg, "online_family_current_ratio", 0.0)),
+		"online_family_anchor_ratio": float(_cfg_value(cfg, "online_family_anchor_ratio", 0.0)),
+		"online_family_history_ratio": float(_cfg_value(cfg, "online_family_history_ratio", 0.0)),
+	}
+	for key, value in ratios.items():
+		if value < 0.0:
+			raise ValueError(f"{key} must be non-negative, got {value}.")
+	if sum(ratios.values()) <= 0.0:
+		raise ValueError("At least one online_family replay ratio must be positive.")
+	min_current = int(_cfg_value(cfg, "online_family_min_current_episodes", 5))
+	if min_current < 0:
+		raise ValueError("online_family_min_current_episodes must be non-negative.")
+	_set_cfg_value(cfg, "online_family_min_current_episodes", min_current)
+	if not _cfg_value(cfg, "online_family_current_task_id", None):
+		_set_cfg_value(cfg, "online_family_current_task_id", str(_cfg_value(cfg, "assembly_id", "current")))
+	manifest_fp = _cfg_value(cfg, "online_family_replay_manifest_fp", None)
+	if manifest_fp:
+		manifest_path = _absolute_cfg_path(manifest_fp)
+		if manifest_path.suffix.lower() != ".json":
+			raise ValueError(
+				f"online_family_replay_manifest_fp={manifest_path} is invalid: expected a replay manifest .json file."
+			)
+		_set_cfg_value(cfg, "online_family_replay_manifest_fp", str(manifest_path))
+	save_fp = _cfg_value(cfg, "online_family_replay_save_fp", None)
+	if save_fp:
+		save_path = _absolute_cfg_path(save_fp)
+		_set_cfg_value(cfg, "online_family_replay_save_fp", str(save_path))
+	max_eps = _cfg_value(cfg, "online_family_replay_max_episodes_per_task", None)
+	if max_eps is not None and int(max_eps) <= 0:
+		raise ValueError("online_family_replay_max_episodes_per_task must be positive when set.")
+
+
 def _normalize_srsa_assembly_id(value):
 	if value is None:
 		return None
@@ -1734,6 +1791,7 @@ def parse_cfg(cfg):
 	if cfg.get('eval_success_metric', None) is not None:
 		cfg.srsa_eval_success_metric = cfg.eval_success_metric
 	_validate_multitask_continuation_paths(cfg)
+	_validate_online_family_replay_cfg(cfg)
 	if cfg.get('multitask_continuation_enabled', False):
 		if bool(cfg.get('latent_residual_enabled', False)):
 			raise ValueError(

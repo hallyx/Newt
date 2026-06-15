@@ -1,5 +1,54 @@
 # AGENT.md
 
+## 2026-06-15 Active Direction: SRSA Online Family Replay V1
+
+The active multi-task training direction is now staged online family replay, not
+offline-first family continuation and not a true mixed-assembly IsaacLab env.
+
+Primary implementation rule:
+
+- Keep each online train job single-assembly.
+- Save the current stage's online replay.
+- On later stages, train from a mixed replay batch:
+  - current task replay: 50%
+  - `01125` anchor replay: 20%
+  - previous task history replay: 30%
+- Do not reuse `multitask_continuation_*` for this path. Those names remain
+  reserved for the existing offline continuation route.
+- Use new config names under `online_family_replay_*`.
+
+Recommended stage order:
+
+- smoke: `01125 -> 00256 -> 00186`
+- medium family: `01125 -> 00256 -> 00186 -> 00004 -> 00014`
+- hard cases only after the baseline is stable: `00062`, then `00271`
+
+Curriculum rule:
+
+- First fix `srsa_axial_clearance_depth_templates` to `"1.0:1.0"` and solve
+  assembly transfer.
+- Add size generalization only after retention is stable:
+  `"1.0:1.0;0.5:1.0;2.0:1.5"`, then the full five-template set.
+
+Checkpoint/eval rule:
+
+- Prefer `relaxed_success` and family retention metrics over
+  `official_success_latched`.
+- The first family score can be:
+  `0.7 * mean_relaxed_success + 0.3 * min_relaxed_success`.
+- Continue reporting strict/process/lateral/force diagnostics; do not let
+  official-latched success hide insertion failures.
+
+Implementation surface for this route:
+
+- `tdmpc2/common/buffer.py`
+- `tdmpc2/common/online_family_replay.py`
+- `tdmpc2/config.py`
+- `tdmpc2/train.py`
+- `tdmpc2/trainer.py`
+- `scripts/run_01125_online_family_replay_targets.sh`
+- `scripts/update_online_family_replay_manifest.py`
+
 ## 2026-05-24 Recovery Note: 01125 Axial-Hole Consolidation
 
 The active task has shifted from the older single-task 14D Phase 1 note below to

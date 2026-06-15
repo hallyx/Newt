@@ -1,0 +1,34 @@
+defaults:
+  - srsa_01125_imitation_relaxed
+  - _self_
+
+# Smoke/default config for staged online family replay.
+# The launcher overrides manifest/save paths into the run log directory.
+
+exp_name: srsa_axial_online_family_replay_from_01125
+
+steps: 50000
+num_envs: 64
+multiproc: false
+num_gpus: 1
+eval_episodes: 1
+eval_freq: 50000
+save_freq: 50000
+seeding_coef: 1
+
+# Phase A: assembly transfer only. Add size curriculum after retention is stable.
+srsa_axial_clearance_depth_templates: "1.0:1.0"
+
+online_family_replay_enabled: true
+online_family_replay_manifest_fp: data/replay_manifests/01125_online_family.json
+online_family_replay_save_fp: data/replay_manifests/replay/${assembly_id}.pt
+online_family_current_task_id:
+online_family_anchor_task_id: "01125"
+online_family_current_ratio: 0.50
+online_family_anchor_ratio: 0.20
+online_family_history_ratio: 0.30
+online_family_min_current_episodes: 5
+online_family_replay_max_episodes_per_task:
+online_family_replay_save_every_eval: true
+online_family_replay_save_on_finish: true
+online_family_replay_storage_device: cpu
