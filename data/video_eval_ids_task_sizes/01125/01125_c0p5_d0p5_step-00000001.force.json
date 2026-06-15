@@ -1,0 +1,9 @@
+{
+  "alignment": "row frame_index matches the corresponding saved video frame index",
+  "env_index": 0,
+  "force_trace_fp": "/home/gpuserver/hx/github/Newt/data/video_eval_ids_task_sizes/01125/01125_c0p5_d0p5_step-00000001.force.csv",
+  "force_units": "raw force columns are Newtons; force_obs columns are SRSA normalized observations",
+  "fps": 10.0,
+  "rows": 1491,
+  "video_fp": "/home/gpuserver/hx/github/Newt/data/video_eval_ids_task_sizes/01125/01125_c0p5_d0p5_step-00000001.mp4"
+}

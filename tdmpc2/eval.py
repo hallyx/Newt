@@ -223,6 +223,164 @@ class EvalTraceRecorder:
 		self.count += 1
 
 
+class VideoForceTraceRecorder:
+	"""Collect force samples that are one-to-one aligned with saved video frames."""
+
+	FORCE_ATTRS = {
+		"force_world": "flange_force_world",
+		"force_socket": "flange_force_socket",
+		"force_obs": "flange_force_obs",
+		"flange_body_contact_force_world": "flange_body_contact_force_world",
+		"held_sensor_contact_force_world": "held_sensor_contact_force_world",
+		"held_asset_contact_force_world": "held_asset_contact_force_world",
+	}
+	INFO_KEYS = (
+		"success",
+		"depth_fraction",
+		"lateral_error",
+		"keypoint_error",
+		"terminal_process_success",
+		"relaxed_terminal_process_success",
+		"jam",
+	)
+
+	def __init__(self, cfg):
+		self.cfg = cfg
+		self.enabled = (
+			bool(cfg.get("eval_video_force_trace", False))
+			and bool(cfg.get("save_video", False))
+			and int(cfg.get("rank", 0)) == 0
+		)
+		self.env_index = cfg.get("eval_video_force_trace_env_index", None)
+		if self.env_index is None:
+			self.env_index = cfg.get("eval_video_env_index", 0)
+		self.env_index = int(self.env_index or 0)
+		self.fps = float(cfg.get("eval_video_fps", 15) or 15)
+		self.rows = []
+		self.fp = None
+		self.metadata_fp = None
+
+	def _runtime_env(self, env):
+		candidates = [env]
+		if hasattr(env, "env"):
+			candidates.append(env.env)
+			if hasattr(env.env, "unwrapped"):
+				candidates.append(env.env.unwrapped)
+		if hasattr(env, "unwrapped"):
+			candidates.append(env.unwrapped)
+		for candidate in candidates:
+			if candidate is not None and hasattr(candidate, "flange_force_world"):
+				return candidate
+		return candidates[-1] if candidates else env
+
+	def _select(self, value):
+		if value is None:
+			return None
+		if torch.is_tensor(value):
+			value = value.detach().cpu()
+			if value.ndim >= 1 and value.shape[0] > self.env_index:
+				value = value[self.env_index]
+			if value.numel() == 1:
+				return float(value.reshape(-1)[0].item())
+			return [float(item) for item in value.reshape(-1).tolist()]
+		try:
+			return float(value)
+		except (TypeError, ValueError):
+			return value
+
+	def _vector(self, runtime_env, attr, dim=3):
+		value = self._select(getattr(runtime_env, attr, None))
+		if value is None:
+			return [math.nan] * dim
+		if isinstance(value, list):
+			vector = value[:dim]
+		else:
+			vector = [float(value)]
+		while len(vector) < dim:
+			vector.append(math.nan)
+		return vector
+
+	def _scalar_attr(self, runtime_env, attr):
+		value = self._select(getattr(runtime_env, attr, None))
+		if isinstance(value, list):
+			return float(value[0]) if value else math.nan
+		return math.nan if value is None else float(value)
+
+	def _info_scalar(self, info, key):
+		if not isinstance(info, dict) or key not in info:
+			return math.nan
+		value = self._select(info[key])
+		if isinstance(value, list):
+			return float(value[0]) if value else math.nan
+		if isinstance(value, bool):
+			return float(value)
+		return math.nan if value is None else float(value)
+
+	def record(
+		self,
+		env,
+		*,
+		frame_index,
+		eval_step,
+		episode_index,
+		episode_step,
+		done=False,
+		info=None,
+	):
+		if not self.enabled:
+			return
+		runtime_env = self._runtime_env(env)
+		row = {
+			"frame_index": int(frame_index),
+			"video_time_s": float(frame_index) / max(self.fps, 1.0e-6),
+			"eval_step": int(eval_step),
+			"episode_index": int(episode_index),
+			"episode_step": int(episode_step),
+			"env_index": int(self.env_index),
+			"done": int(bool(done)),
+		}
+		for prefix, attr in self.FORCE_ATTRS.items():
+			x, y, z = self._vector(runtime_env, attr)
+			row[f"{prefix}_x"] = x
+			row[f"{prefix}_y"] = y
+			row[f"{prefix}_z"] = z
+			row[f"{prefix}_norm"] = math.sqrt(x * x + y * y + z * z) if all(math.isfinite(v) for v in (x, y, z)) else math.nan
+		row["flange_force_norm"] = self._scalar_attr(runtime_env, "flange_force_norm")
+		row["flange_force_flag"] = self._scalar_attr(runtime_env, "flange_force_flag")
+		for key in self.INFO_KEYS:
+			row[key] = self._info_scalar(info, key)
+		self.rows.append(row)
+
+	def save(self, video_fp):
+		if not self.enabled or video_fp is None or not self.rows:
+			return None
+		video_fp = Path(video_fp)
+		self.fp = video_fp.with_suffix(".force.csv")
+		self.metadata_fp = video_fp.with_suffix(".force.json")
+		fieldnames = list(self.rows[0].keys())
+		for row in self.rows:
+			for key in row.keys():
+				if key not in fieldnames:
+					fieldnames.append(key)
+		with open(self.fp, "w", newline="", encoding="utf-8") as f:
+			writer = csv.DictWriter(f, fieldnames=fieldnames)
+			writer.writeheader()
+			writer.writerows(self.rows)
+		metadata = {
+			"video_fp": str(video_fp),
+			"force_trace_fp": str(self.fp),
+			"fps": self.fps,
+			"env_index": self.env_index,
+			"rows": len(self.rows),
+			"alignment": "row frame_index matches the corresponding saved video frame index",
+			"force_units": "raw force columns are Newtons; force_obs columns are SRSA normalized observations",
+		}
+		with open(self.metadata_fp, "w", encoding="utf-8") as f:
+			json.dump(metadata, f, indent=2, sort_keys=True)
+		print(colored(f"Saved video force trace: {self.fp}", "green", attrs=["bold"]))
+		return self.fp
+
+
 def _real_eval_mode(cfg) -> str:
 	return str(cfg.get('eval_real_mode', 'stream')).strip().lower().replace('-', '_')
 
@@ -739,10 +897,22 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	trace_step = 0
 	video_fp = None
 	video_recorder = trainer.logger.video if trainer.cfg.save_video else None
+	video_force_trace = VideoForceTraceRecorder(trainer.cfg) if video_recorder is not None else None
+	force_trace_fp = None
 	video_max_episodes = max(1, int(trainer.cfg.get('eval_video_max_episodes', 1) or 1))
 
 	if video_recorder is not None:
-		video_recorder.init(trainer.env, enabled=trainer.cfg.rank == 0)
+		frame_saved = video_recorder.init(trainer.env, enabled=trainer.cfg.rank == 0)
+		if frame_saved and video_force_trace is not None:
+			video_force_trace.record(
+				trainer.env,
+				frame_index=len(video_recorder.frames) - 1,
+				eval_step=0,
+				episode_index=0,
+				episode_step=0,
+				done=False,
+				info=None,
+			)
 
 	with EvalTraceRecorder(trainer.cfg, phase="sim") as trace, make_eval_zmq_publisher(trainer.cfg) as action_publisher:
 		if trace.enabled and not (0 <= trace.env_index < trainer.cfg.num_envs):
@@ -775,10 +945,21 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 				)
 			should_record_video = video_recorder is not None and completed < video_max_episodes
 			obs, reward, terminated, truncated, info = trainer.env.step(action)
-			if should_record_video:
-				video_recorder.record(trainer.env)
-
 			done = terminated | truncated
+			if should_record_video:
+				frame_saved = video_recorder.record(trainer.env)
+				if frame_saved and video_force_trace is not None:
+					force_env_index = max(0, min(video_force_trace.env_index, trainer.cfg.num_envs - 1))
+					video_force_trace.record(
+						trainer.env,
+						frame_index=len(video_recorder.frames) - 1,
+						eval_step=trace_step + 1,
+						episode_index=completed,
+						episode_step=int(episode_len[force_env_index].item()) + 1,
+						done=bool(done[force_env_index].item()),
+						info=info,
+					)
+
 			episode_reward += reward
 			episode_len += 1
 			trace.record(
@@ -828,6 +1009,8 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	if video_recorder is not None:
 		video_name = trainer.cfg.get('eval_video_name', None) or f"eval_trials_{trainer.cfg.get('assembly_id', 'assembly')}"
 		video_fp = video_recorder.save(trainer._step, name=video_name)
+		if video_force_trace is not None:
+			force_trace_fp = video_force_trace.save(video_fp)
 
 	barrier()
 
@@ -883,6 +1066,8 @@ def eval_by_trials(trainer: Trainer, total_trials: int):
 	metrics['eval_trials'] = total_count
 	if video_fp is not None:
 		metrics['eval_video_fp'] = str(video_fp)
+	if force_trace_fp is not None:
+		metrics['eval_video_force_trace_fp'] = str(force_trace_fp)
 	return metrics
 
 
@@ -999,18 +1184,20 @@ def evaluate(rank: int, cfg: dict):
 			if torch.distributed.is_initialized():
 				torch.distributed.destroy_process_group()
 
-	env = make_env(cfg)
-	logger = Logger(cfg)
-	agent = make_agent(cfg)
-	trainer = Trainer(
-		cfg=cfg,
-		env=env,
-		agent=agent,
-		buffer=None,
-		logger=logger,
-	)
-	barrier()
+	env = None
+	trainer = None
 	try:
+		env = make_env(cfg)
+		logger = Logger(cfg)
+		agent = make_agent(cfg)
+		trainer = Trainer(
+			cfg=cfg,
+			env=env,
+			agent=agent,
+			buffer=None,
+			logger=logger,
+		)
+		barrier()
 		if cfg.rank == 0:
 			print(colored(f'Evaluating checkpoint: {cfg.checkpoint}', 'blue', attrs=['bold']))
 			print(colored(f'Evaluation mode: {cfg.eval_mode}', 'blue', attrs=['bold']))
@@ -1044,13 +1231,21 @@ def evaluate(rank: int, cfg: dict):
 				attrs=['bold'],
 			))
 			_write_eval_summary(cfg, eval_metrics)
+		if cfg.rank == 0:
+			print(colored('Evaluation artifacts saved successfully.', 'green', attrs=['bold']), flush=True)
 		trainer.logger.finish()
 		if cfg.rank == 0:
-			print(colored('Evaluation completed successfully.', 'green', attrs=['bold']))
+			print(colored('Evaluation completed successfully.', 'green', attrs=['bold']), flush=True)
 	except Exception as e:
 		print(colored(f'[Rank {cfg.rank}] Evaluation crashed with exception: {repr(e)}', 'red', attrs=['bold']))
 		raise
 	finally:
+		if env is not None:
+			try:
+				env.close()
+			except Exception as close_exc:
+				if cfg.rank == 0:
+					print(colored(f'Env close failed during eval teardown: {close_exc!r}', 'yellow', attrs=['bold']))
 		if torch.distributed.is_initialized():
 			torch.distributed.destroy_process_group()
 

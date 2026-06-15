@@ -132,7 +132,7 @@ class VideoRecorder:
 		self._record_calls = 0
 		self._saved_fp = None
 		self.enabled = bool(enabled)
-		self.record(env)
+		return self.record(env)
 
 	def _normalize_frame(self, frame):
 		if frame is None:
@@ -163,14 +163,14 @@ class VideoRecorder:
 
 	def record(self, env):
 		if not self.enabled:
-			return
+			return False
 		self._record_calls += 1
 		record_every = max(1, int(self.cfg.get("eval_video_record_every", 1) or 1))
 		if (self._record_calls - 1) % record_every != 0:
-			return
+			return False
 		max_frames = self.cfg.get("eval_video_max_frames", None)
 		if max_frames is not None and len(self.frames) >= int(max_frames):
-			return
+			return False
 		try:
 			frame = self._normalize_frame(env.render())
 		except Exception as exc:
@@ -178,14 +178,15 @@ class VideoRecorder:
 				print(colored(f"Video render failed; disabling this recorder. {exc}", "yellow", attrs=["bold"]))
 				self._warned_render = True
 			self.enabled = False
-			return
+			return False
 		if frame is None:
 			if not self._warned_render:
 				print(colored("Video render returned no frame; disabling this recorder.", "yellow", attrs=["bold"]))
 				self._warned_render = True
 			self.enabled = False
-			return
+			return False
 		self.frames.append(frame)
+		return True
 
 	def _local_video_fp(self, step, name=None):
 		fmt = str(self.cfg.get("eval_video_format", "mp4") or "mp4").strip().lower().lstrip(".")

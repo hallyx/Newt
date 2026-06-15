@@ -4,19 +4,28 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
+import signal
 import subprocess
 import sys
+import time
 
 
 DEFAULT_PYTHON = "/home/gpuserver/miniconda3/envs/isaac51/bin/python"
 DEFAULT_ISAACLAB_DIR = "/home/gpuserver/IsaacLab"
 DEFAULT_SRSA_DIR = "/home/gpuserver/hx/github/srsa"
 DEFAULT_SIZE_TEMPLATES = "0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0"
+SUCCESS_MARKERS = (
+    "Evaluation artifacts saved successfully.",
+    "Evaluation completed successfully.",
+    "Real closed-loop inference completed successfully.",
+)
 
 
 def _repo_root() -> Path:
@@ -136,6 +145,154 @@ def _normalize_extra_overrides(values: list[str]) -> list[str]:
     return normalized
 
 
+def _terminate_process(proc: subprocess.Popen, *, kill_after_s: float = 10.0) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        proc.terminate()
+    try:
+        proc.wait(timeout=max(0.1, float(kill_after_s)))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:
+        proc.kill()
+    proc.wait()
+
+
+def _artifact_outputs_ready(
+    *,
+    required_paths: list[Path],
+    required_globs: list[str],
+    started_at_wall_s: float,
+) -> bool:
+    min_mtime = float(started_at_wall_s) - 1.0
+    for path in required_paths:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return False
+        if stat.st_size <= 0 or stat.st_mtime < min_mtime:
+            return False
+    for pattern in required_globs:
+        matches = [Path(path) for path in glob.glob(pattern)]
+        fresh_matches = []
+        for path in matches:
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            if stat.st_size > 0 and stat.st_mtime >= min_mtime:
+                fresh_matches.append(path)
+        if not fresh_matches:
+            return False
+    return True
+
+
+def _run_eval_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    exit_grace_s: float | None,
+    artifact_required_paths: list[Path] | None = None,
+    artifact_required_globs: list[str] | None = None,
+) -> None:
+    started_at_wall_s = time.time()
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=(os.name != "nt"),
+    )
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    success_seen_at = None
+    stream_open = True
+    try:
+        while True:
+            if stream_open:
+                for key, _ in selector.select(timeout=0.5):
+                    line = key.fileobj.readline()
+                    if line == "":
+                        selector.unregister(key.fileobj)
+                        stream_open = False
+                        break
+                    print(line, end="", flush=True)
+                    if any(marker in line for marker in SUCCESS_MARKERS):
+                        success_seen_at = time.monotonic()
+            else:
+                time.sleep(0.1)
+
+            if (
+                success_seen_at is None
+                and (artifact_required_paths or artifact_required_globs)
+                and _artifact_outputs_ready(
+                    required_paths=artifact_required_paths or [],
+                    required_globs=artifact_required_globs or [],
+                    started_at_wall_s=started_at_wall_s,
+                )
+            ):
+                success_seen_at = time.monotonic()
+                print(
+                    "[newt] eval video/summary artifacts detected; treating eval as complete "
+                    "for teardown timeout handling.",
+                    flush=True,
+                )
+
+            returncode = proc.poll()
+            if returncode is not None:
+                if stream_open:
+                    for line in proc.stdout:
+                        print(line, end="", flush=True)
+                if returncode != 0:
+                    if success_seen_at is not None:
+                        print(
+                            "[newt-warning] eval printed success but exited nonzero during teardown "
+                            f"(returncode={returncode}); continuing.",
+                            flush=True,
+                        )
+                        return
+                    raise subprocess.CalledProcessError(returncode, command)
+                return
+
+            if (
+                success_seen_at is not None
+                and exit_grace_s is not None
+                and float(exit_grace_s) >= 0.0
+                and time.monotonic() - success_seen_at >= float(exit_grace_s)
+            ):
+                print(
+                    "[newt-warning] eval printed success but IsaacSim did not exit within "
+                    f"{float(exit_grace_s):g}s; terminating the child process and continuing.",
+                    flush=True,
+                )
+                _terminate_process(proc)
+                return
+    except KeyboardInterrupt:
+        _terminate_process(proc)
+        raise
+    finally:
+        selector.close()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Record videos with Newt tdmpc2/eval.py over SRSA task-size templates.",
@@ -161,7 +318,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu_id", type=int, default=None, help="Override GPU id instead of parsing --device.")
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--eval_trials", type=int, default=1)
-    parser.add_argument("--video_length", type=int, default=300, help="Maximum recorded frames per template.")
+    parser.add_argument(
+        "--video_length",
+        type=int,
+        default=300,
+        help="Maximum total recorded frames per template. Use 0 to disable the frame cap.",
+    )
     parser.add_argument(
         "--video_episodes",
         type=int,
@@ -173,6 +335,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_format", default="mp4")
     parser.add_argument("--video_record_every", type=int, default=1)
     parser.add_argument("--video_prefix", default=None, help="Filename prefix. Defaults to assembly_id.")
+    parser.add_argument("--no_force_trace", action="store_true", help="Do not save frame-aligned force CSV traces.")
     parser.add_argument("--model_size", default="S")
     parser.add_argument("--horizon", type=int, default=3)
     parser.add_argument("--srsa_task_template_fp", default="data/srsa_axial_task_templates.json")
@@ -240,7 +403,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Run IsaacLab headless.",
     )
+    parser.add_argument(
+        "--isaaclab_multi_gpu",
+        action="store_true",
+        help="Allow IsaacSim renderer multi-GPU mode. Default is disabled so --device cuda:N stays on one GPU.",
+    )
     parser.add_argument("--no_contact_preset", action="store_true", help="Do not add 17D/contact-history defaults.")
+    parser.add_argument(
+        "--eval_exit_grace_s",
+        type=float,
+        default=30.0,
+        help=(
+            "After eval prints a success marker, wait this many seconds for IsaacSim to exit. "
+            "If it is still stuck in plugin teardown, terminate it and continue. Use -1 to disable."
+        ),
+    )
     parser.add_argument("--dry_run", action="store_true", help="Print Newt eval commands without running them.")
     return parser
 
@@ -272,6 +449,7 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
         _override("compile", False),
         _override("mpc", True),
         _override("isaaclab_headless", not args.interactive),
+        _override("isaaclab_multi_gpu", args.isaaclab_multi_gpu),
         _override("isaaclab_use_canonical_obs", True),
         _override("srsa_task_family_name", "normal_fit"),
         _override("srsa_task_param_obs", False),
@@ -302,10 +480,11 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
         _override("eval_video_dir", args.video_dir),
         _override("eval_video_fps", args.video_fps),
         _override("eval_video_format", args.video_format),
-        _override("eval_video_max_frames", args.video_length),
         _override("eval_video_max_episodes", args.video_episodes),
         _override("eval_video_record_every", args.video_record_every),
         _override("eval_video_env_index", 0),
+        _override("eval_video_force_trace", not args.no_force_trace),
+        _override("eval_video_force_trace_env_index", 0),
         _override("enable_wandb", False),
         _override("save_agent", False),
         _override("exp_name", "batch_record_task_sizes"),
@@ -318,6 +497,8 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
             _override("isaaclab_episode_length_s", args.episode_length_s),
             _override("isaaclab_max_episode_steps", max(1, int(round(float(args.episode_length_s) * 15.0)))),
         ])
+    if int(args.video_length) > 0:
+        overrides.append(_override("eval_video_max_frames", args.video_length))
     if not fixed_size_source:
         overrides.extend([
             _override("srsa_task_template_fp", args.srsa_task_template_fp),
@@ -347,6 +528,17 @@ def _base_overrides(args: argparse.Namespace, gpu_id: int) -> list[str]:
     return overrides
 
 
+def _expected_artifacts(args: argparse.Namespace, repo_root: Path, video_name: str) -> tuple[list[Path], list[str]]:
+    work_dir = repo_root / "logs" / "isaaclab-srsa-assembly" / "1" / "batch_record_task_sizes" / video_name
+    video_dir = Path(args.video_dir).expanduser()
+    if not video_dir.is_absolute():
+        video_dir = work_dir / video_dir
+    fmt = str(args.video_format or "mp4").strip().lower().lstrip(".") or "mp4"
+    required_paths = [work_dir / "eval_summary" / "eval_summary.json"]
+    required_globs = [str(video_dir / f"{video_name}_step-*.{fmt}")]
+    return required_paths, required_globs
+
+
 def main() -> int:
     parser = _build_parser()
     args, extra_overrides = parser.parse_known_args()
@@ -362,6 +554,17 @@ def main() -> int:
     gpu_id = int(args.gpu_id if args.gpu_id is not None else _gpu_id_from_device(args.device))
     video_prefix = _safe_name(args.video_prefix or args.assembly_id)
     base_overrides = _base_overrides(args, gpu_id)
+    if int(args.video_length) > 0 and int(args.video_episodes) > 1:
+        episode_steps = int(round(float(args.episode_length_s) * 15.0)) if args.episode_length_s else 75
+        expected_frames = int(args.video_episodes) * max(1, episode_steps) + 1
+        if int(args.video_length) < expected_frames:
+            print(
+                "[newt-warning] --video_length is a total frame cap, not per-episode. "
+                f"video_length={args.video_length} may stop before recording "
+                f"video_episodes={args.video_episodes}; estimated_full_frames={expected_frames}. "
+                "Increase --video_length or use --video_length 0.",
+                flush=True,
+            )
 
     for index, (clearance_mult, depth_mult) in enumerate(templates, start=1):
         template = f"{clearance_mult:g}:{depth_mult:g}"
@@ -397,7 +600,15 @@ def main() -> int:
         print(f"[newt] ({index}/{len(templates)}) Newt eval template {template} -> {video_name} ({size_text})", flush=True)
         print(f"[newt] command={shlex.join(command)}", flush=True)
         if not args.dry_run:
-            subprocess.run(command, cwd=repo_root, check=True)
+            exit_grace_s = None if float(args.eval_exit_grace_s) < 0.0 else float(args.eval_exit_grace_s)
+            artifact_paths, artifact_globs = _expected_artifacts(args, repo_root, video_name)
+            _run_eval_command(
+                command,
+                cwd=repo_root,
+                exit_grace_s=exit_grace_s,
+                artifact_required_paths=artifact_paths,
+                artifact_required_globs=artifact_globs,
+            )
 
     return 0
 

@@ -766,11 +766,14 @@ def _launch_isaaclab_app(cfg):
 
 	enable_cameras = cfg.isaaclab_enable_cameras or cfg.save_video or cfg.obs == 'rgb'
 	device = f"cuda:{cfg.device_id}" if torch.cuda.is_available() else "cpu"
-	_APP_LAUNCHER = AppLauncher(
-		headless=cfg.isaaclab_headless,
-		enable_cameras=enable_cameras,
-		device=device,
-	)
+	launcher_kwargs = {
+		"headless": cfg.isaaclab_headless,
+		"enable_cameras": enable_cameras,
+		"device": device,
+	}
+	if cfg.get('isaaclab_multi_gpu', None) is not None:
+		launcher_kwargs["multi_gpu"] = bool(cfg.isaaclab_multi_gpu)
+	_APP_LAUNCHER = AppLauncher(**launcher_kwargs)
 	_SIMULATION_APP = _APP_LAUNCHER.app
 
 

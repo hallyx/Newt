@@ -681,7 +681,7 @@ scripts/batch_record_task_sizes.py \
 00062
 scripts/batch_record_task_sizes.py \
   --assembly_id 00062 \
-  --checkpoint logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
+  --checkpoint logs/finetune/1/srsa_axial_finetune_from_01125/20260528_051129_asm-00062_tid-2/models/best.pt \
   --templates "0.5:0.5;4.0:2.0" \
   --freespace_range 0.10 \
   --episode_length_s 10 \
@@ -690,6 +690,20 @@ scripts/batch_record_task_sizes.py \
   --eval_trials 10 \
   --video_episodes 10
   --no_terminate_on_success
+
+scripts/batch_record_ids_task_sizes.py \
+  --items "00256=logs/isaaclab-srsa-assembly/1/srsa_axial_direct_finetune_from_01125/20260525_112528_asm-00256/models/best_step-600000_s-0p9556.pt" \
+  --templates "0.5:0.5" \
+  --freespace_range 0.10 \
+  --episode_length_s 10 \
+  --video_fps 10 \
+  --eval_trials 5 \
+  --video_episodes 10 \
+  --video_length 0 \
+  --no_terminate_on_success \
+  --eval_video_force_trace=true \
+  --eval_video_force_trace_env_index=0 \
+  --device cuda:0
 
 Newt batch eval 录一组 assembly：
 
@@ -752,13 +766,102 @@ scripts/batch_record_task_sizes.py \
 
 批量脚本默认关闭 headless，会打开 Isaac 窗口，便于确认录制起点。需要无窗口批量跑时加 `--headless`。
 
+指定显卡用：
+
+```bash
+--device cuda:1
+```
+
+录制脚本默认会额外传 `isaaclab_multi_gpu=false`，避免 IsaacSim renderer multi-GPU 把卡0也拉进来。正式在卡1录制建议同时加：
+
+```bash
+--device cuda:1 --headless
+```
+
+如果开可视窗口，Xorg/GUI 仍可能让显示卡0有显存和 Graphics 占用；这是 IsaacSim 图形窗口行为，不代表 Newt policy/physics 没有切到卡1。需要主动恢复 IsaacSim multi-GPU 时，加 `--isaaclab_multi_gpu`。
+
 脚本自身参数用 `--freespace_range 0.10` 这种 argparse 写法；直接透传给 Hydra 的额外参数要写成 `srsa_curriculum_freespace_range=0.10`。脚本也会兼容尾部的 `--srsa_curriculum_freespace_range 0.10`，自动转成 Hydra override。
 
 默认启用 `--socket_camera_follow`，读取 `camera_profiles/socket_camera_offset.json` 来保持不同尺寸任务视角一致。没有 profile 时会退回默认视角；关闭跟随相机加 `--no_socket_camera_follow`。
 
 Newt eval 支持 `eval_video_name`，批量脚本会自动传入尺寸名，通常不需要手动设置。
 
-视频时长由 episode step 数和 `eval_video_fps` 决定。SRSA 默认约 75 step，所以 1 个 episode 在 `24 fps` 下只有约 `75 / 24 = 3.1s`。`--video_length` / `eval_video_max_frames` 只是最大帧数上限，不会把 episode 拉长；要拉长单个 rollout，用 `--episode_length_s`。
+多个 `assembly_id` / checkpoint 批量录不同尺寸，用上层脚本：
+
+```bash
+scripts/batch_record_ids_task_sizes.py \
+  --items "00186=logs/isaaclab-srsa-assembly/1/srsa_axial_direct_finetune_from_01125/20260525_112528_asm-00186/models/best.pt;00271=logs/finetune_01125_axial_hole/20260525_003125/asm-00271/models/best.pt" \
+  --templates "0.5:0.5;0.5:1.0;1.0:1.0;2.0:1.5;4.0:2.0" \
+  --freespace_range 0.10 \
+  --episode_length_s 10 \
+  --video_fps 15 \
+  --video_length 200 \
+  --no_terminate_on_success
+```
+
+也可以用 manifest：
+
+```csv
+assembly_id,checkpoint
+00186,logs/.../00186/models/best.pt
+00271,logs/.../00271/models/best.pt
+```
+
+```bash
+scripts/batch_record_ids_task_sizes.py \
+  --manifest data/video_record_targets.csv \
+  --templates "0.5:0.5;1.0:1.0;4.0:2.0" \
+  --video_root data/video_eval_ids_task_sizes
+```
+
+输出会按 id 分目录写到 `--video_root/<assembly_id>/`。这个脚本只是串行调用 `scripts/batch_record_task_sizes.py`，所以单 id 脚本支持的参数都可以继续透传。
+
+IsaacSim 有时会在 eval 已成功、视频和 summary 都已写出之后卡在 Replicator/插件卸载阶段。录制脚本默认看到 `Evaluation artifacts saved successfully.` 或 `Evaluation completed successfully.` 后再等 `30s`；如果子进程仍未退出，会自动终止它并继续下一个尺寸/ID。需要调长或关闭这个兜底时用：
+
+```bash
+--eval_exit_grace_s 120   # 成功后最多等 120s
+--eval_exit_grace_s -1    # 不自动终止，完全等待 IsaacSim 自然退出
+```
+
+录制脚本默认会同步保存与视频帧一一对应的力变化 CSV。每个 `.mp4` 旁边会生成：
+
+```text
+<video_name>_step-00000001.force.csv
+<video_name>_step-00000001.force.json
+```
+
+`force.csv` 中每一行对应视频中的一帧，`frame_index` 可直接对应视频帧号，`video_time_s = frame_index / eval_video_fps`。常用列：
+
+```text
+force_world_x/y/z/norm
+force_socket_x/y/z/norm
+force_obs_x/y/z/norm
+flange_force_norm
+flange_force_flag
+depth_fraction
+lateral_error
+terminal_process_success
+```
+
+其中 `force_world_*` / `force_socket_*` 是原始力，单位 N；`force_obs_*` 是 SRSA observation 中归一化后的力。只想录视频、不保存力 CSV 时，加 `--no_force_trace`。
+
+视频时长由 episode step 数和 `eval_video_fps` 决定。SRSA 默认约 75 step，所以 1 个 episode 在 `24 fps` 下只有约 `75 / 24 = 3.1s`。`--video_length` / `eval_video_max_frames` 是整段视频的总帧数上限，不是每个 episode 的长度；要拉长单个 rollout，用 `--episode_length_s`。录多个 episode 时，要把 `--video_length` 设得足够大，或者用 `--video_length 0` 关闭总帧数上限。
+
+例如 `--episode_length_s 10` 时约 `150` step/episode，录 `10` 个 episode 至少需要约 `1500` 帧：
+
+```bash
+scripts/batch_record_task_sizes.py \
+  --assembly_id 01125 \
+  --checkpoint logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt \
+  --templates "0.5:0.5;4.0:2.0" \
+  --freespace_range 0.10 \
+  --episode_length_s 10 \
+  --video_fps 10 \
+  --video_length 0 \
+  --eval_trials 10 \
+  --video_episodes 10 \
+  --no_terminate_on_success
+```
 
 想录更长的视频，可以降低 fps，或录多个 episode：
 

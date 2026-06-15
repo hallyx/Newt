@@ -37,6 +37,7 @@ class Config:
 	assembly_id: str = "00004"
 	isaaclab_headless: bool = True
 	isaaclab_enable_cameras: bool = False
+	isaaclab_multi_gpu: Optional[bool] = None
 	isaaclab_use_fabric: Optional[bool] = None
 	isaaclab_use_canonical_obs: bool = False
 	isaaclab_canonical_append_force: bool = False
@@ -500,6 +501,8 @@ class Config:
 	eval_video_env_index: int = 0
 	eval_video_max_episodes: int = 1
 	eval_video_name: Optional[str] = None
+	eval_video_force_trace: bool = False
+	eval_video_force_trace_env_index: Optional[int] = None
 	render_size: int = 224
 	save_agent: bool = True
 	save_freq: Optional[int] = None
