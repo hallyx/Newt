@@ -58,9 +58,16 @@ class TDMPC2(torch.nn.Module):
 				)
 		if self._latent_residual_freeze_base:
 			residual_params = list(self.model.latent_residual_parameters())
-			if len(residual_params) == 0:
+			adapter_params = []
+			if bool(self.cfg.get('task_context_adapter_train_with_frozen_base', True)):
+				adapter_params = list(self.model.task_context_adapter_parameters())
+			if len(residual_params) == 0 and len(adapter_params) == 0:
 				raise ValueError("latent_residual_freeze_base_wm=true but no residual adapter parameters exist.")
-			optim_groups = [{'params': residual_params}]
+			optim_groups = []
+			if len(residual_params) > 0:
+				optim_groups.append({'params': residual_params})
+			if len(adapter_params) > 0:
+				optim_groups.append({'params': adapter_params})
 		else:
 			optim_groups = [
 				{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
@@ -75,6 +82,8 @@ class TDMPC2(torch.nn.Module):
 				optim_groups.append({'params': self.model._task_emb.parameters()})
 			if getattr(self.model, '_contact_encoder', None) is not None:
 				optim_groups.append({'params': self.model._contact_encoder.parameters()})
+			if getattr(self.model, '_task_context_adapters', None) is not None:
+				optim_groups.append({'params': self.model.task_context_adapter_parameters()})
 			if self._latent_residual_enabled:
 				optim_groups.append({'params': self.model.latent_residual_parameters()})
 		self.optim = torch.optim.Adam(optim_groups, lr=self.cfg.lr, capturable=True)
@@ -151,6 +160,10 @@ class TDMPC2(torch.nn.Module):
 		metadata = {
 			"task_conditioning": self.cfg.get("task_conditioning", None),
 			"num_global_tasks": self.cfg.get("num_global_tasks", None),
+			"task_context_adapter_enabled": bool(self.cfg.get("task_context_adapter_enabled", False)),
+			"task_context_adapter_hidden_dim": self.cfg.get("task_context_adapter_hidden_dim", None),
+			"task_context_adapter_alpha": self.cfg.get("task_context_adapter_alpha", None),
+			"task_context_adapter_source": self.cfg.get("task_context_adapter_source", None),
 		}
 		if bool(self.cfg.get("multitask_continuation_enabled", False)):
 			metadata.update({
@@ -325,6 +338,11 @@ class TDMPC2(torch.nn.Module):
 				if not str(k).startswith('_')
 			})
 		return out
+
+	def task_context_adapter_metrics(self):
+		if not hasattr(self.model, 'task_context_adapter_metrics'):
+			return {}
+		return self.model.task_context_adapter_metrics()
 
 	def save(self, fp):
 		"""
@@ -837,8 +855,11 @@ class TDMPC2(torch.nn.Module):
 						continue
 					values = [step_info[key] for step_info in residual_infos if key in step_info]
 					if len(values) > 0 and torch.is_tensor(values[0]):
-						info[key] = torch.stack(values).mean()
+							info[key] = torch.stack(values).mean()
 		info.update(pi_info)
+		adapter_metrics = self.task_context_adapter_metrics()
+		if adapter_metrics:
+			info.update(TensorDict(adapter_metrics, batch_size=()))
 
 		return total_loss, zs.detach(), info.detach()
 
@@ -905,4 +926,47 @@ class TDMPC2(torch.nn.Module):
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
-		return self._update(obs, action, reward, **kwargs)
+		metrics = self._update(obs, action, reward, **kwargs)
+		batch_metrics = self._online_family_batch_metrics(buffer)
+		if batch_metrics is not None:
+			metrics.update(batch_metrics)
+		return metrics
+
+	def _online_family_batch_metrics(self, buffer):
+		"""Return metrics describing the latest online-family replay sample."""
+		task_counts = getattr(buffer, "last_batch_task_counts", None)
+		source_counts = getattr(buffer, "last_batch_source_counts", None)
+		if not task_counts and not source_counts:
+			return None
+		values = {}
+		if task_counts:
+			total = float(sum(max(0, int(value)) for value in task_counts.values()))
+			if total > 0:
+				probs = []
+				for key, value in sorted(task_counts.items()):
+					count = float(max(0, int(value)))
+					prob = count / total
+					probs.append(prob)
+					safe_key = str(key).replace("-", "_").replace("/", "_")
+					values[f"online_family_batch_task_count_{safe_key}"] = torch.tensor(count, device=self.device)
+					values[f"online_family_batch_task_frac_{safe_key}"] = torch.tensor(prob, device=self.device)
+				probs_t = torch.tensor(probs, device=self.device, dtype=torch.float32).clamp_min(1.0e-12)
+				entropy = -(probs_t * probs_t.log()).sum()
+				values["online_family_batch_task_entropy"] = entropy
+				if len(probs) > 1:
+					values["online_family_batch_task_entropy_norm"] = entropy / torch.log(torch.tensor(float(len(probs)), device=self.device))
+				else:
+					values["online_family_batch_task_entropy_norm"] = torch.zeros((), device=self.device)
+				values["online_family_batch_num_tasks"] = torch.tensor(float(len(probs)), device=self.device)
+		if source_counts:
+			total = float(sum(max(0, int(value)) for value in source_counts.values()))
+			if total > 0:
+				for key, value in sorted(source_counts.items()):
+					count = float(max(0, int(value)))
+					prob = count / total
+					safe_key = str(key).replace("-", "_").replace("/", "_")
+					values[f"online_family_batch_source_count_{safe_key}"] = torch.tensor(count, device=self.device)
+					values[f"online_family_batch_source_frac_{safe_key}"] = torch.tensor(prob, device=self.device)
+		if not values:
+			return None
+		return TensorDict(values, batch_size=())

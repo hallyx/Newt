@@ -13,6 +13,7 @@ CONFIG_DIR=${CONFIG_DIR:-configs/train}
 SOURCE_CHECKPOINT=${SOURCE_CHECKPOINT:-${REPO_ROOT}/logs/isaaclab-srsa-assembly/1/srsa_axial_imitation_relaxed/20260525_233657_asm-01125_tid-2/models/best.pt}
 
 TARGETS=${TARGETS:-"01125 00256 00186"}
+RESUME_COMPLETED_TARGETS=${RESUME_COMPLETED_TARGETS:-}
 ANCHOR_TASK_ID=${ANCHOR_TASK_ID:-01125}
 STEPS_PER_TASK=${STEPS_PER_TASK:-50000}
 NUM_ENVS=${NUM_ENVS:-64}
@@ -28,6 +29,21 @@ UTD=${UTD:-0.075}
 EVAL_EPISODES=${EVAL_EPISODES:-1}
 RETENTION_EVAL_EPISODES=${RETENTION_EVAL_EPISODES:-20}
 EVAL_SUCCESS_METRIC=${EVAL_SUCCESS_METRIC:-relaxed}
+UPDATE_PROGRESS_LOG_EVERY=${UPDATE_PROGRESS_LOG_EVERY:-50}
+ACQUISITION_STOP_ENABLED=${ACQUISITION_STOP_ENABLED:-false}
+ACQUISITION_REQUIRE_SUCCESS=${ACQUISITION_REQUIRE_SUCCESS:-false}
+ACQUISITION_SUCCESS_THRESHOLD=${ACQUISITION_SUCCESS_THRESHOLD:-0.80}
+ACQUISITION_MIN_STEPS=${ACQUISITION_MIN_STEPS:-150000}
+ACQUISITION_METRIC=${ACQUISITION_METRIC:-episode_success}
+RETENTION_REQUIRE_GATE=${RETENTION_REQUIRE_GATE:-false}
+RETENTION_MIN_FAMILY=${RETENTION_MIN_FAMILY:-0.80}
+RETENTION_MIN_ANCHOR=${RETENTION_MIN_ANCHOR:-0.75}
+RETENTION_MIN_CURRENT=${RETENTION_MIN_CURRENT:-0.80}
+RETENTION_GATE_METRIC=${RETENTION_GATE_METRIC:-episode_success}
+TASK_CONTEXT_ADAPTER_ENABLED=${TASK_CONTEXT_ADAPTER_ENABLED:-false}
+TASK_CONTEXT_ADAPTER_HIDDEN_DIM=${TASK_CONTEXT_ADAPTER_HIDDEN_DIM:-128}
+TASK_CONTEXT_ADAPTER_ALPHA=${TASK_CONTEXT_ADAPTER_ALPHA:-1.0}
+TASK_CONTEXT_ADAPTER_SOURCE=${TASK_CONTEXT_ADAPTER_SOURCE:-task_context}
 
 CURRENT_RATIO=${CURRENT_RATIO:-0.50}
 ANCHOR_RATIO=${ANCHOR_RATIO:-0.20}
@@ -122,6 +138,61 @@ else:
 PY
 }
 
+check_retention_gate() {
+  local summary_fp=$1
+  local anchor_id=$2
+  local current_id=$3
+  local min_family=$4
+  local min_anchor=$5
+  local min_current=$6
+  local metric=$7
+  "${PYTHON}" - "${summary_fp}" "${anchor_id}" "${current_id}" "${min_family}" "${min_anchor}" "${min_current}" "${metric}" <<'PY'
+import json
+import math
+import sys
+
+summary_fp, anchor_id, current_id, min_family, min_anchor, min_current, metric = sys.argv[1:]
+min_family = float(min_family)
+min_anchor = float(min_anchor)
+min_current = float(min_current)
+payload = json.load(open(summary_fp, encoding="utf-8"))
+
+def value_from(item, key):
+    raw = item.get(key)
+    if raw is None and key == "episode_success":
+        raw = item.get("relaxed_success")
+    if raw is None:
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) else None
+
+family = value_from(payload, metric)
+tasks = {
+    str(item.get("assembly_id")): item
+    for item in payload.get("tasks", [])
+    if isinstance(item, dict)
+}
+anchor = value_from(tasks.get(str(anchor_id), {}), metric)
+current = value_from(tasks.get(str(current_id), {}), metric)
+problems = []
+if family is None or family < min_family:
+    problems.append(f"family {metric}={family} < {min_family}")
+if anchor is None or anchor < min_anchor:
+    problems.append(f"anchor {anchor_id} {metric}={anchor} < {min_anchor}")
+if current is None or current < min_current:
+    problems.append(f"current {current_id} {metric}={current} < {min_current}")
+
+print(
+    f"[retention-gate] metric={metric} family={family} anchor:{anchor_id}={anchor} "
+    f"current:{current_id}={current} thresholds=family:{min_family},anchor:{min_anchor},current:{min_current}"
+)
+if problems:
+    print("[retention-gate] FAIL: " + "; ".join(problems), file=sys.stderr)
+    raise SystemExit(3)
+print("[retention-gate] PASS")
+PY
+}
+
 SOURCE_CHECKPOINT=$(make_abs_path "${SOURCE_CHECKPOINT}")
 CONFIG_DIR=$(make_abs_path "${CONFIG_DIR}")
 SRSA_TASK_TEMPLATE_FP=$(make_abs_path "${SRSA_TASK_TEMPLATE_FP}")
@@ -211,9 +282,14 @@ echo "[launcher] python=${PYTHON}"
 echo "[launcher] config=${CONFIG_DIR}/${CONFIG_NAME}"
 echo "[launcher] source_checkpoint=${SOURCE_CHECKPOINT}"
 echo "[launcher] targets=${TARGETS}"
+echo "[launcher] resume_completed_targets=${RESUME_COMPLETED_TARGETS}"
 echo "[launcher] steps_per_task=${STEPS_PER_TASK} num_envs=${NUM_ENVS} multiproc=${MULTIPROC} num_gpus=${NUM_GPUS} gpu_id=${GPU_ID}"
 echo "[launcher] eval_freq=${EVAL_FREQ} save_freq=${SAVE_FREQ} eval_success_metric=${EVAL_SUCCESS_METRIC}"
+echo "[launcher] update_progress_log_every=${UPDATE_PROGRESS_LOG_EVERY}"
+echo "[launcher] acquisition_stop=${ACQUISITION_STOP_ENABLED} require_success=${ACQUISITION_REQUIRE_SUCCESS} metric=${ACQUISITION_METRIC} threshold=${ACQUISITION_SUCCESS_THRESHOLD} min_steps=${ACQUISITION_MIN_STEPS}"
+echo "[launcher] retention_gate=${RETENTION_REQUIRE_GATE} metric=${RETENTION_GATE_METRIC} family>=${RETENTION_MIN_FAMILY} anchor>=${RETENTION_MIN_ANCHOR} current>=${RETENTION_MIN_CURRENT}"
 echo "[launcher] replay_mix=current:${CURRENT_RATIO} anchor:${ANCHOR_RATIO} history:${HISTORY_RATIO} min_current_eps=${MIN_CURRENT_EPISODES}"
+echo "[launcher] task_context_adapter enabled=${TASK_CONTEXT_ADAPTER_ENABLED} source=${TASK_CONTEXT_ADAPTER_SOURCE} hidden=${TASK_CONTEXT_ADAPTER_HIDDEN_DIM} alpha=${TASK_CONTEXT_ADAPTER_ALPHA}"
 echo "[launcher] size_templates=${SRSA_CLEARANCE_DEPTH_TEMPLATES} eval_task_template_exact=${EVAL_TASK_TEMPLATE_EXACT}"
 echo "[launcher] manifest=${MANIFEST_FP}"
 echo "[launcher] replay_dir=${REPLAY_DIR}"
@@ -222,7 +298,10 @@ echo "[launcher] dry_run=${DRY_RUN}"
 
 current_checkpoint=${SOURCE_CHECKPOINT}
 completed_targets=()
-stage_idx=0
+for ASM in ${RESUME_COMPLETED_TARGETS}; do
+  completed_targets+=("${ASM}")
+done
+stage_idx=${STAGE_OFFSET:-${#completed_targets[@]}}
 
 for ASM in ${TARGETS}; do
   stage_idx=$((stage_idx + 1))
@@ -230,11 +309,13 @@ for ASM in ${TARGETS}; do
   stage_work_dir="${WORK_BASE}/${RUN_ID}"
   stage_log="${LOG_ROOT}/stage-${stage_idx}_asm-${ASM}.train.log"
   replay_fp="${REPLAY_DIR}/${ASM}.pt"
+  acquisition_status_fp="${LOG_ROOT}/stage-${stage_idx}_asm-${ASM}.acquisition_status.json"
 
   echo "[launcher] $(date --iso-8601=seconds) start stage=${stage_idx} assembly_id=${ASM}"
   echo "[launcher] stage_run_id=${RUN_ID}"
   echo "[launcher] stage_checkpoint_in=${current_checkpoint}"
   echo "[launcher] stage_replay_out=${replay_fp}"
+  echo "[launcher] stage_acquisition_status=${acquisition_status_fp}"
   echo "[launcher] stage_log=${stage_log}"
 
   train_cmd=(
@@ -265,6 +346,11 @@ for ASM in ${TARGETS}; do
     online_family_history_ratio="${HISTORY_RATIO}"
     online_family_min_current_episodes="${MIN_CURRENT_EPISODES}"
     online_family_replay_storage_device="${REPLAY_STORAGE_DEVICE}"
+    online_family_acquisition_stop_enabled="${ACQUISITION_STOP_ENABLED}"
+    online_family_acquisition_success_threshold="${ACQUISITION_SUCCESS_THRESHOLD}"
+    online_family_acquisition_min_steps="${ACQUISITION_MIN_STEPS}"
+    online_family_acquisition_metric="${ACQUISITION_METRIC}"
+    online_family_acquisition_status_fp="${acquisition_status_fp}"
     steps="${STEPS_PER_TASK}"
     num_envs="${NUM_ENVS}"
     multiproc="${MULTIPROC}"
@@ -281,10 +367,15 @@ for ASM in ${TARGETS}; do
     eval_episodes="${EVAL_EPISODES}"
     eval_success_metric="${EVAL_SUCCESS_METRIC}"
     srsa_eval_success_metric="${EVAL_SUCCESS_METRIC}"
+    update_progress_log_every="${UPDATE_PROGRESS_LOG_EVERY}"
     enable_wandb="${ENABLE_WANDB}"
     save_agent=true
     save_best=true
     save_best_metric=episode_success
+    task_context_adapter_enabled="${TASK_CONTEXT_ADAPTER_ENABLED}"
+    task_context_adapter_hidden_dim="${TASK_CONTEXT_ADAPTER_HIDDEN_DIM}"
+    task_context_adapter_alpha="${TASK_CONTEXT_ADAPTER_ALPHA}"
+    task_context_adapter_source="${TASK_CONTEXT_ADAPTER_SOURCE}"
     exp_name="${EXP_NAME}"
     run_id="${RUN_ID}"
   )
@@ -306,6 +397,23 @@ for ASM in ${TARGETS}; do
     echo "[launcher] expected replay snapshot not found: ${replay_fp}" >&2
     echo "[launcher] Check ${stage_log}; replay is saved by Trainer at eval/finish." >&2
     exit 1
+  fi
+  require_acquisition_success=false
+  case "${ACQUISITION_REQUIRE_SUCCESS,,}" in
+    1|true|yes) require_acquisition_success=true ;;
+  esac
+  if [[ "${DRY_RUN}" != "1" && "${require_acquisition_success}" == "true" ]]; then
+    if [[ ! -f "${acquisition_status_fp}" ]]; then
+      echo "[launcher] acquisition status missing: ${acquisition_status_fp}" >&2
+      echo "[launcher] Check ${stage_log}; ensure eval_freq triggers at least one eval." >&2
+      exit 2
+    fi
+    acquisition_reached=$("${PYTHON}" -c 'import json, sys; print("true" if bool(json.load(open(sys.argv[1], encoding="utf-8")).get("reached", False)) else "false")' "${acquisition_status_fp}")
+    if [[ "${acquisition_reached}" != "true" ]]; then
+      echo "[launcher] acquisition gate not reached for assembly_id=${ASM}; skipping manifest update and retention eval." >&2
+      echo "[launcher] status=${acquisition_status_fp}" >&2
+      exit 2
+    fi
   fi
 
   completed_targets+=("${ASM}")
@@ -341,6 +449,8 @@ for ASM in ${TARGETS}; do
 
   eval_cmd=(
     "${PYTHON}" tdmpc2/batch_eval_tasks.py
+    --config-dir "${CONFIG_DIR}"
+    --config-name "${CONFIG_NAME}"
     checkpoint="${current_checkpoint}"
     eval_assembly_ids="${eval_ids}"
     isaaclab_backend=srsa
@@ -362,6 +472,43 @@ for ASM in ${TARGETS}; do
     compile=false
     mpc=true
     isaaclab_headless=true
+    isaaclab_use_canonical_obs=true
+    srsa_task_family_name=normal_fit
+    srsa_task_param_obs=false
+    srsa_task_param_obs_mode=task_vec
+    srsa_enable_axial_task_param_sampler=true
+    srsa_axial_fixed_plug_scale=true
+    srsa_axial_clearance_base=0.000114
+    srsa_axial_clearance_jitter_ratio=0.10
+    srsa_axial_depth_base=0.015
+    srsa_axial_depth_jitter_ratio=0.10
+    'srsa_axial_init_error_xy_range="0.009,0.0010"'
+    'srsa_axial_init_error_z_range="0.0010,0.0020"'
+    'srsa_axial_init_error_yaw_range="-0.0872665,0.0872665"'
+    'srsa_axial_visual_noise_xy_range="0.0,0.0"'
+    'srsa_axial_visual_noise_z_range="0.0,0.0"'
+    srsa_enable_flange_force_sensor=true
+    isaaclab_canonical_append_force=true
+    isaaclab_canonical_append_task_params=false
+    srsa_vision_noise_xy_std=0.0
+    srsa_vision_noise_xy_jitter_std=0.0
+    srsa_vision_noise_z_std=0.0
+    srsa_vision_noise_z_jitter_std=0.0
+    isaaclab_canonical_use_visual_noise=false
+    task_conditioning=axial_params
+    contact_history_enabled=true
+    contact_history_len=4
+    contact_context_dim=64
+    contact_history_hidden_dim=128
+    contact_history_layers=2
+    contact_force_dim=6
+    contact_action_dim=3
+    contact_ee_delta_dim=3
+    contact_history_use_ee_delta=true
+    task_context_adapter_enabled="${TASK_CONTEXT_ADAPTER_ENABLED}"
+    task_context_adapter_hidden_dim="${TASK_CONTEXT_ADAPTER_HIDDEN_DIM}"
+    task_context_adapter_alpha="${TASK_CONTEXT_ADAPTER_ALPHA}"
+    task_context_adapter_source="${TASK_CONTEXT_ADAPTER_SOURCE}"
     eval_success_metric="${EVAL_SUCCESS_METRIC}"
     srsa_eval_success_metric="${EVAL_SUCCESS_METRIC}"
     batch_eval_episodes_per_task="${RETENTION_EVAL_EPISODES}"
@@ -387,6 +534,20 @@ for ASM in ${TARGETS}; do
     fi
     family_score=$(score_family_csv "${retention_summary%.json}.csv")
     echo "[launcher] family_score=${family_score} checkpoint=${current_checkpoint}"
+    require_retention_gate=false
+    case "${RETENTION_REQUIRE_GATE,,}" in
+      1|true|yes) require_retention_gate=true ;;
+    esac
+    if [[ "${require_retention_gate}" == "true" ]]; then
+      check_retention_gate \
+        "${retention_summary}" \
+        "${ANCHOR_TASK_ID}" \
+        "${ASM}" \
+        "${RETENTION_MIN_FAMILY}" \
+        "${RETENTION_MIN_ANCHOR}" \
+        "${RETENTION_MIN_CURRENT}" \
+        "${RETENTION_GATE_METRIC}"
+    fi
   fi
 done
 

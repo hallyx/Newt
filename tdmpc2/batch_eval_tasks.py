@@ -26,6 +26,7 @@ from config import Config, apply_eval_task_template, parse_cfg, safe_run_token
 from collect_eval_rollouts import (
 	_adapt_obs_to_checkpoint,
 	_apply_checkpoint_compat,
+	_clear_template_derived_fields,
 	_make_agent,
 	_model_task_input,
 	_normalize_assembly_id,
@@ -98,12 +99,15 @@ def _resolve_eval_entries(cfg) -> list[dict]:
 		selected = _parse_assembly_ids(cfg.get('batch_eval_assembly_ids', None))
 	if selected:
 		entries = []
+		default_task_id = cfg.get('eval_task_id', None)
+		if default_task_id is None:
+			default_task_id = cfg.get('srsa_param_template_id', None)
 		for index, assembly_id in enumerate(selected):
 			if assembly_id in manifest_by_assembly:
 				entry = dict(manifest_by_assembly[assembly_id])
 			else:
 				entry = {
-					"task_id": index if not manifest_entries else len(entries),
+					"task_id": int(default_task_id) if default_task_id is not None else (index if not manifest_entries else len(entries)),
 					"task_name": f"{cfg.task}-{assembly_id}",
 					"assembly_id": assembly_id,
 				}
@@ -130,6 +134,35 @@ def _resolve_summary_fp(cfg, output_dir: Path) -> Path:
 	if cfg.get('batch_eval_summary_fp', None):
 		return Path(cfg.batch_eval_summary_fp).expanduser().resolve()
 	return output_dir / "batch_eval_summary.json"
+
+
+def _parse_force_task_vec_6(raw):
+	if raw is None:
+		return None
+	if isinstance(raw, str):
+		text = raw.strip().strip("'\"")
+		if not text or text.lower() in {"none", "null"}:
+			return None
+		if text.startswith("[") and text.endswith("]"):
+			values = json.loads(text)
+		else:
+			values = [item for item in text.replace(";", ",").replace(" ", ",").split(",") if item.strip()]
+	else:
+		values = list(raw)
+	values = [float(value) for value in values]
+	if len(values) != 6:
+		raise ValueError(f"batch_eval_force_task_vec_6 must have 6 values, got {len(values)}: {values}")
+	return values
+
+
+def _forced_task_vec_tensor(cfg, device):
+	values = _parse_force_task_vec_6(cfg.get('batch_eval_force_task_vec_6', None))
+	if values is None:
+		return None, None
+	task_vec = torch.as_tensor(values, dtype=torch.float32, device=device).view(1, 6)
+	task_vec = task_vec.expand(int(cfg.num_envs), 6).contiguous()
+	label = cfg.get('batch_eval_force_task_vec_label', None) or "forced"
+	return task_vec, {"label": str(label), "task_vec_6": values}
 
 
 def _child_overrides(cfg, *, entry: dict, output_dir: Path):
@@ -237,6 +270,15 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"contact_action_dim",
 		"contact_ee_delta_dim",
 		"contact_history_use_ee_delta",
+		"task_context_adapter_enabled",
+		"task_context_adapter_hidden_dim",
+		"task_context_adapter_alpha",
+		"task_context_adapter_source",
+		"task_context_adapter_apply_encoder",
+		"task_context_adapter_apply_dynamics",
+		"task_context_adapter_apply_policy",
+		"task_context_adapter_apply_reward",
+		"task_context_adapter_apply_q",
 		"learn_task_emb",
 		"collect_match_checkpoint",
 		"collect_expected_obs_dim",
@@ -244,6 +286,8 @@ def _child_overrides(cfg, *, entry: dict, output_dir: Path):
 		"batch_eval_overwrite",
 		"batch_eval_mpc",
 		"batch_eval_max_env_steps",
+		"batch_eval_force_task_vec_6",
+		"batch_eval_force_task_vec_label",
 		"save_video",
 		"eval_video_dir",
 		"eval_video_fps",
@@ -397,6 +441,7 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 			tasks = torch.zeros(cfg.num_envs, dtype=torch.long, device=rollout_device)
 		else:
 			tasks = torch.full((cfg.num_envs,), task_id, dtype=torch.long, device=rollout_device)
+		forced_task_vec, forced_task_vec_meta = _forced_task_vec_tensor(cfg, rollout_device)
 		episode_return = torch.zeros(cfg.num_envs, dtype=torch.float32, device=rollout_device)
 		episode_len = torch.zeros(cfg.num_envs, dtype=torch.int64, device=rollout_device)
 		returns = []
@@ -428,11 +473,18 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 			"cyan",
 			attrs=["bold"],
 		))
+		if forced_task_vec_meta is not None:
+			print(colored(
+				f"Forcing model task_vec_6 label={forced_task_vec_meta['label']} "
+				f"values={forced_task_vec_meta['task_vec_6']}; environment task remains assembly_id={assembly_id}.",
+				"yellow",
+				attrs=["bold"],
+			))
 		with torch.no_grad():
 			while completed < target_episodes:
 				t0 = episode_len == 0
 				torch.compiler.cudagraph_mark_step_begin()
-				model_tasks = _model_task_input(cfg, env, tasks)
+				model_tasks = forced_task_vec if forced_task_vec is not None else _model_task_input(cfg, env, tasks)
 				action, _ = agent(
 					obs,
 					t0=t0,
@@ -508,6 +560,9 @@ def _evaluate_one(cfg, entry: dict, output_dir: Path):
 			"mpc": bool(use_mpc),
 			"env_steps": int(env_steps),
 		}
+		if forced_task_vec_meta is not None:
+			metrics["forced_task_vec_label"] = forced_task_vec_meta["label"]
+			metrics["forced_task_vec_6"] = forced_task_vec_meta["task_vec_6"]
 		if video_fp is not None:
 			metrics["eval_video_fp"] = str(video_fp)
 		for metric_key, values in success_diagnostics.items():
@@ -597,6 +652,9 @@ def launch(cfg: Config):
 		cfg.offline_manifest_fp = str(
 			Path(hydra.utils.to_absolute_path(str(cfg.offline_manifest_fp))).expanduser().resolve()
 		)
+	if cfg.get('batch_eval_worker_assembly_id', None) is not None:
+		cfg.assembly_id = _normalize_assembly_id(cfg.batch_eval_worker_assembly_id)
+		cfg = _clear_template_derived_fields(cfg)
 	_apply_checkpoint_compat(cfg, checkpoint_fp)
 	cfg = parse_cfg(cfg)
 	cfg.enable_wandb = False

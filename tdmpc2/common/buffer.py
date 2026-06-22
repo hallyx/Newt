@@ -22,11 +22,14 @@ class Buffer():
 			multiproc: bool = False,
 			cache_values: bool = False,
 			storage_device: str = 'cuda:0',
+			prefetch='auto',
 	):
 		self.set_storage_device(storage_device)
 		self._multiproc = multiproc
 		self._sampler_use_gpu = self._storage_device.type != 'cuda'
 		self._prefetch = None if (self._multiproc or self._storage_device.type == 'cuda') else 8
+		if prefetch != 'auto':
+			self._prefetch = prefetch
 		self._capacity = capacity
 		self._batch_size = batch_size
 		self._sample_size = batch_size * (horizon + 1)
@@ -185,6 +188,7 @@ class Buffer():
 			cache_values=False,
 			storage_device=None,
 			max_episodes=None,
+			prefetch=None,
 	):
 		"""Load a replay buffer snapshot saved with `save()`."""
 		path = Path(path).expanduser()
@@ -212,6 +216,7 @@ class Buffer():
 			multiproc=multiproc,
 			cache_values=cache_values,
 			storage_device=storage_device,
+			prefetch=prefetch,
 		)
 		buffer.load_snapshot_data(tds, metadata=metadata, max_episodes=max_episodes)
 		return buffer

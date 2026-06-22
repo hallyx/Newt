@@ -1,7 +1,9 @@
 import os
 import datetime
+import json
 from collections import defaultdict, OrderedDict
 from contextlib import nullcontext
+from pathlib import Path
 from time import time
 
 import torch
@@ -36,6 +38,8 @@ class Trainer():
 		self._start_time = time()
 		self._last_progress_log = 0.0
 		self._progress_log_interval = max(0.0, float(cfg.get('progress_log_interval_sec', 30.0)))
+		self._update_progress_log_every = max(0, int(cfg.get('update_progress_log_every', 50)))
+		self._update_progress_blocks = 0
 		self._rollout_device = torch.device(f'cuda:{cfg.device_id}') if (
 			cfg.task.startswith('isaaclab-') or
 			cfg.get('isaaclab_env_id', '').startswith('Isaac-') or
@@ -79,6 +83,8 @@ class Trainer():
 			print(f'Episodes per update frequency: {self._eps_per_update_freq:,}')
 			if self._progress_log_interval > 0:
 				print(f'Progress heartbeat: every {self._progress_log_interval:.0f}s during eval/rollout/update.')
+			if self._update_progress_log_every > 0:
+				print(f'Update completion log: every {self._update_progress_log_every} update blocks.')
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
@@ -91,6 +97,8 @@ class Trainer():
 		)
 		if hasattr(self.agent, 'latent_residual_metrics'):
 			metrics.update(self.agent.latent_residual_metrics())
+		if hasattr(self.agent, 'task_context_adapter_metrics'):
+			metrics.update(self.agent.task_context_adapter_metrics())
 		return metrics
 
 	def _maybe_save_current_replay(self, reason):
@@ -126,6 +134,84 @@ class Trainer():
 		if self.cfg.world_size > 1:
 			barrier()
 		return result
+
+	def _metric_to_float(self, metrics, key):
+		if key not in metrics:
+			return None
+		value = metrics[key]
+		if isinstance(value, torch.Tensor):
+			value = value.item()
+		elif isinstance(value, np.generic):
+			value = value.item()
+		try:
+			value = float(value)
+		except (TypeError, ValueError):
+			return None
+		if np.isnan(value):
+			return None
+		return value
+
+	def _acquisition_status_fp(self):
+		status_fp = self.cfg.get('online_family_acquisition_status_fp', None)
+		if status_fp:
+			return Path(status_fp).expanduser()
+		return Path(self.cfg.work_dir) / 'acquisition_status.json'
+
+	def _write_acquisition_status(self, *, metric_name, metric_value, reached, reason):
+		if self.cfg.rank != 0:
+			return None
+		status_fp = self._acquisition_status_fp()
+		status_fp.parent.mkdir(parents=True, exist_ok=True)
+		threshold = float(self.cfg.get('online_family_acquisition_success_threshold', 0.0))
+		min_steps = int(self.cfg.get('online_family_acquisition_min_steps', 0))
+		payload = {
+			'enabled': True,
+			'reached': bool(reached),
+			'reason': str(reason),
+			'metric': str(metric_name),
+			'value': metric_value,
+			'threshold': threshold,
+			'min_steps': min_steps,
+			'step': int(self._step),
+			'episode': int(self._ep_idx),
+			'elapsed_time_sec': int(time() - self._start_time),
+			'assembly_id': str(self.cfg.get('assembly_id', '')),
+			'task_id': str(self.cfg.get('online_family_current_task_id', self.cfg.get('assembly_id', ''))),
+			'checkpoint': self.cfg.get('checkpoint', None),
+		}
+		with open(status_fp, 'w', encoding='utf-8') as f:
+			json.dump(payload, f, ensure_ascii=True, indent=2)
+			f.write('\n')
+		return status_fp
+
+	def _maybe_stop_for_acquisition(self, eval_metrics):
+		if not bool(self.cfg.get('online_family_acquisition_stop_enabled', False)):
+			return False
+		metric_name = str(self.cfg.get('online_family_acquisition_metric', 'episode_success'))
+		metric_value = self._metric_to_float(eval_metrics, metric_name)
+		threshold = float(self.cfg.get('online_family_acquisition_success_threshold', 0.0))
+		min_steps = int(self.cfg.get('online_family_acquisition_min_steps', 0))
+		reached = metric_value is not None and self._step >= min_steps and metric_value >= threshold
+		reason = 'threshold_reached' if reached else 'waiting'
+		status_fp = self._write_acquisition_status(
+			metric_name=metric_name,
+			metric_value=metric_value,
+			reached=reached,
+			reason=reason,
+		)
+		if self.cfg.world_size > 1 and torch.distributed.is_initialized():
+			payload = [bool(reached) if self.cfg.rank == 0 else False]
+			torch.distributed.broadcast_object_list(payload, src=0)
+			reached = bool(payload[0])
+		if reached and self.cfg.rank == 0:
+			location = f' status={status_fp}' if status_fp is not None else ''
+			print(colored(
+				f'Acquisition gate reached: {metric_name}={metric_value:.4f} '
+				f'>= {threshold:.4f} at step {self._step:,}.{location}',
+				'green',
+				attrs=['bold'],
+			))
+		return reached
 
 	def _uses_runtime_task_vec(self):
 		return (
@@ -453,6 +539,9 @@ class Trainer():
 					save_metrics['step'] = self._step
 					self.logger.save_agent(self.agent, f'{self._step:,}'.replace(',', '_'), metrics=save_metrics)
 
+				if self._maybe_stop_for_acquisition(eval_metrics):
+					break
+
 				# Reset environment and metrics
 				obs, ep_reward, ep_len, done, action_infos = self._reset_train_rollout()
 			if obs is None:
@@ -544,10 +633,14 @@ class Trainer():
 						_train_metrics = self.agent.update(self.buffer)
 					train_metrics.update(_train_metrics)
 					self._update_tokens -= num_updates
+					self._update_progress_blocks += 1
 					self._maybe_log_progress(
 						'update',
 						extra=f"done updates={num_updates} remaining_tokens={self._update_tokens:.3f}",
-						force=True,
+						force=(
+							self._update_progress_log_every > 0 and
+							self._update_progress_blocks % self._update_progress_log_every == 0
+						),
 					)
 		
 		self._maybe_save_current_replay('finish')

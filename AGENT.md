@@ -1,25 +1,134 @@
 # AGENT.md
 
-## 2026-06-15 Active Direction: SRSA Online Family Replay V1
+## 2026-06-18 Active Direction: SRSA Online Family Replay V2
 
-The active multi-task training direction is now staged online family replay, not
-offline-first family continuation and not a true mixed-assembly IsaacLab env.
+The active multi-task training direction is staged online family replay V2
+(`acquisition-first`), not offline-first family continuation and not a true
+mixed-assembly IsaacLab env.
 
 Primary implementation rule:
 
 - Keep each online train job single-assembly.
-- Save the current stage's online replay.
-- On later stages, train from a mixed replay batch:
-  - current task replay: 50%
+- Learn the current target before handing off to the next stage.
+- During acquisition, use current-heavy replay:
+  - current task replay: 80%
   - `01125` anchor replay: 20%
-  - previous task history replay: 30%
+  - previous task history replay: 0%
+- Gate handoff on eval success instead of fixed 50k-step stages.
+- Save the current stage's online replay only after the acquisition stage has
+  produced useful current-task data.
+- Run retention eval only after the acquisition gate is reached.
+- Treat single-task success as evidence that the target is learnable, not as
+  proof that `AxialTaskEncoder` / `task_vec_6` conditioning is being used.
 - Do not reuse `multitask_continuation_*` for this path. Those names remain
   reserved for the existing offline continuation route.
 - Use new config names under `online_family_replay_*`.
 
-Recommended stage order:
+Current validated V2 result:
 
-- smoke: `01125 -> 00256 -> 00186`
+- Run:
+  `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_acquire_from_01125/20260618_001734_launcher`
+- Stage:
+  `01125 -> 00256`
+- Checkpoint in:
+  `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_replay_from_01125/20260615_202326_stage-1_asm-01125/models/latest.pt`
+- Stage-2 checkpoint out:
+  `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_acquire_from_01125/20260618_001734_stage-2_asm-00256/models/latest.pt`
+- Acquisition gate:
+  `00256 episode_success=0.9023` at 299,520 env steps.
+- Retention after 00256:
+  `01125 relaxed_success=0.75`, `00256 relaxed_success=0.90`,
+  family average `0.825`.
+- Task-vector swap diagnostic on the same 00256 checkpoint:
+  - normal 00256 task vector: `episode_success=0.90`
+  - forced 01125 task vector in the 00256 environment:
+    `episode_success=0.90`
+  - forced zero task vector in the 00256 environment:
+    `episode_success=0.75`
+
+Interpretation:
+
+- `00256` is learnable from the online-family stage-1 checkpoint.
+- The older 50k online-family failure was mainly premature handoff.
+- `01125` retention is acceptable but weakened; do not add many tasks before
+  checking task-vector usage and adding retention gates.
+- The current issue is not simply "`task_vec_6` is disconnected"; the more
+  precise diagnosis is that `task_vec_6` is not yet an irreplaceable information
+  source. The model can still use state/contact feedback, MPC correction, and
+  single-task bias paths to solve relaxed success.
+- The current policy is weakly sensitive to `task_vec_6`; the 01125 vector swap
+  does not hurt 00256 at all. Do not assume the task encoder is carrying
+  multi-task routing yet.
+- Strict/process success remains weak, so report strict/process/lateral
+  diagnostics alongside relaxed success.
+
+2026-06-19 replay/task tensor check:
+
+- Checked replay snapshots:
+  - `20260615_202326_launcher/replay/01125.pt`
+  - `20260618_001734_launcher/replay/00256.pt`
+- Both snapshots store a per-transition `task` tensor with shape `[N, 6]`.
+- `01125` replay has one unique vector:
+  `[0, -0.155195, 0.145688, 0.165645, 1, 0]`.
+- `00256` replay has one unique vector:
+  `[0, -0.178871, 0.099081, 0.115353, 1.2189, 0]`.
+- A mixed `OnlineFamilyReplayBuffer` sample with 50/50 current/anchor replay
+  returned `task.shape == [3, 64, 6]`, task counts
+  `{'01125': 32, '00256': 32}`, and nonzero task-vector std on the differing
+  dimensions.
+- `tdmpc2/tdmpc2.py:update()` consumes `task` from `buffer.sample()` and passes
+  it into `_update()` / `_loss_fn()`; the model-update path is not replacing the
+  sampled batch task tensor with the current env task vector.
+- Therefore replay save/load and online-family mixed sampling are not currently
+  showing a global `env.current_task_vec` broadcast bug. The next problem to
+  test is whether the trained model actually changes action/value/reward/model
+  predictions when only `task_vec_6` changes.
+
+Recommended next work order:
+
+- validated acquisition: `01125 -> 00256`
+- completed diagnostic: offline paired sensitivity report on identical replay
+  states with only `task_vec_6` changed. Report:
+  `logs/task_vec_sensitivity/20260619_00256_v2_offline_report.json`.
+  Result: action/Q/reward/next-latent deltas are near numerical noise
+  (`action_l2` about `4e-7` for 01125/00186/zero/extreme swaps; random about
+  `3e-6`) while correct action norm is about `0.8`. This strongly supports
+  that the learned model is currently almost invariant to task-vector changes.
+- next training step: retention polish on `01125,00256` with guaranteed mixed
+  batches, ideally 50/50 for the diagnostic polish run. Batch task/source
+  counts and task entropy are now logged from `TDMPC2.update()` when using
+  `OnlineFamilyReplayBuffer`; per-task losses remain the next deeper logging
+  item if needed.
+- Recommended polish command is recorded in
+  `docs/multitask_status_brief.md` section 13. It starts from the validated V2
+  00256 checkpoint, runs `TARGETS=00256`, `CURRENT_RATIO=0.50`,
+  `ANCHOR_RATIO=0.50`, `HISTORY_RATIO=0.0`, and is meant to be launched on
+  physical GPU 1 with `CUDA_VISIBLE_DEVICES=1 GPU_ID=0`.
+- Active polish run launched on physical GPU 1:
+  `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_polish_01125_00256/20260619_0135_retention_polish_launcher`.
+  Early verification: update batches are exactly 50/50
+  (`01125=512`, `00256=512`, entropy norm `1.0`), and first eval at
+  49,920 env steps reached `00256 episode_success=0.8555`. Let the run finish
+  to 100k and retention eval before judging retention/task-vector sensitivity.
+- The polish run finished and passed retention, but the paired sensitivity
+  report still showed near-zero task-vector influence. A zero-init task context
+  FiLM adapter is now implemented behind `task_context_adapter_enabled=true`.
+  It inserts task-conditioned residual modulation at encoder latent, dynamics,
+  policy, reward, and Q sites; old checkpoints load into an initially equivalent
+  model because adapter final projections are reset to zero.
+- next architecture experiment: start from the 20260619 polish checkpoint with
+  `TASK_CONTEXT_ADAPTER_ENABLED=true`, keep 01125/00256 replay at 50/50, then
+  rerun the paired sensitivity report before considering `00186`.
+- 2026-06-22 adapter run diagnosis: the first adapter run completed but degraded
+  (`00256` eval ended around `0.578`), and family eval initially reported 0/20
+  because batch-eval workers did not inherit `task_context_adapter_*` settings.
+  That eval compatibility bug is fixed. The deeper model issue is that the
+  learned `AxialTaskEncoder` context is nearly collapsed for realistic SRSA
+  vectors, so a new `task_context_adapter_source=raw_task_vec` option was added.
+  Prefer the next experiment with `TASK_CONTEXT_ADAPTER_SOURCE=raw_task_vec` and
+  smaller `TASK_CONTEXT_ADAPTER_ALPHA=0.05`.
+- next acquisition step: cautious `00186` only after 01125/00256 retention and
+  task-conditioning sensitivity are acceptable
 - medium family: `01125 -> 00256 -> 00186 -> 00004 -> 00014`
 - hard cases only after the baseline is stable: `00062`, then `00271`
 
@@ -34,6 +143,22 @@ Checkpoint/eval rule:
 
 - Prefer `relaxed_success` and family retention metrics over
   `official_success_latched`.
+- For acquisition gates, start with `episode_success >= 0.80` after at least
+  150k env steps.
+- For retention gates before adding another task, require both the new task and
+  the anchor/family to remain acceptable, e.g. current `>=0.80`, anchor
+  `>=0.75`, family mean `>=0.80`.
+- Run task-vector swap diagnostics before changing model architecture:
+  evaluate the same environment/checkpoint with the correct task vector, an
+  anchor task vector, and a zero/random vector. If success barely changes, the
+  policy may be ignoring task conditioning.
+- With the current V2 00256 checkpoint, wrong-vector eval confirms weak
+  dependence on `task_vec_6`; prefer task-conditioning fixes or diagnostics
+  before scaling to many more assemblies.
+- Do not treat success swap alone as decisive. For the next diagnostic, keep the
+  initial state paired and compute `delta_action`, `delta_Q`,
+  `delta_reward_pred`, and `delta_next_latent` under correct, anchor, zero,
+  random, and extreme task vectors.
 - The first family score can be:
   `0.7 * mean_relaxed_success + 0.3 * min_relaxed_success`.
 - Continue reporting strict/process/lateral/force diagnostics; do not let
@@ -47,7 +172,10 @@ Implementation surface for this route:
 - `tdmpc2/train.py`
 - `tdmpc2/trainer.py`
 - `scripts/run_01125_online_family_replay_targets.sh`
+- `scripts/run_01125_online_family_acquire_targets.sh`
+- `scripts/run_00256_task_vec_swap_eval.sh`
 - `scripts/update_online_family_replay_manifest.py`
+- `tdmpc2/scripts/task_vec_sensitivity_report.py`
 
 ## 2026-05-24 Recovery Note: 01125 Axial-Hole Consolidation
 

@@ -631,3 +631,433 @@ After smoke passes, scale in this order:
 1. `01125 -> 00256 -> 00186 -> 00004 -> 00014`, still fixed at `1.0:1.0`.
 2. Full family with `00062` and `00271` added last.
 3. Size curriculum after assembly retention is stable.
+
+## 12. 2026-06-17 Update: Acquisition-First V2
+
+The first online-family 00256 stage should not be interpreted as a task or
+architecture failure. The failed online-family stage trained 00256 for only
+about 50k env steps and stopped at `episode_success=0.0`.
+
+Follow-up single-target controls showed the missing piece was training time:
+
+- `00256` from the original 01125 checkpoint reached high success after longer
+  direct fine-tuning, with best observed eval success around `0.97`.
+- `00256` from the online-family stage-1 01125 checkpoint reached
+  `episode_success=0.8672` at 249,600 env steps and `0.8867` at 299,520 env
+  steps.
+- Therefore the stage-1 checkpoint is still a viable transfer source, and
+  00256 is learnable. The 50k online-family failure mainly implicates stage
+  scheduling and premature handoff.
+
+New default direction:
+
+- Use acquisition-first stages instead of fixed 50k stages.
+- Train the current target until it reaches a success gate or the full budget.
+- Keep replay current-heavy during acquisition, e.g. current/anchor/history
+  `0.80/0.20/0.0`.
+- Update the online-family replay manifest and run retention eval only after
+  the acquisition gate is reached.
+- Do not use single-task success alone to conclude that `AxialTaskEncoder` is
+  effective; a task-vector swap diagnostic is still needed.
+
+Implemented V2 surfaces:
+
+- `online_family_acquisition_*` config fields in `tdmpc2/config.py`.
+- Eval-time acquisition status and early stop in `tdmpc2/trainer.py`.
+- Gate-aware staged launcher behavior in
+  `scripts/run_01125_online_family_replay_targets.sh`.
+- Dedicated 00256 acquisition entry:
+  `scripts/run_01125_online_family_acquire_targets.sh`.
+- Eval-only task-vector override in `tdmpc2/batch_eval_tasks.py`:
+  `batch_eval_force_task_vec_6` and `batch_eval_force_task_vec_label`.
+
+Recommended next command on physical GPU 1:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+RUN_STAMP=$(date +%Y%m%d_%H%M%S) \
+scripts/run_01125_online_family_acquire_targets.sh
+```
+
+Inside that process, `GPU_ID=0` is correct because `CUDA_VISIBLE_DEVICES=1`
+makes the physical GPU 1 appear as local CUDA device 0.
+
+Task-vector diagnostic after a strong 00256 checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+/home/gpuserver/miniconda3/envs/isaac51/bin/python tdmpc2/batch_eval_tasks.py \
+  --config-dir configs/train \
+  --config-name srsa_01125_imitation_relaxed \
+  checkpoint=/path/to/00256/models/latest.pt \
+  eval_assembly_ids="[00256]" \
+  batch_eval_episodes_per_task=20 \
+  batch_eval_force_task_vec_label=01125_vec \
+  'batch_eval_force_task_vec_6="[0,-0.155195,0.145688,0.165645,1,0]"' \
+  batch_eval_output_dir=logs/task_vec_swap_eval/00256_with_01125_vec
+```
+
+Compare that with a normal 00256 eval and a zero-vector eval. If the success
+rate barely changes, the policy is likely ignoring task conditioning. If the
+wrong vector sharply degrades success, the task encoder is influencing control.
+
+Observed 2026-06-18 swap result on
+`20260618_001734_stage-2_asm-00256/models/latest.pt`:
+
+| Eval | 00256 env model input | relaxed success | strict success |
+| --- | --- | ---: | ---: |
+| normal | 00256 task vector | 0.90 | 0.00 |
+| forced anchor | 01125 task vector | 0.90 | 0.00 |
+| forced zero | zero vector | 0.75 | 0.00 |
+
+Interpretation:
+
+- The current V2 checkpoint is only weakly sensitive to `task_vec_6`.
+- The policy can still solve 00256 when the model receives the 01125 vector.
+- Before scaling to many more assemblies, add retention gates and either
+  strengthen task conditioning or run a more discriminative mixed-task
+  diagnostic.
+
+## 13. 2026-06-19 Update: Task-Vector Indispensability Plan
+
+The refined diagnosis is:
+
+```text
+The current problem is not simply that task_vec_6 is disconnected.
+The problem is that task_vec_6 is not yet an irreplaceable information source.
+```
+
+The model can still solve relaxed 00256 with weak or wrong task-vector input
+because state, contact feedback, MPC correction, and single-task bias paths can
+carry much of the control signal. The next revision should therefore create and
+measure pressure where the same class of state requires different predictions,
+values, or actions under different `task_vec_6` values.
+
+### Step 1 Completed: Replay and Mixed-Batch Task Tensor Check
+
+Checked replay snapshots:
+
+- `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_replay_from_01125/20260615_202326_launcher/replay/01125.pt`
+- `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_acquire_from_01125/20260618_001734_launcher/replay/00256.pt`
+
+Observed storage:
+
+| Replay | stored task shape | unique task vectors | expected vector match |
+| --- | --- | ---: | --- |
+| `01125.pt` | `[38400, 6]` | 1 | yes, max abs diff about `3.9e-7` |
+| `00256.pt` | `[230400, 6]` | 1 | yes, max abs diff about `1.4e-6` |
+
+Stored task vectors:
+
+- 01125: `[0, -0.155195, 0.145688, 0.165645, 1, 0]`
+- 00256: `[0, -0.178871, 0.099081, 0.115353, 1.2189, 0]`
+
+Mixed-sampling check:
+
+- Current buffer: `00256.pt`.
+- Manifest: `20260618_001734_launcher/online_family_replay_manifest.json`.
+- Ratios for the diagnostic sample: current/anchor/history `0.50/0.50/0.0`.
+- Sampled batch shapes:
+  - `obs`: `[4, 64, 17]`
+  - `action`: `[3, 64, 3]`
+  - `reward`: `[3, 64, 1]`
+  - `task`: `[3, 64, 6]`
+- `last_batch_task_counts`: `{'01125': 32, '00256': 32}`.
+- `task_vec_6` std was nonzero on dimensions that differ between the tasks.
+
+Training update path:
+
+- `Trainer.to_td()` uses the runtime SRSA task vector when writing current
+  online rollouts into replay.
+- `TDMPC2.update()` calls `buffer.sample(device=self.device)`, receives
+  `obs, action, reward, task`, and passes that sampled `task` into
+  `_update()` / `_loss_fn()`.
+- The update path is therefore not replacing a mixed replay batch's `task`
+  tensor with a single current-env task vector.
+
+Conclusion:
+
+- Replay save/load and `OnlineFamilyReplayBuffer` mixed sampling are preserving
+  per-transition task tensors.
+- The current evidence does not show a global `env.current_task_vec` broadcast
+  overwrite at the replay/wrapper layer.
+- The remaining diagnosis should focus on whether the trained model changes
+  behavior and predictions when only `task_vec_6` changes.
+
+### Step 2: Paired Sensitivity Diagnostic
+
+Do not rely on success-rate swap alone. The next diagnostic should use paired
+states:
+
+```text
+same seed
+same initial state
+same 00256 environment
+only task_vec_6 changes
+```
+
+Compare at least these task-vector conditions:
+
+- correct 00256 vector
+- anchor 01125 vector
+- 00186 vector
+- zero vector
+- random vector
+- extreme vector
+
+Record paired deltas:
+
+- `delta_action = ||pi(s, task_i) - pi(s, task_j)||`
+- `delta_Q`
+- `delta_reward_pred`
+- `delta_next_latent`
+- return / relaxed success / strict success delta
+- MPC selected-plan delta, if easy to expose
+
+If action/Q/reward/dynamics deltas are near zero, the task-conditioning path is
+being ignored by the learned model. If deltas are visible but success is stable,
+the vector is affecting decisions, but the tasks may be behaviorally compatible
+or MPC/contact feedback is correcting the wrong prior.
+
+Implemented offline paired report:
+
+- Script: `tdmpc2/scripts/task_vec_sensitivity_report.py`
+- Report:
+  `logs/task_vec_sensitivity/20260619_00256_v2_offline_report.json`
+- Checkpoint:
+  `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_acquire_from_01125/20260618_001734_stage-2_asm-00256/models/latest.pt`
+- Replay states/actions:
+  `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_acquire_from_01125/20260618_001734_launcher/replay/00256.pt`
+- Sample size: 512 finite replay transitions.
+
+Command used:
+
+```bash
+/home/gpuserver/miniconda3/envs/isaac51/bin/python \
+  tdmpc2/scripts/task_vec_sensitivity_report.py \
+  --cpu \
+  --batch-size 512 \
+  --output logs/task_vec_sensitivity/20260619_00256_v2_offline_report.json \
+  --condition-from-replay old_00186=logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_replay_from_01125/20260615_202326_launcher/replay/00186.pt
+```
+
+Observed deltas versus the correct 00256 vector:
+
+| Swapped task vector | action L2 mean | Q abs mean | reward abs mean | next-latent L2 mean |
+| --- | ---: | ---: | ---: | ---: |
+| 01125 replay vector | `4.43e-7` | `2.09e-5` | `9.81e-7` | `1.84e-6` |
+| old 00186 replay vector | `4.76e-7` | `2.18e-5` | `9.42e-7` | `1.92e-6` |
+| zero vector | `4.79e-7` | `2.11e-5` | `9.78e-7` | `1.91e-6` |
+| random vector | `3.44e-6` | `3.79e-5` | `3.58e-6` | `1.17e-5` |
+| extreme vector | `4.51e-7` | `2.12e-5` | `9.99e-7` | `1.86e-6` |
+
+Scale reference under the correct vector:
+
+- action mean norm: about `0.80`
+- latent norm: about `4.20`
+- predicted Q scalar mean: about `132.3`
+- predicted reward scalar mean: about `6.40`
+
+Interpretation:
+
+- The current model is almost invariant to `task_vec_6` in this offline paired
+  probe.
+- The result is stronger than the closed-loop success swap result because the
+  same replay states/actions were reused and only `task_vec_6` changed.
+- The next useful training experiment should force mixed 01125/00256 replay
+  pressure and log batch task entropy/per-task behavior. If sensitivity remains
+  near zero after that, a zero-init FiLM/residual adapter is justified.
+
+### Step 3: Retention Polish With Real Mixed-Task Pressure
+
+Before adding another assembly, run an 01125/00256 retention-polish stage whose
+training batches are forced to contain both tasks, ideally 50/50 for the
+diagnostic polish run.
+
+Required logging:
+
+- batch task counts and batch task entropy
+- per-task world-model loss
+- per-task reward loss
+- per-task value/policy loss when available
+- per-task eval success, including relaxed/process/strict/lateral metrics
+
+The purpose is not only to improve average success. The purpose is to make it
+hard for one task to overwrite the other while giving the model repeated
+examples where similar states have different task-conditioned value/action
+targets.
+
+Implemented logging support:
+
+- `tdmpc2/tdmpc2.py:TDMPC2.update()` now reads
+  `OnlineFamilyReplayBuffer.last_batch_task_counts` and
+  `last_batch_source_counts` after each sample.
+- Logged metrics include:
+  - `online_family_batch_task_count_<task_id>`
+  - `online_family_batch_task_frac_<task_id>`
+  - `online_family_batch_task_entropy`
+  - `online_family_batch_task_entropy_norm`
+  - `online_family_batch_num_tasks`
+  - `online_family_batch_source_count_<source>`
+  - `online_family_batch_source_frac_<source>`
+- This verifies whether retention-polish updates are actually mixed, e.g.
+  01125/00256 near 50/50 with entropy norm near 1.0.
+
+Still pending for a deeper retention-polish run:
+
+- per-task world-model/reward/value/policy losses
+- paired sensitivity report after polish
+- closed-loop paired eval with identical initial states, if practical
+
+Recommended 01125/00256 retention-polish command on physical GPU 1:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+GPU_ID=0 \
+RUN_STAMP=20260619_00256_retention_polish \
+EXP_NAME=srsa_axial_online_family_polish_01125_00256 \
+SOURCE_CHECKPOINT=logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_acquire_from_01125/20260618_001734_stage-2_asm-00256/models/latest.pt \
+TARGETS=00256 \
+RESUME_COMPLETED_TARGETS=01125 \
+CURRENT_RATIO=0.50 \
+ANCHOR_RATIO=0.50 \
+HISTORY_RATIO=0.0 \
+MIN_CURRENT_EPISODES=5 \
+STEPS_PER_TASK=100000 \
+NUM_ENVS=256 \
+RETENTION_NUM_ENVS=256 \
+ACQUISITION_STOP_ENABLED=false \
+ACQUISITION_REQUIRE_SUCCESS=false \
+RETENTION_REQUIRE_GATE=true \
+UPDATE_PROGRESS_LOG_EVERY=50 \
+scripts/run_01125_online_family_acquire_targets.sh
+```
+
+Dry-run validation passed with the same command shape and `DRY_RUN=1`.
+
+### Step 4: Zero-Init Task Context Adapter
+
+The 01125/00256 retention-polish run passed retention gates, but the paired
+sensitivity report still showed near-zero action/Q/reward/dynamics deltas when
+only `task_vec_6` changed. The low-risk architecture change has therefore been
+implemented, but remains disabled by default:
+
+- `task_vec_6 -> AxialTaskEncoder -> task_ctx -> zero-init FiLM residual`
+- implementation: `tdmpc2/models/task_context_adapter.py`
+- insertion sites: encoder latent, dynamics output, policy prior, reward head,
+  and Q head
+- config switch: `task_context_adapter_enabled=true`
+- old checkpoints load into an initially equivalent model because each adapter's
+  final projection is reset to zero after global model initialization
+- metrics log adapter parameter norms such as
+  `task_context_adapter_encoder_final_weight_norm`
+
+Smoke validation passed:
+
+- `py_compile` on modified modules
+- `git diff --check`
+- launcher dry-run with `TASK_CONTEXT_ADAPTER_ENABLED=true`
+- strict load of the 20260619 retention-polish checkpoint into an adapter-enabled
+  model, with all keys matched and adapter final weight norm `0.0`
+
+Recommended first adapter experiment on physical GPU 1:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+GPU_ID=0 \
+RUN_STAMP=20260622_taskctx_adapter_00256 \
+EXP_NAME=srsa_axial_online_family_taskctx_adapter_01125_00256 \
+SOURCE_CHECKPOINT=logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_polish_01125_00256/20260619_0135_retention_polish_stage-2_asm-00256/models/latest.pt \
+TARGETS=00256 \
+RESUME_COMPLETED_TARGETS=01125 \
+CURRENT_RATIO=0.50 \
+ANCHOR_RATIO=0.50 \
+HISTORY_RATIO=0.0 \
+MIN_CURRENT_EPISODES=5 \
+STEPS_PER_TASK=100000 \
+NUM_ENVS=256 \
+RETENTION_NUM_ENVS=256 \
+ACQUISITION_STOP_ENABLED=false \
+ACQUISITION_REQUIRE_SUCCESS=false \
+RETENTION_REQUIRE_GATE=true \
+TASK_CONTEXT_ADAPTER_ENABLED=true \
+TASK_CONTEXT_ADAPTER_HIDDEN_DIM=128 \
+TASK_CONTEXT_ADAPTER_ALPHA=1.0 \
+UPDATE_PROGRESS_LOG_EVERY=50 \
+scripts/run_01125_online_family_acquire_targets.sh
+```
+
+After this run, rerun `tdmpc2/scripts/task_vec_sensitivity_report.py` against
+the new checkpoint. The acceptance signal is not just high relaxed success; the
+adapter route should produce clearly larger paired deltas than the previous
+`1e-6`-scale task-vector swaps while preserving 01125/00256 retention.
+
+### 2026-06-22 Adapter Run Diagnosis
+
+Run inspected:
+
+- `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_taskctx_adapter_01125_00256/20260622_taskctx_adapter_00256_launcher`
+
+Observed:
+
+- No training process remained; GPU1 was idle after the run.
+- Training completed, but degraded from the source polish checkpoint:
+  - pre-update train rollout: `episode_success=0.949`
+  - 49,920 eval: `episode_success=0.250`
+  - 99,840 eval: `episode_success=0.578`
+- Adapter weights moved quickly:
+  - final `task_context_adapter_pi_final_weight_norm=11.93`
+  - final `task_context_adapter_q_final_weight_norm=16.47`
+- Family eval initially reported 0/20 on both 01125 and 00256, but that eval
+  path had a bug: the batch-eval worker did not inherit
+  `task_context_adapter_*` overrides, and checkpoint compatibility did not infer
+  adapter-enabled checkpoints. This has been fixed in:
+  - `tdmpc2/batch_eval_tasks.py`
+  - `tdmpc2/collect_eval_rollouts.py`
+- Even with adapter-aware sensitivity loading, realistic task-vector swaps
+  remained near numerical noise:
+  - `anchor_from_replay action_l2=1.727e-07`
+  - `old_00186 action_l2=1.820e-07`
+  - `zero action_l2=1.711e-07`
+
+Deeper cause:
+
+- The adapter was using learned `task_ctx` from `AxialTaskEncoder`, but that
+  context has collapsed for realistic SRSA vectors:
+  - 00256 vs 01125 task-context L2: about `1.8e-08`
+  - 00256 vs 00186 task-context L2: about `4.2e-08`
+- Therefore the adapter learned a mostly task-independent modulation and damaged
+  the policy/value landscape without making `task_vec_6` indispensable.
+
+Follow-up implementation:
+
+- `task_context_adapter_source` was added.
+- Supported values:
+  - `task_context`: old adapter source, kept as default for compatibility
+  - `raw_task_vec`: feed raw 6D `task_vec_6` directly to the adapter
+  - `both`: concatenate learned task context and raw task vector
+- For the next experiment, use `raw_task_vec` and a smaller alpha:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+GPU_ID=0 \
+RUN_STAMP=20260622_rawtask_adapter_00256 \
+EXP_NAME=srsa_axial_online_family_rawtask_adapter_01125_00256 \
+SOURCE_CHECKPOINT=logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_polish_01125_00256/20260619_0135_retention_polish_stage-2_asm-00256/models/latest.pt \
+TARGETS=00256 \
+RESUME_COMPLETED_TARGETS=01125 \
+CURRENT_RATIO=0.50 \
+ANCHOR_RATIO=0.50 \
+HISTORY_RATIO=0.0 \
+STEPS_PER_TASK=100000 \
+NUM_ENVS=256 \
+RETENTION_NUM_ENVS=256 \
+ACQUISITION_STOP_ENABLED=false \
+ACQUISITION_REQUIRE_SUCCESS=false \
+RETENTION_REQUIRE_GATE=true \
+TASK_CONTEXT_ADAPTER_ENABLED=true \
+TASK_CONTEXT_ADAPTER_SOURCE=raw_task_vec \
+TASK_CONTEXT_ADAPTER_ALPHA=0.05 \
+UPDATE_PROGRESS_LOG_EVERY=50 \
+scripts/run_01125_online_family_acquire_targets.sh
+```

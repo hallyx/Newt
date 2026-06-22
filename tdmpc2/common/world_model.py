@@ -5,6 +5,7 @@ from common import layers, math, init
 from models.axial_task_encoder import AxialTaskEncoder
 from models.contact_history_encoder import ContactHistoryEncoder
 from models.latent_residual import TaskConditionedLatentContactResidualAdapter
+from models.task_context_adapter import TaskContextFiLMAdapter
 from tensordict import TensorDict
 
 
@@ -21,8 +22,11 @@ class WorldModel(nn.Module):
 		self._task_emb = None
 		self._task_encoder = None
 		self._contact_encoder = None
+		self._task_context_adapters = None
 		self._latent_residual_adapter = None
 		self._latent_residual_enabled = bool(cfg.get('latent_residual_enabled', False))
+		self._task_context_adapter_enabled = bool(cfg.get('task_context_adapter_enabled', False))
+		self._task_context_adapter_source = str(cfg.get('task_context_adapter_source', 'task_context')).lower()
 		self._contact_context_dim = 0
 		self._task_conditioning = str(cfg.get('task_conditioning', 'axial_params')).lower()
 		if self._task_conditioning in {'axial', 'axial_params', 'param', 'param_only'}:
@@ -85,6 +89,39 @@ class WorldModel(nn.Module):
 					f'H={cfg.get("contact_history_len", 4)} -> {self._contact_context_dim}D.'
 				)
 		self._encoder = layers.enc(cfg)
+		if self._task_context_adapter_enabled:
+			if cfg.task_dim <= 0 or self._task_conditioning == 'none':
+				raise ValueError("task_context_adapter_enabled=true requires active task conditioning.")
+			self._task_context_adapters = nn.ModuleDict()
+			adapter_hidden_dim = int(cfg.get('task_context_adapter_hidden_dim', 128))
+			adapter_alpha = float(cfg.get('task_context_adapter_alpha', 1.0))
+			adapter_input_dim = self._task_adapter_context_dim()
+			adapter_specs = {
+				"encoder": bool(cfg.get('task_context_adapter_apply_encoder', True)),
+				"dynamics": bool(cfg.get('task_context_adapter_apply_dynamics', True)),
+				"pi": bool(cfg.get('task_context_adapter_apply_policy', True)),
+				"reward": bool(cfg.get('task_context_adapter_apply_reward', True)),
+				"q": bool(cfg.get('task_context_adapter_apply_q', True)),
+			}
+			for name, enabled in adapter_specs.items():
+				if not enabled:
+					continue
+				self._task_context_adapters[name] = TaskContextFiLMAdapter(
+					feature_dim=cfg.latent_dim,
+					task_dim=adapter_input_dim,
+					hidden_dim=adapter_hidden_dim,
+					alpha=adapter_alpha,
+				)
+			if len(self._task_context_adapters) == 0:
+				raise ValueError("task_context_adapter_enabled=true but all adapter apply flags are false.")
+			if cfg.rank == 0:
+				print(
+					'Using zero-init task context FiLM adapters: '
+					f"sites={list(self._task_context_adapters.keys())} "
+					f"latent_dim={cfg.latent_dim} source={self._task_context_adapter_source} "
+					f"adapter_input_dim={adapter_input_dim} "
+					f"hidden={adapter_hidden_dim} alpha={adapter_alpha}."
+				)
 		dynamics_in_dim = cfg.latent_dim + cfg.action_dim + cfg.task_dim + self._contact_context_dim
 		self._dynamics = layers.mlp(dynamics_in_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
 		if self._latent_residual_enabled:
@@ -126,6 +163,9 @@ class WorldModel(nn.Module):
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.QOnlineTargetEnsemble(cfg)
 		self.apply(init.weight_init)
+		if self._task_context_adapters is not None:
+			for adapter in self._task_context_adapters.values():
+				adapter.reset_to_identity()
 		if self._latent_residual_adapter is not None:
 			self._latent_residual_adapter.reset_residual_to_zero()
 		init.zero_(self._reward[-1].weight)
@@ -143,6 +183,8 @@ class WorldModel(nn.Module):
 			modules.append(('Axial task encoder', self._task_encoder))
 		if self._contact_encoder is not None:
 			modules.append(('Contact history encoder', self._contact_encoder))
+		if self._task_context_adapters is not None:
+			modules.append(('Task context FiLM adapters', self._task_context_adapters))
 		if self._latent_residual_adapter is not None:
 			modules.append(('Latent contact residual adapter', self._latent_residual_adapter))
 		modules.extend([
@@ -167,14 +209,26 @@ class WorldModel(nn.Module):
 			return []
 		return list(self._latent_residual_adapter.parameters())
 
+	def task_context_adapter_parameters(self):
+		if self._task_context_adapters is None:
+			return []
+		return list(self._task_context_adapters.parameters())
+
 	def freeze_base_world_model(self):
 		"""
 		Freeze the original world model trunk and leave only the residual adapter trainable.
 		"""
+		train_task_adapter = bool(self.cfg.get('task_context_adapter_train_with_frozen_base', True))
 		for name, param in self.named_parameters():
-			param.requires_grad_(name.startswith('_latent_residual_adapter.'))
+			param.requires_grad_(
+				name.startswith('_latent_residual_adapter.') or
+				(train_task_adapter and name.startswith('_task_context_adapters.'))
+			)
 		if self._latent_residual_adapter is not None:
 			for param in self._latent_residual_adapter.parameters():
+				param.requires_grad_(True)
+		if train_task_adapter and self._task_context_adapters is not None:
+			for param in self._task_context_adapters.parameters():
 				param.requires_grad_(True)
 
 	def set_latent_residual_alpha_scale(self, value):
@@ -301,6 +355,48 @@ class WorldModel(nn.Module):
 		task_ids = self._broadcast_task_ids(task, x)
 		return self._expand_task_context(self._task_emb(task_ids), x)
 
+	def raw_task_vec_context(self, x, task):
+		if not hasattr(self, '_task_vecs'):
+			return None
+		if self._is_task_vec(task):
+			task_vec = task.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		else:
+			task_ids = self._broadcast_task_ids(task, x)
+			task_vec = self._task_vecs[task_ids]
+		return self._expand_task_context(task_vec, x)
+
+	def _task_adapter_context_dim(self):
+		source = self._task_context_adapter_source
+		if source in {'task_context', 'context', 'encoded'}:
+			return int(self.cfg.task_dim)
+		if source in {'raw_task_vec', 'task_vec', 'raw'}:
+			return int(self.cfg.get('axial_task_vec_dim', 6))
+		if source in {'both', 'concat', 'task_context_and_raw'}:
+			return int(self.cfg.task_dim) + int(self.cfg.get('axial_task_vec_dim', 6))
+		raise ValueError(
+			f"Unknown task_context_adapter_source={source!r}. "
+			"Use task_context, raw_task_vec, or both."
+		)
+
+	def task_adapter_context(self, x, task):
+		source = self._task_context_adapter_source
+		if source in {'task_context', 'context', 'encoded'}:
+			return self.task_context(x, task)
+		if source in {'raw_task_vec', 'task_vec', 'raw'}:
+			return self.raw_task_vec_context(x, task)
+		if source in {'both', 'concat', 'task_context_and_raw'}:
+			context = self.task_context(x, task)
+			raw = self.raw_task_vec_context(x, task)
+			if context is None:
+				return raw
+			if raw is None:
+				return context
+			return torch.cat([context, raw], dim=-1)
+		raise ValueError(
+			f"Unknown task_context_adapter_source={source!r}. "
+			"Use task_context, raw_task_vec, or both."
+		)
+
 	def task_emb(self, x, task):
 		"""
 		Appends the task context to input x.
@@ -312,6 +408,25 @@ class WorldModel(nn.Module):
 		if context is None:
 			return x
 		return torch.cat([x, context], dim=-1)
+
+	def task_context_adapt(self, site, x, task):
+		if self._task_context_adapters is None or site not in self._task_context_adapters:
+			return x
+		context = self.task_adapter_context(x, task)
+		if context is None:
+			return x
+		return self._task_context_adapters[site](x, context)
+
+	def task_context_adapter_metrics(self):
+		if self._task_context_adapters is None:
+			return {}
+		out = {
+			"task_context_adapter_enabled": torch.tensor(1.0, device=self.log_std_min.device),
+		}
+		for name, adapter in self._task_context_adapters.items():
+			for key, value in adapter.metrics().items():
+				out[f"task_context_adapter_{name}_{key}"] = value
+		return out
 
 	def contact_context(
 		self,
@@ -362,10 +477,12 @@ class WorldModel(nn.Module):
 		This implementation assumes a single state-based observation.
 		"""
 		if self.cfg.obs == 'state':
-			return self._encoder[self.cfg.obs](self.task_emb(obs, task))
+			z = self._encoder[self.cfg.obs](self.task_emb(obs, task))
+			return self.task_context_adapt("encoder", z, task)
 		assert isinstance(obs, TensorDict), "Expected observation to be a TensorDict"
 		z = torch.cat([self.task_emb(obs['state'], task), obs['rgb']], dim=-1)
-		return self._encoder['state'](z)
+		z = self._encoder['state'](z)
+		return self.task_context_adapt("encoder", z, task)
 
 		# z_rgb = self._encoder['rgb'](obs['rgb'])
 		# return torch.stack((z_state, z_rgb), dim=0).mean(0)
@@ -403,6 +520,7 @@ class WorldModel(nn.Module):
 		)
 		z = torch.cat([z, a], dim=-1)
 		z_next_base = self._dynamics(z)
+		z_next_base = self.task_context_adapt("dynamics", z_next_base, task)
 		if self._latent_residual_adapter is None:
 			if return_info:
 				return z_next_base, {"_z_next_base": z_next_base}
@@ -427,6 +545,7 @@ class WorldModel(nn.Module):
 		"""
 		Predicts instantaneous (single-step) reward.
 		"""
+		z = self.task_context_adapt("reward", z, task)
 		z = self.task_emb(z, task)
 		z = torch.cat([z, a], dim=-1)
 		return self._reward(z)
@@ -437,6 +556,7 @@ class WorldModel(nn.Module):
 		The policy prior is a Gaussian distribution with
 		mean and (log) std predicted by a neural network.
 		"""
+		z = self.task_context_adapt("pi", z, task)
 		z = self.task_emb(z, task)
 
 		# Gaussian policy prior
@@ -483,6 +603,7 @@ class WorldModel(nn.Module):
 		`target` specifies whether to use the target Q-networks or not.
 		"""
 		assert return_type in {'min', 'avg', 'all'}
+		z = self.task_context_adapt("q", z, task)
 		z = self.task_emb(z, task)
 		z = torch.cat([z, a], dim=-1)
 

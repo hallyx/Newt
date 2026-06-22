@@ -310,6 +310,11 @@ class Config:
 	online_family_replay_save_every_eval: bool = True
 	online_family_replay_save_on_finish: bool = True
 	online_family_replay_storage_device: str = "cpu"
+	online_family_acquisition_stop_enabled: bool = False
+	online_family_acquisition_success_threshold: float = 0.80
+	online_family_acquisition_min_steps: int = 150_000
+	online_family_acquisition_metric: str = "episode_success"
+	online_family_acquisition_status_fp: Optional[str] = None
 
 	# policy rollout collection for offline RL
 	collect_assembly_ids: Any = "[00004,00014,00062,00271]"
@@ -369,6 +374,8 @@ class Config:
 	batch_eval_overwrite: bool = False
 	batch_eval_mpc: Optional[bool] = None
 	batch_eval_max_env_steps: Optional[int] = None
+	batch_eval_force_task_vec_6: Any = None
+	batch_eval_force_task_vec_label: Optional[str] = None
 
 	# zero-shot task screening
 	screen_assembly_ids: Any = "[00004,00014,00062,00271]"
@@ -408,6 +415,7 @@ class Config:
 	warmup_steps: int = 5_000
 	seeding_coef: int = 5
 	progress_log_interval_sec: float = 30.0
+	update_progress_log_every: int = 50
 	eval_hang_guard_factor: float = 2.0
 	exp_name: str = "default"
 	finetune: bool = False
@@ -487,6 +495,16 @@ class Config:
 	latent_residual_force_history_len: Optional[int] = None
 	latent_residual_force_dim: Optional[int] = None
 	latent_residual_contact_feature_dim: int = 0
+	task_context_adapter_enabled: bool = False
+	task_context_adapter_hidden_dim: int = 128
+	task_context_adapter_alpha: float = 1.0
+	task_context_adapter_source: str = "task_context"
+	task_context_adapter_apply_encoder: bool = True
+	task_context_adapter_apply_dynamics: bool = True
+	task_context_adapter_apply_policy: bool = True
+	task_context_adapter_apply_reward: bool = True
+	task_context_adapter_apply_q: bool = True
+	task_context_adapter_train_with_frozen_base: bool = True
 	num_q: int = 5
 	simnorm_dim: int = 8
 	disable_task_emb: bool = False
@@ -1102,6 +1120,21 @@ def _validate_online_family_replay_cfg(cfg):
 	max_eps = _cfg_value(cfg, "online_family_replay_max_episodes_per_task", None)
 	if max_eps is not None and int(max_eps) <= 0:
 		raise ValueError("online_family_replay_max_episodes_per_task must be positive when set.")
+	min_steps = int(_cfg_value(cfg, "online_family_acquisition_min_steps", 0))
+	if min_steps < 0:
+		raise ValueError("online_family_acquisition_min_steps must be non-negative.")
+	_set_cfg_value(cfg, "online_family_acquisition_min_steps", min_steps)
+	threshold = float(_cfg_value(cfg, "online_family_acquisition_success_threshold", 0.0))
+	if threshold < 0.0 or threshold > 1.0:
+		raise ValueError("online_family_acquisition_success_threshold must be in [0, 1].")
+	_set_cfg_value(cfg, "online_family_acquisition_success_threshold", threshold)
+	metric = str(_cfg_value(cfg, "online_family_acquisition_metric", "episode_success") or "").strip()
+	if not metric:
+		raise ValueError("online_family_acquisition_metric must be non-empty.")
+	_set_cfg_value(cfg, "online_family_acquisition_metric", metric)
+	status_fp = _cfg_value(cfg, "online_family_acquisition_status_fp", None)
+	if status_fp:
+		_set_cfg_value(cfg, "online_family_acquisition_status_fp", str(_absolute_cfg_path(status_fp)))
 
 
 def _normalize_srsa_assembly_id(value):
@@ -1374,7 +1407,9 @@ def _build_mesh_template_entry(cfg, manifest, template, row, assembly_id, mesh_p
 			"srsa_axial_yaw_requirement": bool(template.get("yaw_requirement", False)),
 		},
 	}
-	entry["task_vec_6"] = make_axial_task_vec(cfg, _merge_template_params(entry))
+	task_vec_cfg = deepcopy(cfg)
+	_set_cfg_value(task_vec_cfg, "axial_task_vec_6", None)
+	entry["task_vec_6"] = make_axial_task_vec(task_vec_cfg, _merge_template_params(entry))
 	return entry
 
 
@@ -1478,11 +1513,11 @@ def _apply_template_sampler_config(cfg, item):
 	for section in (_template_section(item, "srsa_sampler"), item):
 		if not isinstance(section, dict):
 			continue
-			for cfg_key in SRSA_SAMPLER_CFG_KEYS:
-				for source_key in _sampler_source_keys(cfg_key):
-					if source_key in section and section[source_key] is not None:
-						_set_cfg_value(cfg, cfg_key, _coerce_sampler_cfg_value(cfg_key, section[source_key]))
-						break
+		for cfg_key in SRSA_SAMPLER_CFG_KEYS:
+			for source_key in _sampler_source_keys(cfg_key):
+				if source_key in section and section[source_key] is not None:
+					_set_cfg_value(cfg, cfg_key, _coerce_sampler_cfg_value(cfg_key, section[source_key]))
+					break
 
 
 def _set_from_template_if_empty(cfg, item, cfg_key, *template_keys):

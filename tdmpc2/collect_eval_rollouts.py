@@ -108,6 +108,23 @@ def _infer_checkpoint_compat(checkpoint_fp: Path):
 	else:
 		task_conditioning = "none"
 		task_dim = 0
+	adapter_sites = {}
+	adapter_hidden_dim = None
+	adapter_source = None
+	for site in ("encoder", "dynamics", "pi", "reward", "q"):
+		weight = _get_state_tensor(state_dict, f"_task_context_adapters.{site}.net.0.weight")
+		if weight is not None:
+			adapter_sites[site] = True
+			adapter_hidden_dim = int(weight.shape[0])
+			input_dim = int(weight.shape[1])
+			if input_dim == int(task_dim):
+				adapter_source = "task_context"
+			elif input_dim == 6:
+				adapter_source = "raw_task_vec"
+			elif input_dim == int(task_dim) + 6:
+				adapter_source = "both"
+			else:
+				adapter_source = "task_context"
 	obs_dim = int(enc_weight.shape[1]) - task_dim
 	if obs_dim <= 0:
 		raise ValueError(
@@ -121,6 +138,14 @@ def _infer_checkpoint_compat(checkpoint_fp: Path):
 		"action_dim": int(action_masks.shape[-1]) if action_masks is not None else None,
 		"task_dim": task_dim,
 		"task_conditioning": task_conditioning,
+		"task_context_adapter_enabled": bool(adapter_sites),
+		"task_context_adapter_hidden_dim": adapter_hidden_dim,
+		"task_context_adapter_source": adapter_source,
+		"task_context_adapter_apply_encoder": bool(adapter_sites.get("encoder", False)),
+		"task_context_adapter_apply_dynamics": bool(adapter_sites.get("dynamics", False)),
+		"task_context_adapter_apply_policy": bool(adapter_sites.get("pi", False)),
+		"task_context_adapter_apply_reward": bool(adapter_sites.get("reward", False)),
+		"task_context_adapter_apply_q": bool(adapter_sites.get("q", False)),
 	}
 
 
@@ -263,6 +288,16 @@ def _apply_checkpoint_compat(cfg, checkpoint_fp: Path):
 	if compat["model_size"] is not None:
 		cfg.model_size = compat["model_size"]
 	cfg.task_conditioning = compat["task_conditioning"]
+	cfg.task_context_adapter_enabled = bool(compat.get("task_context_adapter_enabled", False))
+	if compat.get("task_context_adapter_hidden_dim", None) is not None:
+		cfg.task_context_adapter_hidden_dim = int(compat["task_context_adapter_hidden_dim"])
+	if compat.get("task_context_adapter_source", None) is not None:
+		cfg.task_context_adapter_source = str(compat["task_context_adapter_source"])
+	cfg.task_context_adapter_apply_encoder = bool(compat.get("task_context_adapter_apply_encoder", False))
+	cfg.task_context_adapter_apply_dynamics = bool(compat.get("task_context_adapter_apply_dynamics", False))
+	cfg.task_context_adapter_apply_policy = bool(compat.get("task_context_adapter_apply_policy", False))
+	cfg.task_context_adapter_apply_reward = bool(compat.get("task_context_adapter_apply_reward", False))
+	cfg.task_context_adapter_apply_q = bool(compat.get("task_context_adapter_apply_q", False))
 	cfg.collect_expected_obs_dim = compat["obs_dim"]
 	if compat.get("action_dim", None) is not None:
 		cfg.srsa_policy_action_dim = int(compat["action_dim"])
@@ -279,6 +314,8 @@ def _apply_checkpoint_compat(cfg, checkpoint_fp: Path):
 		f"model_size={cfg.get('model_size', None)} "
 		f"task_conditioning={cfg.task_conditioning} "
 		f"obs_dim={compat['obs_dim']} task_dim={compat['task_dim']} "
+		f"task_context_adapter={cfg.task_context_adapter_enabled} "
+		f"adapter_source={cfg.get('task_context_adapter_source', None)} "
 		f"srsa_force_sensor={cfg.get('srsa_enable_flange_force_sensor', None)}.",
 		"cyan",
 		attrs=["bold"],
@@ -778,6 +815,15 @@ def _child_overrides(cfg, *, assembly_id: str, output_dir: Path, gpu_id: int | N
 		"contact_action_dim",
 		"contact_ee_delta_dim",
 		"contact_history_use_ee_delta",
+		"task_context_adapter_enabled",
+		"task_context_adapter_hidden_dim",
+		"task_context_adapter_alpha",
+		"task_context_adapter_source",
+		"task_context_adapter_apply_encoder",
+		"task_context_adapter_apply_dynamics",
+		"task_context_adapter_apply_policy",
+		"task_context_adapter_apply_reward",
+		"task_context_adapter_apply_q",
 	]
 	overrides = []
 	for field in fields:

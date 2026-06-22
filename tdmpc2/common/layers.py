@@ -431,6 +431,9 @@ def api_model_conversion(target_state_dict, source_state_dict):
 	"""
 	Converts a checkpoint from our old API to the new torch.compile compatible API.
 	"""
+	def _is_task_context_adapter_key(key):
+		return '._task_context_adapters.' in key or key.startswith('_task_context_adapters.')
+
 	encoder_key = 'module._encoder.state.0.weight'
 	if encoder_key in source_state_dict and encoder_key not in target_state_dict:
 		# Remove 'module.' prefix from all keys in source_state_dict
@@ -518,6 +521,9 @@ def api_model_conversion(target_state_dict, source_state_dict):
 		):
 			if key not in source_state_dict or source_state_dict[key].shape != target_state_dict[key].shape:
 				source_state_dict[key] = target_state_dict[key]
+		if _is_task_context_adapter_key(key):
+			if key not in source_state_dict or source_state_dict[key].shape != target_state_dict[key].shape:
+				source_state_dict[key] = target_state_dict[key]
 
 	if not any(
 		key.endswith('_latent_residual_alpha_scale') or
@@ -532,6 +538,12 @@ def api_model_conversion(target_state_dict, source_state_dict):
 				'._latent_residual_adapter.' in key or
 				key.startswith('_latent_residual_adapter.')
 			)
+		}
+
+	if not any(_is_task_context_adapter_key(key) for key in target_state_dict.keys()):
+		source_state_dict = {
+			key: value for key, value in source_state_dict.items()
+			if not _is_task_context_adapter_key(key)
 		}
 
 	return source_state_dict
