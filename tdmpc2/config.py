@@ -301,11 +301,14 @@ class Config:
 	online_family_replay_manifest_fp: Optional[str] = None
 	online_family_replay_save_fp: Optional[str] = None
 	online_family_current_task_id: Optional[str] = None
+	online_family_current_condition_id: Optional[str] = None
+	online_family_current_template_id: Optional[str] = None
 	online_family_anchor_task_id: str = "01125"
 	online_family_current_ratio: float = 0.50
 	online_family_anchor_ratio: float = 0.20
 	online_family_history_ratio: float = 0.30
 	online_family_min_current_episodes: int = 5
+	online_family_sample_balance: str = "ratio"
 	online_family_replay_max_episodes_per_task: Optional[int] = None
 	online_family_replay_save_every_eval: bool = True
 	online_family_replay_save_on_finish: bool = True
@@ -315,6 +318,10 @@ class Config:
 	online_family_acquisition_min_steps: int = 150_000
 	online_family_acquisition_metric: str = "episode_success"
 	online_family_acquisition_status_fp: Optional[str] = None
+	multi_task_bootstrap_min_episodes_per_condition: int = 20
+	multi_task_bootstrap_current_only: bool = True
+	multi_task_roundrobin_block_steps: int = 50_000
+	multi_task_condition_manifest_fp: Optional[str] = None
 
 	# policy rollout collection for offline RL
 	collect_assembly_ids: Any = "[00004,00014,00062,00271]"
@@ -376,6 +383,9 @@ class Config:
 	batch_eval_max_env_steps: Optional[int] = None
 	batch_eval_force_task_vec_6: Any = None
 	batch_eval_force_task_vec_label: Optional[str] = None
+	eval_task_causality_enabled: bool = True
+	eval_wrong_task_vec_enabled: bool = True
+	eval_wrong_assembly_embedding_enabled: bool = True
 
 	# zero-shot task screening
 	screen_assembly_ids: Any = "[00004,00014,00062,00271]"
@@ -455,6 +465,15 @@ class Config:
 	latent_dim: int = 512
 	task_dim: int = 512
 	task_conditioning: str = "axial_params"
+	task_context_mode: str = "axial_encoder"
+	task_context_raw_residual_scale: float = 0.05
+	task_context_repair_enabled: bool = False
+	task_recon_coef: float = 0.0
+	task_spread_coef: float = 0.0
+	task_raw_residual_scale: float = 0.1
+	task_spread_near_threshold: float = 0.3
+	task_spread_far_threshold: float = 1.0
+	task_spread_margin: float = 0.5
 	axial_task_dim: int = 64
 	axial_task_vec_dim: int = 6
 	axial_task_type: str = "peg_in_hole"
@@ -465,6 +484,14 @@ class Config:
 	axial_target_insertion_depth: Optional[float] = None
 	axial_scale_ratio: Optional[float] = None
 	axial_yaw_requirement: bool = False
+	task_vec_normalization_enabled: bool = False
+	task_vec_normalization_stats_fp: Optional[str] = None
+	task_vec_normalization_mean: Any = None
+	task_vec_normalization_std: Any = None
+	task_vec_normalization_eps: float = 1.0e-6
+	assembly_conditioning: str = "none"
+	assembly_embedding_dim: int = 16
+	assembly_id_vocab_fp: Optional[str] = None
 	contact_history_enabled: bool = False
 	contact_history_len: int = 4
 	contact_force_dim: int = 6
@@ -501,9 +528,10 @@ class Config:
 	task_context_adapter_source: str = "task_context"
 	task_context_adapter_apply_encoder: bool = True
 	task_context_adapter_apply_dynamics: bool = True
-	task_context_adapter_apply_policy: bool = True
-	task_context_adapter_apply_reward: bool = True
-	task_context_adapter_apply_q: bool = True
+	task_context_adapter_apply_policy: bool = False
+	task_context_adapter_apply_reward: bool = False
+	task_context_adapter_apply_q: bool = False
+	task_context_adapter_lr_scale: float = 0.1
 	task_context_adapter_train_with_frozen_base: bool = True
 	num_q: int = 5
 	simnorm_dim: int = 8
@@ -1105,6 +1133,29 @@ def _validate_online_family_replay_cfg(cfg):
 	_set_cfg_value(cfg, "online_family_min_current_episodes", min_current)
 	if not _cfg_value(cfg, "online_family_current_task_id", None):
 		_set_cfg_value(cfg, "online_family_current_task_id", str(_cfg_value(cfg, "assembly_id", "current")))
+	if not _cfg_value(cfg, "online_family_current_template_id", None):
+		template_id = _cfg_value(cfg, "srsa_param_template_id", None)
+		if template_id is None:
+			template_id = _cfg_value(cfg, "srsa_task_template_id", None)
+		if template_id is not None:
+			_set_cfg_value(cfg, "online_family_current_template_id", str(template_id))
+	if not _cfg_value(cfg, "online_family_current_condition_id", None):
+		task_id = str(_cfg_value(cfg, "online_family_current_task_id", _cfg_value(cfg, "assembly_id", "current")))
+		template_id = _cfg_value(cfg, "online_family_current_template_id", None)
+		if template_id is None:
+			template_id = str(_cfg_value(cfg, "srsa_axial_clearance_depth_templates", "default"))
+		_set_cfg_value(cfg, "online_family_current_condition_id", f"{task_id}|{template_id}")
+	sample_balance = str(_cfg_value(cfg, "online_family_sample_balance", "ratio")).strip().lower()
+	if sample_balance not in {"ratio", "condition_uniform", "uniform_condition"}:
+		raise ValueError(
+			f"Unknown online_family_sample_balance={sample_balance!r}. "
+			"Use ratio or condition_uniform."
+		)
+	_set_cfg_value(cfg, "online_family_sample_balance", sample_balance)
+	bootstrap_min = int(_cfg_value(cfg, "multi_task_bootstrap_min_episodes_per_condition", 20))
+	if bootstrap_min < 0:
+		raise ValueError("multi_task_bootstrap_min_episodes_per_condition must be non-negative.")
+	_set_cfg_value(cfg, "multi_task_bootstrap_min_episodes_per_condition", bootstrap_min)
 	manifest_fp = _cfg_value(cfg, "online_family_replay_manifest_fp", None)
 	if manifest_fp:
 		manifest_path = _absolute_cfg_path(manifest_fp)

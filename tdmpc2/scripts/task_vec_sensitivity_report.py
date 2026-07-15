@@ -49,6 +49,13 @@ def _checkpoint_state_dict(checkpoint_fp: Path):
 	return obj["model"] if isinstance(obj, dict) and "model" in obj else obj
 
 
+def _checkpoint_metadata(checkpoint_fp: Path):
+	obj = torch.load(checkpoint_fp, map_location="cpu", weights_only=False)
+	if isinstance(obj, dict) and isinstance(obj.get("metadata"), dict):
+		return dict(obj["metadata"])
+	return {}
+
+
 def _state_tensor(state_dict, key: str):
 	for candidate in (key, f"module.{key}"):
 		if candidate in state_dict:
@@ -65,6 +72,7 @@ def _infer_model_size(enc_dim: int):
 
 def _infer_checkpoint_compat(checkpoint_fp: Path):
 	state_dict = _checkpoint_state_dict(checkpoint_fp)
+	metadata = _checkpoint_metadata(checkpoint_fp)
 	enc_weight = _state_tensor(state_dict, "_encoder.state.0.weight")
 	if enc_weight is None:
 		raise KeyError(f"Could not infer encoder input from checkpoint={checkpoint_fp}")
@@ -84,6 +92,7 @@ def _infer_checkpoint_compat(checkpoint_fp: Path):
 	adapter_sites = {}
 	adapter_hidden_dim = None
 	adapter_source = None
+	adapter_alpha = metadata.get("task_context_adapter_alpha", None)
 	for site in ("encoder", "dynamics", "pi", "reward", "q"):
 		weight = _state_tensor(state_dict, f"_task_context_adapters.{site}.net.0.weight")
 		if weight is not None:
@@ -98,6 +107,8 @@ def _infer_checkpoint_compat(checkpoint_fp: Path):
 				adapter_source = "both"
 			else:
 				adapter_source = "task_context"
+	if adapter_source is None and metadata.get("task_context_adapter_source", None) is not None:
+		adapter_source = str(metadata["task_context_adapter_source"])
 	obs_dim = int(enc_weight.shape[1]) - task_dim
 	if obs_dim <= 0:
 		raise ValueError(
@@ -112,12 +123,25 @@ def _infer_checkpoint_compat(checkpoint_fp: Path):
 		"task_dim": task_dim,
 		"task_context_adapter_enabled": bool(adapter_sites),
 		"task_context_adapter_hidden_dim": adapter_hidden_dim,
+		"task_context_adapter_alpha": float(adapter_alpha) if adapter_alpha is not None else None,
+		"task_context_adapter_lr_scale": float(metadata["task_context_adapter_lr_scale"]) if metadata.get("task_context_adapter_lr_scale", None) is not None else None,
 		"task_context_adapter_source": adapter_source,
 		"task_context_adapter_apply_encoder": bool(adapter_sites.get("encoder", False)),
 		"task_context_adapter_apply_dynamics": bool(adapter_sites.get("dynamics", False)),
 		"task_context_adapter_apply_policy": bool(adapter_sites.get("pi", False)),
 		"task_context_adapter_apply_reward": bool(adapter_sites.get("reward", False)),
 		"task_context_adapter_apply_q": bool(adapter_sites.get("q", False)),
+		"task_vec_normalization_enabled": bool(metadata.get("task_vec_normalization_enabled", False)),
+		"task_vec_normalization_mean": metadata.get("task_vec_normalization_mean", None),
+		"task_vec_normalization_std": metadata.get("task_vec_normalization_std", None),
+		"task_vec_normalization_eps": metadata.get("task_vec_normalization_eps", None),
+		"task_context_repair_enabled": bool(metadata.get("task_context_repair_enabled", False)),
+		"task_recon_coef": float(metadata["task_recon_coef"]) if metadata.get("task_recon_coef", None) is not None else None,
+		"task_spread_coef": float(metadata["task_spread_coef"]) if metadata.get("task_spread_coef", None) is not None else None,
+		"task_raw_residual_scale": float(metadata["task_raw_residual_scale"]) if metadata.get("task_raw_residual_scale", None) is not None else None,
+		"task_spread_near_threshold": float(metadata["task_spread_near_threshold"]) if metadata.get("task_spread_near_threshold", None) is not None else None,
+		"task_spread_far_threshold": float(metadata["task_spread_far_threshold"]) if metadata.get("task_spread_far_threshold", None) is not None else None,
+		"task_spread_margin": float(metadata["task_spread_margin"]) if metadata.get("task_spread_margin", None) is not None else None,
 	}
 
 
@@ -135,6 +159,10 @@ def _load_config(args, checkpoint_fp: Path):
 	cfg.task_context_adapter_enabled = bool(compat.get("task_context_adapter_enabled", False))
 	if compat.get("task_context_adapter_hidden_dim", None) is not None:
 		cfg.task_context_adapter_hidden_dim = int(compat["task_context_adapter_hidden_dim"])
+	if compat.get("task_context_adapter_alpha", None) is not None:
+		cfg.task_context_adapter_alpha = float(compat["task_context_adapter_alpha"])
+	if compat.get("task_context_adapter_lr_scale", None) is not None:
+		cfg.task_context_adapter_lr_scale = float(compat["task_context_adapter_lr_scale"])
 	if compat.get("task_context_adapter_source", None) is not None:
 		cfg.task_context_adapter_source = str(compat["task_context_adapter_source"])
 	cfg.task_context_adapter_apply_encoder = bool(compat.get("task_context_adapter_apply_encoder", False))
@@ -142,6 +170,24 @@ def _load_config(args, checkpoint_fp: Path):
 	cfg.task_context_adapter_apply_policy = bool(compat.get("task_context_adapter_apply_policy", False))
 	cfg.task_context_adapter_apply_reward = bool(compat.get("task_context_adapter_apply_reward", False))
 	cfg.task_context_adapter_apply_q = bool(compat.get("task_context_adapter_apply_q", False))
+	cfg.task_vec_normalization_enabled = bool(compat.get("task_vec_normalization_enabled", False))
+	if compat.get("task_vec_normalization_mean", None) is not None:
+		cfg.task_vec_normalization_mean = compat["task_vec_normalization_mean"]
+	if compat.get("task_vec_normalization_std", None) is not None:
+		cfg.task_vec_normalization_std = compat["task_vec_normalization_std"]
+	if compat.get("task_vec_normalization_eps", None) is not None:
+		cfg.task_vec_normalization_eps = float(compat["task_vec_normalization_eps"])
+	cfg.task_context_repair_enabled = bool(compat.get("task_context_repair_enabled", False))
+	for key in (
+		"task_recon_coef",
+		"task_spread_coef",
+		"task_raw_residual_scale",
+		"task_spread_near_threshold",
+		"task_spread_far_threshold",
+		"task_spread_margin",
+	):
+		if compat.get(key, None) is not None:
+			setattr(cfg, key, float(compat[key]))
 	if compat["action_dim"] is not None:
 		cfg.srsa_policy_action_dim = int(compat["action_dim"])
 		cfg.isaaclab_action_dim = int(compat["action_dim"])
@@ -197,6 +243,17 @@ def _load_world_model(model: WorldModel, checkpoint_fp: Path, cfg):
 				continue
 			if tuple(state_dict[source_key].shape) != tuple(target_state[key].shape):
 				state_dict[source_key] = target_state[key]
+	repair_prefixes = (
+		"_task_encoder.raw_residual.",
+		"_task_encoder.decoder.",
+		"module._task_encoder.raw_residual.",
+		"module._task_encoder.decoder.",
+	)
+	for key, value in target_state.items():
+		if key in state_dict:
+			continue
+		if any(key.startswith(prefix) for prefix in repair_prefixes):
+			state_dict[key] = value
 	try:
 		model.load_state_dict(state_dict)
 	except Exception as load_error:

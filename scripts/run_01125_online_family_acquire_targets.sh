@@ -73,6 +73,8 @@ seed_manifest_cmd=(
   --manifest "${MANIFEST_FP}"
   --task-id "01125"
   --assembly-id "01125"
+  --template-id "${SRSA_PARAM_TEMPLATE_ID:-2}"
+  --condition-id "01125|tid-${SRSA_PARAM_TEMPLATE_ID:-2}"
   --replay-fp "${ANCHOR_REPLAY_FP}"
   --checkpoint "${SOURCE_CHECKPOINT}"
   --stage-index 1

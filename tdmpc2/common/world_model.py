@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
@@ -28,6 +31,7 @@ class WorldModel(nn.Module):
 		self._task_context_adapter_enabled = bool(cfg.get('task_context_adapter_enabled', False))
 		self._task_context_adapter_source = str(cfg.get('task_context_adapter_source', 'task_context')).lower()
 		self._contact_context_dim = 0
+		self._task_vec_normalization_enabled = bool(cfg.get('task_vec_normalization_enabled', False))
 		self._task_conditioning = str(cfg.get('task_conditioning', 'axial_params')).lower()
 		if self._task_conditioning in {'axial', 'axial_params', 'param', 'param_only'}:
 			self._task_conditioning = 'axial_params'
@@ -38,7 +42,25 @@ class WorldModel(nn.Module):
 			if task_vectors.ndim != 2 or task_vectors.shape[-1] != int(cfg.get('axial_task_vec_dim', 6)):
 				raise ValueError(f'Expected task_vectors shape (N, 6), got {tuple(task_vectors.shape)}.')
 			self.register_buffer('_task_vecs', task_vectors)
-			self._task_encoder = AxialTaskEncoder(task_dim=cfg.task_dim)
+			self._init_task_vec_normalization(task_vectors)
+			raw_residual_scale = float(cfg.get(
+				'task_raw_residual_scale',
+				cfg.get('task_context_raw_residual_scale', 0.0),
+			))
+			self._task_encoder = AxialTaskEncoder(
+				task_dim=cfg.task_dim,
+				task_vec_dim=int(cfg.get('axial_task_vec_dim', 6)),
+				repair_enabled=bool(cfg.get('task_context_repair_enabled', False)),
+				raw_residual_scale=raw_residual_scale,
+				normalize_inputs=False,
+				normalization_eps=float(cfg.get('task_vec_normalization_eps', 1.0e-6)),
+			)
+			if hasattr(self, "_task_vec_norm_mean") and hasattr(self, "_task_vec_norm_std"):
+				self._task_encoder.set_normalization_stats(
+					self._task_vec_norm_mean,
+					self._task_vec_norm_std,
+					float(getattr(self, "_task_vec_normalization_eps", 1.0e-6)),
+				)
 			if cfg.rank == 0:
 				print(f'Using AxialTaskEncoder param-only task conditioning: {tuple(task_vectors.shape)} -> {cfg.task_dim}D.')
 		elif self._task_conditioning in {'none', 'disabled'} or cfg.task_dim <= 0:
@@ -163,6 +185,8 @@ class WorldModel(nn.Module):
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.QOnlineTargetEnsemble(cfg)
 		self.apply(init.weight_init)
+		if self._task_encoder is not None:
+			self._task_encoder.reset_repair_to_identity()
 		if self._task_context_adapters is not None:
 			for adapter in self._task_context_adapters.values():
 				adapter.reset_to_identity()
@@ -214,21 +238,74 @@ class WorldModel(nn.Module):
 			return []
 		return list(self._task_context_adapters.parameters())
 
+	def _init_task_vec_normalization(self, task_vectors):
+		if not self._task_vec_normalization_enabled:
+			return
+		stats_fp = self.cfg.get('task_vec_normalization_stats_fp', None)
+		eps = float(self.cfg.get('task_vec_normalization_eps', 1.0e-6))
+		cfg_mean = self.cfg.get('task_vec_normalization_mean', None)
+		cfg_std = self.cfg.get('task_vec_normalization_std', None)
+		if cfg_mean is not None and cfg_std is not None:
+			mean = torch.tensor(cfg_mean, dtype=torch.float32)
+			std = torch.tensor(cfg_std, dtype=torch.float32)
+		elif stats_fp:
+			stats_path = Path(str(stats_fp)).expanduser()
+			with open(stats_path, "r", encoding="utf-8") as f:
+				payload = json.load(f)
+			stats = payload.get("stats", payload)
+			mean = torch.tensor(stats["mean"], dtype=torch.float32)
+			std = torch.tensor(stats["std"], dtype=torch.float32)
+			eps = float(stats.get("eps", eps))
+		else:
+			mean = task_vectors.float().mean(dim=0)
+			std = task_vectors.float().std(dim=0, unbiased=False)
+		std = std.clamp_min(eps)
+		self.register_buffer("_task_vec_norm_mean", mean, persistent=False)
+		self.register_buffer("_task_vec_norm_std", std, persistent=False)
+		self._task_vec_normalization_eps = eps
+		if self.cfg.rank == 0:
+			print(
+				"Task vector normalization enabled: "
+				f"mean={[round(float(x), 6) for x in mean.tolist()]} "
+				f"std={[round(float(x), 6) for x in std.tolist()]}."
+			)
+
+	def normalize_task_vec(self, task_vec):
+		if not self._task_vec_normalization_enabled or not hasattr(self, "_task_vec_norm_mean"):
+			return task_vec
+		mean = self._task_vec_norm_mean.to(device=task_vec.device, dtype=task_vec.dtype)
+		std = self._task_vec_norm_std.to(device=task_vec.device, dtype=task_vec.dtype)
+		return (task_vec - mean) / std.clamp_min(float(getattr(self, "_task_vec_normalization_eps", 1.0e-6)))
+
+	def task_vec_normalization_metadata(self):
+		if not self._task_vec_normalization_enabled or not hasattr(self, "_task_vec_norm_mean"):
+			return {}
+		return {
+			"task_vec_normalization_mean": [float(x) for x in self._task_vec_norm_mean.detach().cpu().tolist()],
+			"task_vec_normalization_std": [float(x) for x in self._task_vec_norm_std.detach().cpu().tolist()],
+			"task_vec_normalization_eps": float(getattr(self, "_task_vec_normalization_eps", 1.0e-6)),
+		}
+
 	def freeze_base_world_model(self):
 		"""
 		Freeze the original world model trunk and leave only the residual adapter trainable.
 		"""
 		train_task_adapter = bool(self.cfg.get('task_context_adapter_train_with_frozen_base', True))
+		train_task_repair = bool(self.cfg.get('task_context_repair_enabled', False))
 		for name, param in self.named_parameters():
 			param.requires_grad_(
 				name.startswith('_latent_residual_adapter.') or
-				(train_task_adapter and name.startswith('_task_context_adapters.'))
+				(train_task_adapter and name.startswith('_task_context_adapters.')) or
+				(train_task_repair and name.startswith('_task_encoder.'))
 			)
 		if self._latent_residual_adapter is not None:
 			for param in self._latent_residual_adapter.parameters():
 				param.requires_grad_(True)
 		if train_task_adapter and self._task_context_adapters is not None:
 			for param in self._task_context_adapters.parameters():
+				param.requires_grad_(True)
+		if train_task_repair and self._task_encoder is not None:
+			for param in self._task_encoder.parameters():
 				param.requires_grad_(True)
 
 	def set_latent_residual_alpha_scale(self, value):
@@ -341,21 +418,7 @@ class WorldModel(nn.Module):
 		task_ids = self.task_ids_for_shape(task, x.shape[:-1], device=x.device)
 		return self._action_masks[task_ids]
 
-	def task_context(self, x, task):
-		if self._task_encoder is not None:
-			if self._is_task_vec(task):
-				task_vec = task.to(device=x.device, dtype=torch.float32, non_blocking=True)
-			else:
-				task_ids = self._broadcast_task_ids(task, x)
-				task_vec = self._task_vecs[task_ids]
-			return self._expand_task_context(self._task_encoder(task_vec), x)
-
-		if not hasattr(self, '_task_emb') or self._task_emb is None:
-			return None
-		task_ids = self._broadcast_task_ids(task, x)
-		return self._expand_task_context(self._task_emb(task_ids), x)
-
-	def raw_task_vec_context(self, x, task):
+	def _task_vec_from_task(self, x, task):
 		if not hasattr(self, '_task_vecs'):
 			return None
 		if self._is_task_vec(task):
@@ -363,6 +426,42 @@ class WorldModel(nn.Module):
 		else:
 			task_ids = self._broadcast_task_ids(task, x)
 			task_vec = self._task_vecs[task_ids]
+		return task_vec
+
+	def task_context_repair_info(self, x, task, reconstruct=True):
+		if self._task_encoder is None:
+			return None
+		task_vec = self._task_vec_from_task(x, task)
+		if task_vec is None:
+			return None
+		task_vec_norm = self.normalize_task_vec(task_vec)
+		parts = self._task_encoder.forward_parts(task_vec_norm)
+		out = {
+			"task_vec": self._expand_task_context(task_vec, x),
+			"task_vec_norm": self._expand_task_context(parts["task_vec_norm"], x),
+			"axial_context": self._expand_task_context(parts["axial_context"], x),
+			"raw_residual": self._expand_task_context(parts["raw_residual"], x),
+			"task_context": self._expand_task_context(parts["task_context"], x),
+		}
+		if reconstruct:
+			out["task_recon"] = self._task_encoder.reconstruct(out["task_context"])
+		return out
+
+	def task_context(self, x, task):
+		if self._task_encoder is not None:
+			info = self.task_context_repair_info(x, task, reconstruct=False)
+			return None if info is None else info["task_context"]
+
+		if not hasattr(self, '_task_emb') or self._task_emb is None:
+			return None
+		task_ids = self._broadcast_task_ids(task, x)
+		return self._expand_task_context(self._task_emb(task_ids), x)
+
+	def raw_task_vec_context(self, x, task):
+		task_vec = self._task_vec_from_task(x, task)
+		if task_vec is None:
+			return None
+		task_vec = self.normalize_task_vec(task_vec)
 		return self._expand_task_context(task_vec, x)
 
 	def _task_adapter_context_dim(self):

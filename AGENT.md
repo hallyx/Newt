@@ -127,6 +127,23 @@ Recommended next work order:
   vectors, so a new `task_context_adapter_source=raw_task_vec` option was added.
   Prefer the next experiment with `TASK_CONTEXT_ADAPTER_SOURCE=raw_task_vec` and
   smaller `TASK_CONTEXT_ADAPTER_ALPHA=0.05`.
+- 2026-06-22 raw-task adapter result: the `01125 + 00256` diagnostic with
+  `TASK_CONTEXT_ADAPTER_SOURCE=raw_task_vec` and `TASK_CONTEXT_ADAPTER_ALPHA=0.05`
+  completed, but degraded badly. `00256` eval fell from the source checkpoint's
+  strong pre-update rollout to `0.1445` at 49,920 steps and `0.0` at 99,840
+  steps; post-run family eval was `01125=0.0`, `00256=0.0` relaxed success.
+  Mixed replay was correct (`01125=512`, `00256=512`, entropy norm `1.0`).
+- The same raw-task run did make `task_vec_6` influential: after fixing the
+  sensitivity loader to restore adapter alpha from checkpoint metadata, paired
+  sensitivity was no longer numerical noise (`anchor action_l2=0.059`,
+  `zero action_l2=0.089`, `random action_l2=0.102`). Interpret this as
+  "raw task input can move the model, but the full-site adapter is too
+  destructive at alpha 0.05", not as a reason to add tasks.
+- do not add `00186` until a two-task run keeps `00256` success acceptable,
+  keeps `01125` retention acceptable, logs near-50/50 batch task counts, and
+  produces paired action/Q/reward/next-latent sensitivity above numerical noise.
+  The next two-task attempt should lower adapter strength first, e.g. try
+  `TASK_CONTEXT_ADAPTER_ALPHA=0.005` from the same clean polish checkpoint.
 - next acquisition step: cautious `00186` only after 01125/00256 retention and
   task-conditioning sensitivity are acceptable
 - medium family: `01125 -> 00256 -> 00186 -> 00004 -> 00014`
@@ -155,6 +172,13 @@ Checkpoint/eval rule:
 - With the current V2 00256 checkpoint, wrong-vector eval confirms weak
   dependence on `task_vec_6`; prefer task-conditioning fixes or diagnostics
   before scaling to many more assemblies.
+- The current mainline is two-task diagnosis first, three-task expansion second:
+  `01125 + 00256` must pass retention and paired sensitivity before running
+  `01125 + 00256 + 00186`.
+- If the three-task ablation runs, keep it to `01125:0.34`, `00256:0.33`,
+  `00186:0.33` replay pressure, keep
+  `srsa_axial_clearance_depth_templates=1.0:1.0`, and do not add `00062` or
+  `00271`.
 - Do not treat success swap alone as decisive. For the next diagnostic, keep the
   initial state paired and compute `delta_action`, `delta_Q`,
   `delta_reward_pred`, and `delta_next_latent` under correct, anchor, zero,
@@ -173,6 +197,7 @@ Implementation surface for this route:
 - `tdmpc2/trainer.py`
 - `scripts/run_01125_online_family_replay_targets.sh`
 - `scripts/run_01125_online_family_acquire_targets.sh`
+- `scripts/run_01125_00256_rawtask_adapter_diagnostic.sh`
 - `scripts/run_00256_task_vec_swap_eval.sh`
 - `scripts/update_online_family_replay_manifest.py`
 - `tdmpc2/scripts/task_vec_sensitivity_report.py`

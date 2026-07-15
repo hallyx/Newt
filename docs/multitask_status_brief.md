@@ -1061,3 +1061,142 @@ TASK_CONTEXT_ADAPTER_ALPHA=0.05 \
 UPDATE_PROGRESS_LOG_EVERY=50 \
 scripts/run_01125_online_family_acquire_targets.sh
 ```
+
+### 2026-06-22 Route Lock: Two Tasks Before Three
+
+Do not make three-task early mixed training the next mainline experiment. It is
+theoretically attractive because it would pressure the task representation from
+the start, but it would also entangle too many variables in the current state:
+`00186` is harder than `00256`, the online path is still single-assembly env plus
+family replay rather than a true mixed-assembly IsaacLab env, and the adapter
+strength/source questions are not resolved.
+
+The active mainline is therefore:
+
+```text
+01125 + 00256 diagnostic first
+00186 expansion only after the diagnostic passes
+```
+
+Default next launcher:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+GPU_ID=0 \
+scripts/run_01125_00256_rawtask_adapter_diagnostic.sh
+```
+
+This wrapper fixes the run shape to:
+
+- source checkpoint:
+  `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_polish_01125_00256/20260619_0135_retention_polish_stage-2_asm-00256/models/latest.pt`
+- tasks: `01125 + 00256`
+- replay mix: `CURRENT_RATIO=0.50`, `ANCHOR_RATIO=0.50`,
+  `HISTORY_RATIO=0.0`
+- adapter: `TASK_CONTEXT_ADAPTER_ENABLED=true`,
+  `TASK_CONTEXT_ADAPTER_SOURCE=raw_task_vec`,
+  `TASK_CONTEXT_ADAPTER_ALPHA=0.005`
+- retention gate: enabled before any next-task handoff
+
+Two-task pass criteria:
+
+- `00256` relaxed success stays near the known acceptable level.
+- `01125` retention does not clearly regress.
+- update logs show real 50/50 task batches for `01125` and `00256`.
+- paired `task_vec_6` sensitivity is no longer at `1e-7` numerical-noise scale
+  for action/Q/reward/next-latent deltas.
+
+Only after those pass, run the cautious three-task ablation:
+
+```text
+01125 + 00256 + 00186
+```
+
+Use the online-family ratios to approximate:
+
+```text
+01125: 0.34
+00256: 0.33
+00186: 0.33
+```
+
+In the current launcher shape, that means an `00186` acquisition stage whose
+manifest already contains `01125` and `00256`, with `01125` as anchor, `00256`
+as history, and `00186` as current. Keep
+`srsa_axial_clearance_depth_templates=1.0:1.0`; do not add `00062`, `00271`, or
+size-generalization templates in the same experiment.
+
+If the three-task ablation fails, do not immediately reject the multi-task route.
+First check whether paired sensitivity collapsed back to noise, then whether
+`00186` is still weak under single-task/direct fine-tune, and only then decide
+whether `AxialTaskEncoder` needs a raw residual path, reconstruction loss, or
+spread loss.
+
+### 2026-06-23 Raw-Task Adapter Result
+
+Run inspected:
+
+- `logs/isaaclab-srsa-assembly/1/srsa_axial_online_family_rawtask_adapter_01125_00256/20260622_194546_launcher`
+
+Training completed, but the run failed the two-task gate:
+
+- pre-update rollout on `00256`: `episode_success=0.949`
+- 49,920-step eval: `episode_success=0.1445`
+- 99,840-step eval: `episode_success=0.0`
+- best checkpoint: `best_step-49920_s-0p1445.pt`
+- latest checkpoint: `99,840` steps with `episode_success=0.0`
+
+Family eval after the run:
+
+| Assembly | relaxed success | strict success | official latched | mean lateral error |
+| --- | ---: | ---: | ---: | ---: |
+| `01125` | `0.00` | `0.00` | `0.85` | `103.1 mm` |
+| `00256` | `0.00` | `0.00` | `0.25` | `98.4 mm` |
+
+Sampling was not the problem. Update logs show exact 50/50 mixed batches:
+
+- `online_family_batch_task_count_01125=512`
+- `online_family_batch_task_count_00256=512`
+- `online_family_batch_task_entropy_norm=1.0`
+
+Adapter weights still moved quickly even with `alpha=0.05`:
+
+- final encoder adapter weight norm: `7.92`
+- final dynamics adapter weight norm: `8.15`
+- final policy adapter weight norm: `7.63`
+- final reward adapter weight norm: `5.91`
+- final Q adapter weight norm: `54.21`
+
+Paired sensitivity was rerun with
+`tdmpc2/scripts/task_vec_sensitivity_report.py` after fixing the loader to read
+`task_context_adapter_alpha` from checkpoint metadata. The fixed report is:
+
+- `logs/task_vec_sensitivity/20260622_rawtask_adapter_00256_report.json`
+
+Mean deltas versus the correct `00256` task vector:
+
+| Swap | action L2 | Q abs | reward abs | next-latent L2 |
+| --- | ---: | ---: | ---: | ---: |
+| `01125` replay vector | `0.0595` | `1.64` | `0.227` | `0.562` |
+| old `00186` replay vector | `0.0752` | `22.21` | `0.393` | `1.170` |
+| zero vector | `0.0888` | `5.33` | `0.437` | `1.257` |
+| random vector | `0.1025` | `28.96` | `0.410` | `1.532` |
+
+Interpretation:
+
+- `raw_task_vec` fixed the invariance symptom: task-vector swaps now produce
+  large action/Q/reward/dynamics deltas rather than `1e-7` numerical noise.
+- The full-site adapter at `alpha=0.05` is too destructive for the current
+  two-task policy; it turns task conditioning into a strong perturbation before
+  the policy/value landscape can absorb it.
+- This is not a green light for `00186`. The two-task gate failed on retention
+  and current-task success.
+
+Next recommendation:
+
+- stay on `01125 + 00256`;
+- restart from the clean 20260619 polish checkpoint;
+- try a weaker raw-task adapter first, e.g.
+  `TASK_CONTEXT_ADAPTER_ALPHA=0.005`;
+- keep the same 50/50 replay and retention gates;
+- rerun paired sensitivity and family eval before any three-task ablation.

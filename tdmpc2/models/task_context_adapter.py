@@ -37,6 +37,9 @@ class TaskContextFiLMAdapter(nn.Module):
 			nn.Mish(inplace=False),
 			nn.Linear(self.hidden_dim, 2 * self.feature_dim),
 		)
+		self._last_delta_l2_mean = None
+		self._last_delta_l2_p95 = None
+		self._last_relative_delta_norm = None
 		self.reset_to_identity()
 
 	def reset_to_identity(self):
@@ -53,12 +56,37 @@ class TaskContextFiLMAdapter(nn.Module):
 			)
 		params = self.net(task_context.to(device=x.device, dtype=x.dtype, non_blocking=True))
 		gamma, beta = params.chunk(2, dim=-1)
-		return x + self.alpha * (gamma * x + beta)
+		delta = self.alpha * (gamma * x + beta)
+		compiler = getattr(torch, "compiler", None)
+		is_compiling = False
+		if compiler is not None and hasattr(compiler, "is_compiling"):
+			is_compiling = bool(compiler.is_compiling())
+		if not is_compiling:
+			with torch.no_grad():
+				delta_f = delta.detach().float()
+				x_f = x.detach().float()
+				if delta_f.ndim == 1:
+					delta_norm = delta_f.norm().view(1)
+					x_norm = x_f.norm().view(1)
+				else:
+					delta_norm = delta_f.reshape(-1, delta_f.shape[-1]).norm(dim=-1)
+					x_norm = x_f.reshape(-1, x_f.shape[-1]).norm(dim=-1)
+				self._last_delta_l2_mean = delta_norm.mean()
+				self._last_delta_l2_p95 = torch.quantile(delta_norm, 0.95)
+				self._last_relative_delta_norm = delta_norm.mean() / x_norm.mean().clamp_min(1.0e-6)
+		return x + delta
 
 	def metrics(self):
 		final = self.net[-1]
-		return {
+		out = {
 			"final_weight_norm": final.weight.detach().norm(),
 			"final_bias_norm": final.bias.detach().norm(),
 			"alpha": torch.tensor(float(self.alpha), device=final.weight.device),
 		}
+		if self._last_delta_l2_mean is not None:
+			out.update({
+				"delta_l2_mean": self._last_delta_l2_mean.detach(),
+				"delta_l2_p95": self._last_delta_l2_p95.detach(),
+				"relative_delta_norm": self._last_relative_delta_norm.detach(),
+			})
+		return out

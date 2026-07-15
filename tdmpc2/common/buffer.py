@@ -1,4 +1,5 @@
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 
 import torch
@@ -59,6 +60,7 @@ class Buffer():
 		)
 		self._num_eps = 0
 		self._num_demos = 0
+		self.metadata = {}
 
 	def __len__(self):
 		"""Return the number of stored transitions."""
@@ -127,7 +129,23 @@ class Buffer():
 			if "action" in td.keys():
 				metadata.setdefault("action_shape", list(td.get("action").shape[1:]))
 			if "task" in td.keys():
-				metadata.setdefault("task_shape", list(td.get("task").shape[1:]))
+				task = td.get("task")
+				metadata.setdefault("task_shape", list(task.shape[1:]))
+				if task.is_floating_point() and task.ndim >= 2 and int(task.shape[-1]) <= 64:
+					task_flat = task.reshape(-1, task.shape[-1]).detach().cpu().float()
+					task_unique = torch.unique(task_flat, dim=0)
+					metadata.setdefault("task_vec_unique", int(task_unique.shape[0]))
+					hashes = []
+					values = []
+					for vec in task_unique[:32]:
+						rounded = [round(float(item), 8) for item in vec.tolist()]
+						digest = hashlib.sha1(",".join(f"{item:.8g}" for item in rounded).encode("utf-8")).hexdigest()[:12]
+						hashes.append(digest)
+						if len(values) < 8:
+							values.append(rounded)
+					metadata.setdefault("task_vec_hashes", hashes)
+					if values:
+						metadata.setdefault("task_vec_unique_values", values)
 		except Exception:
 			pass
 		return metadata
@@ -219,6 +237,7 @@ class Buffer():
 			prefetch=prefetch,
 		)
 		buffer.load_snapshot_data(tds, metadata=metadata, max_episodes=max_episodes)
+		buffer.metadata = metadata
 		return buffer
 
 	def load_demos(self, tds):

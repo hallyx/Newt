@@ -47,6 +47,8 @@ def parse_args():
 	parser.add_argument("--manifest", required=True, help="Manifest JSON path to create/update.")
 	parser.add_argument("--task-id", required=True, help="Logical task id, usually the assembly id.")
 	parser.add_argument("--assembly-id", default=None, help="Assembly id. Defaults to --task-id.")
+	parser.add_argument("--template-id", default=None, help="Template/parameter id for condition-level replay.")
+	parser.add_argument("--condition-id", default=None, help="Explicit condition id. Defaults to assembly_id|template_id.")
 	parser.add_argument("--replay-fp", required=True, help="Saved replay snapshot path.")
 	parser.add_argument("--checkpoint", default=None, help="Stage checkpoint produced with this replay.")
 	parser.add_argument("--stage-index", type=int, default=None, help="Stage index in the launcher curriculum.")
@@ -69,13 +71,23 @@ def main():
 	manifest_path.parent.mkdir(parents=True, exist_ok=True)
 	payload = _load_manifest(manifest_path)
 	now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+	metadata = _read_snapshot_metadata(replay_path)
 	task_id = str(args.task_id)
 	assembly_id = str(args.assembly_id or args.task_id)
+	template_id = args.template_id
+	if template_id is None:
+		template_id = metadata.get("template_id", None)
+	if template_id is not None:
+		template_id = str(template_id)
+	condition_id = args.condition_id or metadata.get("condition_id", None)
+	if condition_id is None:
+		condition_id = f"{assembly_id}|{template_id if template_id is not None else 'default'}"
 	role = args.role or ("anchor" if task_id == str(args.anchor_task_id) else "history")
-	metadata = _read_snapshot_metadata(replay_path)
 	entry = {
 		"task_id": task_id,
 		"assembly_id": assembly_id,
+		"template_id": template_id,
+		"condition_id": str(condition_id),
 		"role": role,
 		"replay_fp": _display_path(replay_path, manifest_path, args.absolute_paths),
 		"updated_at": now,
@@ -84,11 +96,21 @@ def main():
 		entry["stage_index"] = int(args.stage_index)
 	if checkpoint_path is not None:
 		entry["checkpoint"] = _display_path(checkpoint_path, manifest_path, args.absolute_paths)
-	for key in ["num_episodes", "num_transitions", "horizon", "obs_shape", "action_shape", "task_shape"]:
+	for key in [
+		"num_episodes",
+		"num_transitions",
+		"horizon",
+		"obs_shape",
+		"action_shape",
+		"task_shape",
+		"task_vec_unique",
+		"task_vec_hashes",
+		"task_vec_unique_values",
+	]:
 		if key in metadata:
 			entry[key] = metadata[key]
 
-	tasks = [item for item in payload["tasks"] if str(item.get("task_id")) != task_id]
+	tasks = [item for item in payload["tasks"] if str(item.get("condition_id", item.get("task_id"))) != str(condition_id)]
 	tasks.append(entry)
 	tasks.sort(key=lambda item: (0 if item.get("role") == "anchor" else 1, item.get("stage_index", 10**9), str(item.get("task_id"))))
 	payload["tasks"] = tasks

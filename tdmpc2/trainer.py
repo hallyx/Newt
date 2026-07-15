@@ -121,12 +121,23 @@ class Trainer():
 					attrs=['bold'],
 				))
 			else:
+				template_id = self.cfg.get(
+					'online_family_current_template_id',
+					self.cfg.get('srsa_param_template_id', self.cfg.get('srsa_task_template_id', None)),
+				)
+				task_id = str(self.cfg.get('online_family_current_task_id', self.cfg.get('assembly_id', '')))
+				condition_id = self.cfg.get('online_family_current_condition_id', None)
+				if not condition_id:
+					condition_id = f"{task_id}|{template_id if template_id is not None else self.cfg.get('srsa_axial_clearance_depth_templates', 'default')}"
 				metadata = {
 					'reason': reason,
 					'step': int(self._step),
 					'episode': int(self._ep_idx),
 					'assembly_id': str(self.cfg.get('assembly_id', '')),
-					'task_id': str(self.cfg.get('online_family_current_task_id', self.cfg.get('assembly_id', ''))),
+					'task_id': task_id,
+					'template_id': None if template_id is None else str(template_id),
+					'condition_id': str(condition_id),
+					'source_replay_fp': str(save_fp),
 					'checkpoint': self.cfg.get('checkpoint', None),
 				}
 				save_fn = self.buffer.save_current if hasattr(self.buffer, 'save_current') else self.buffer.save

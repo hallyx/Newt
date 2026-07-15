@@ -3,6 +3,7 @@ import os
 import importlib
 import math
 import types
+import builtins
 from pathlib import Path
 
 import gymnasium as gym
@@ -13,6 +14,166 @@ import torch
 _APP_LAUNCHER = None
 _SIMULATION_APP = None
 _ISAACLAB_WORKDIR = None
+
+
+def _automate_metadata_roots(cfg):
+	"""
+	Local AutoMate metadata candidates used by IsaacLab's basename open path.
+	"""
+	env_candidates = [
+		os.environ.get('NEWT_AUTOMATE_ASSET_ROOT'),
+		os.environ.get('AUTOMATE_ASSET_ROOT'),
+		os.environ.get('ISAACLAB_NUCLEUS_DIR'),
+		os.environ.get('ISAAC_NUCLEUS_DIR'),
+	]
+	path_candidates = [
+		Path(item).expanduser()
+		for item in env_candidates
+		if item
+	]
+	path_candidates.extend(
+		[
+			Path('/home/gpuserver/isaacsim_assets/Assets/Isaac/5.1'),
+			Path('/home/gpuserver/isaacsim_assets/Assets/Isaac/4.5'),
+			Path('/home/gpuserver/IsaacLab'),
+			Path(str(cfg.get('isaaclab_dir', ''))).expanduser(),
+		]
+	)
+
+	seen = set()
+	for root in path_candidates:
+		if not root:
+			continue
+		for candidate in (
+			root,
+			root / 'AutoMate',
+			root / 'IsaacLab' / 'AutoMate',
+			root / 'Isaac' / 'IsaacLab' / 'AutoMate',
+		):
+			try:
+				candidate = candidate.resolve()
+			except OSError:
+				continue
+			if candidate in seen:
+				continue
+			seen.add(candidate)
+			if (
+				(candidate / 'plug_grasps.json').exists()
+				and (candidate / 'disassembly_dist.json').exists()
+			):
+				yield candidate
+
+
+def _local_automate_basename_path(automate_root, basename):
+	if basename in {'plug_grasps.json', 'disassembly_dist.json'}:
+		candidate = automate_root / basename
+	elif basename in {'disassemble_traj.json', 'plug.obj', 'socket.obj', 'plug.usd', 'socket.usd'}:
+		assembly_id = os.environ.get('NEWT_AUTOMATE_ASSEMBLY_ID', '').zfill(5)
+		candidate = automate_root / assembly_id / basename
+	else:
+		return None
+	return candidate if candidate.exists() else None
+
+
+def _patch_automate_trimesh_load(automate_root):
+	try:
+		import trimesh
+		import trimesh.exchange.load as load_mod
+	except Exception:
+		return
+
+	orig_load = getattr(load_mod, 'load', None)
+	if orig_load is not None and not getattr(orig_load, '_newt_automate_mesh_patched', False):
+
+		def load_local_automate_mesh(file_obj, *args, **kwargs):
+			try:
+				path = Path(file_obj)
+				if not path.is_absolute():
+					local_path = _local_automate_basename_path(automate_root, path.name)
+					if local_path is not None:
+						file_obj = str(local_path)
+			except (TypeError, ValueError, OSError):
+				pass
+			return orig_load(file_obj, *args, **kwargs)
+
+		load_local_automate_mesh._newt_automate_mesh_patched = True
+		load_mod.load = load_local_automate_mesh
+		try:
+			trimesh.load = load_local_automate_mesh
+		except Exception:
+			pass
+		industreal_mod = sys.modules.get('isaaclab_tasks.direct.automate.industreal_algo_utils')
+		if industreal_mod is not None:
+			setattr(industreal_mod, 'load', load_local_automate_mesh)
+
+	orig_load_mesh = getattr(load_mod, 'load_mesh', None)
+	if orig_load_mesh is not None and not getattr(orig_load_mesh, '_newt_automate_mesh_patched', False):
+
+		def load_mesh_local_automate(file_obj, *args, **kwargs):
+			try:
+				path = Path(file_obj)
+				if not path.is_absolute():
+					local_path = _local_automate_basename_path(automate_root, path.name)
+					if local_path is not None:
+						file_obj = str(local_path)
+			except (TypeError, ValueError, OSError):
+				pass
+			return orig_load_mesh(file_obj, *args, **kwargs)
+
+		load_mesh_local_automate._newt_automate_mesh_patched = True
+		load_mod.load_mesh = load_mesh_local_automate
+		try:
+			trimesh.load_mesh = load_mesh_local_automate
+		except Exception:
+			pass
+
+
+def _patch_automate_metadata_open(cfg):
+	"""
+	Redirect IsaacLab AutoMate's basename metadata reads to local asset files.
+
+	AutoMate calls retrieve_file_path(..., download_dir="./") and then opens
+	os.path.basename(...). Newt runs IsaacLab from an isolated runtime directory,
+	so the basename may not exist even when the local asset cache is complete.
+	"""
+	if not (
+		cfg.get('isaaclab_env_id', '') == 'Isaac-AutoMate-Assembly-Direct-v0'
+		or _uses_srsa_backend(cfg)
+	):
+		return
+
+	automate_root = next(_automate_metadata_roots(cfg), None)
+	if automate_root is None:
+		if int(getattr(cfg, 'rank', 0)) == 0:
+			print('[isaaclab-warning] Could not find local AutoMate metadata root; basename metadata reads may fail.')
+		return
+
+	assembly_id = str(cfg.get('assembly_id', '')).zfill(5)
+	os.environ['NEWT_AUTOMATE_ASSEMBLY_ID'] = assembly_id
+	os.environ['NEWT_AUTOMATE_AUDIT_ASSEMBLY_ID'] = assembly_id
+	_patch_automate_trimesh_load(automate_root)
+
+	orig_open = builtins.open
+	if getattr(orig_open, '_newt_automate_metadata_patched', False):
+		return
+
+	def open_local_automate_metadata(file, *args, **kwargs):
+		try:
+			path = Path(file)
+			mode = args[0] if args else kwargs.get('mode', 'r')
+			read_only = isinstance(mode, str) and not any(flag in mode for flag in ('w', 'a', 'x', '+'))
+			if read_only and not path.is_absolute():
+				local_path = _local_automate_basename_path(automate_root, path.name)
+				if local_path is not None:
+					file = str(local_path)
+		except (TypeError, ValueError, OSError):
+			pass
+		return orig_open(file, *args, **kwargs)
+
+	open_local_automate_metadata._newt_automate_metadata_patched = True
+	builtins.open = open_local_automate_metadata
+	if int(getattr(cfg, 'rank', 0)) == 0:
+		print(f'[Rank {cfg.rank}] Patched AutoMate metadata/mesh basename reads using {automate_root}.')
 
 
 def _canonicalize_quat_wxyz(quat: torch.Tensor) -> torch.Tensor:
@@ -1481,6 +1642,7 @@ def make_env(cfg):
 		env_cfg.task_name = cfg.isaaclab_task_name
 	if cfg.isaaclab_env_id == "Isaac-AutoMate-Assembly-Direct-v0" or _uses_srsa_backend(cfg):
 		_configure_assembly_task(env_cfg, cfg)
+		_patch_automate_metadata_open(cfg)
 	_configure_physx_buffers(env_cfg, cfg)
 	render_mode = 'rgb_array' if (cfg.save_video or cfg.obs == 'rgb') else None
 	env = gym.make(cfg.isaaclab_env_id, cfg=env_cfg, render_mode=render_mode)

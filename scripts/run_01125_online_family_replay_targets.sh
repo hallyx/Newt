@@ -44,12 +44,29 @@ TASK_CONTEXT_ADAPTER_ENABLED=${TASK_CONTEXT_ADAPTER_ENABLED:-false}
 TASK_CONTEXT_ADAPTER_HIDDEN_DIM=${TASK_CONTEXT_ADAPTER_HIDDEN_DIM:-128}
 TASK_CONTEXT_ADAPTER_ALPHA=${TASK_CONTEXT_ADAPTER_ALPHA:-1.0}
 TASK_CONTEXT_ADAPTER_SOURCE=${TASK_CONTEXT_ADAPTER_SOURCE:-task_context}
+TASK_CONTEXT_ADAPTER_APPLY_ENCODER=${TASK_CONTEXT_ADAPTER_APPLY_ENCODER:-true}
+TASK_CONTEXT_ADAPTER_APPLY_DYNAMICS=${TASK_CONTEXT_ADAPTER_APPLY_DYNAMICS:-true}
+TASK_CONTEXT_ADAPTER_APPLY_POLICY=${TASK_CONTEXT_ADAPTER_APPLY_POLICY:-false}
+TASK_CONTEXT_ADAPTER_APPLY_REWARD=${TASK_CONTEXT_ADAPTER_APPLY_REWARD:-false}
+TASK_CONTEXT_ADAPTER_APPLY_Q=${TASK_CONTEXT_ADAPTER_APPLY_Q:-false}
+TASK_CONTEXT_ADAPTER_LR_SCALE=${TASK_CONTEXT_ADAPTER_LR_SCALE:-0.1}
+TASK_CONTEXT_REPAIR_ENABLED=${TASK_CONTEXT_REPAIR_ENABLED:-false}
+TASK_RECON_COEF=${TASK_RECON_COEF:-0.0}
+TASK_SPREAD_COEF=${TASK_SPREAD_COEF:-0.0}
+TASK_RAW_RESIDUAL_SCALE=${TASK_RAW_RESIDUAL_SCALE:-0.1}
+TASK_SPREAD_NEAR_THRESHOLD=${TASK_SPREAD_NEAR_THRESHOLD:-0.3}
+TASK_SPREAD_FAR_THRESHOLD=${TASK_SPREAD_FAR_THRESHOLD:-1.0}
+TASK_SPREAD_MARGIN=${TASK_SPREAD_MARGIN:-0.5}
 
 CURRENT_RATIO=${CURRENT_RATIO:-0.50}
 ANCHOR_RATIO=${ANCHOR_RATIO:-0.20}
 HISTORY_RATIO=${HISTORY_RATIO:-0.30}
 MIN_CURRENT_EPISODES=${MIN_CURRENT_EPISODES:-5}
+ONLINE_FAMILY_SAMPLE_BALANCE=${ONLINE_FAMILY_SAMPLE_BALANCE:-ratio}
+MULTI_TASK_BOOTSTRAP_MIN_EPISODES_PER_CONDITION=${MULTI_TASK_BOOTSTRAP_MIN_EPISODES_PER_CONDITION:-20}
+MULTI_TASK_BOOTSTRAP_CURRENT_ONLY=${MULTI_TASK_BOOTSTRAP_CURRENT_ONLY:-true}
 REPLAY_STORAGE_DEVICE=${REPLAY_STORAGE_DEVICE:-cpu}
+REPLAY_CONDITION_FILENAME=${REPLAY_CONDITION_FILENAME:-false}
 SRSA_CLEARANCE_DEPTH_TEMPLATES=${SRSA_CLEARANCE_DEPTH_TEMPLATES:-1.0:1.0}
 
 SRSA_TASK_TEMPLATE_FP=${SRSA_TASK_TEMPLATE_FP:-data/srsa_axial_task_templates.json}
@@ -289,7 +306,11 @@ echo "[launcher] update_progress_log_every=${UPDATE_PROGRESS_LOG_EVERY}"
 echo "[launcher] acquisition_stop=${ACQUISITION_STOP_ENABLED} require_success=${ACQUISITION_REQUIRE_SUCCESS} metric=${ACQUISITION_METRIC} threshold=${ACQUISITION_SUCCESS_THRESHOLD} min_steps=${ACQUISITION_MIN_STEPS}"
 echo "[launcher] retention_gate=${RETENTION_REQUIRE_GATE} metric=${RETENTION_GATE_METRIC} family>=${RETENTION_MIN_FAMILY} anchor>=${RETENTION_MIN_ANCHOR} current>=${RETENTION_MIN_CURRENT}"
 echo "[launcher] replay_mix=current:${CURRENT_RATIO} anchor:${ANCHOR_RATIO} history:${HISTORY_RATIO} min_current_eps=${MIN_CURRENT_EPISODES}"
-echo "[launcher] task_context_adapter enabled=${TASK_CONTEXT_ADAPTER_ENABLED} source=${TASK_CONTEXT_ADAPTER_SOURCE} hidden=${TASK_CONTEXT_ADAPTER_HIDDEN_DIM} alpha=${TASK_CONTEXT_ADAPTER_ALPHA}"
+echo "[launcher] task_context_adapter enabled=${TASK_CONTEXT_ADAPTER_ENABLED} source=${TASK_CONTEXT_ADAPTER_SOURCE} hidden=${TASK_CONTEXT_ADAPTER_HIDDEN_DIM} alpha=${TASK_CONTEXT_ADAPTER_ALPHA} lr_scale=${TASK_CONTEXT_ADAPTER_LR_SCALE}"
+echo "[launcher] task_context_adapter_sites encoder=${TASK_CONTEXT_ADAPTER_APPLY_ENCODER} dynamics=${TASK_CONTEXT_ADAPTER_APPLY_DYNAMICS} policy=${TASK_CONTEXT_ADAPTER_APPLY_POLICY} reward=${TASK_CONTEXT_ADAPTER_APPLY_REWARD} q=${TASK_CONTEXT_ADAPTER_APPLY_Q}"
+echo "[launcher] task_context_repair enabled=${TASK_CONTEXT_REPAIR_ENABLED} recon_coef=${TASK_RECON_COEF} spread_coef=${TASK_SPREAD_COEF} raw_residual_scale=${TASK_RAW_RESIDUAL_SCALE}"
+echo "[launcher] task_context_repair_spread near=${TASK_SPREAD_NEAR_THRESHOLD} far=${TASK_SPREAD_FAR_THRESHOLD} margin=${TASK_SPREAD_MARGIN}"
+echo "[launcher] sample_balance=${ONLINE_FAMILY_SAMPLE_BALANCE} bootstrap_min_eps_per_condition=${MULTI_TASK_BOOTSTRAP_MIN_EPISODES_PER_CONDITION} bootstrap_current_only=${MULTI_TASK_BOOTSTRAP_CURRENT_ONLY}"
 echo "[launcher] size_templates=${SRSA_CLEARANCE_DEPTH_TEMPLATES} eval_task_template_exact=${EVAL_TASK_TEMPLATE_EXACT}"
 echo "[launcher] manifest=${MANIFEST_FP}"
 echo "[launcher] replay_dir=${REPLAY_DIR}"
@@ -308,12 +329,18 @@ for ASM in ${TARGETS}; do
   RUN_ID="${RUN_STAMP}_stage-${stage_idx}_asm-${ASM}"
   stage_work_dir="${WORK_BASE}/${RUN_ID}"
   stage_log="${LOG_ROOT}/stage-${stage_idx}_asm-${ASM}.train.log"
-  replay_fp="${REPLAY_DIR}/${ASM}.pt"
   acquisition_status_fp="${LOG_ROOT}/stage-${stage_idx}_asm-${ASM}.acquisition_status.json"
+  condition_id="${ASM}|tid-${SRSA_PARAM_TEMPLATE_ID}"
+  replay_label="${ASM}"
+  if [[ "${REPLAY_CONDITION_FILENAME,,}" == "true" || "${REPLAY_CONDITION_FILENAME}" == "1" ]]; then
+    replay_label="${ASM}_tid-${SRSA_PARAM_TEMPLATE_ID}"
+  fi
+  replay_fp="${REPLAY_DIR}/${replay_label}.pt"
 
   echo "[launcher] $(date --iso-8601=seconds) start stage=${stage_idx} assembly_id=${ASM}"
   echo "[launcher] stage_run_id=${RUN_ID}"
   echo "[launcher] stage_checkpoint_in=${current_checkpoint}"
+  echo "[launcher] stage_condition_id=${condition_id}"
   echo "[launcher] stage_replay_out=${replay_fp}"
   echo "[launcher] stage_acquisition_status=${acquisition_status_fp}"
   echo "[launcher] stage_log=${stage_log}"
@@ -340,11 +367,16 @@ for ASM in ${TARGETS}; do
     online_family_replay_manifest_fp="${MANIFEST_FP}"
     online_family_replay_save_fp="${replay_fp}"
     online_family_current_task_id="${ASM}"
+    online_family_current_template_id="${SRSA_PARAM_TEMPLATE_ID}"
+    online_family_current_condition_id="${condition_id}"
     online_family_anchor_task_id="${ANCHOR_TASK_ID}"
     online_family_current_ratio="${CURRENT_RATIO}"
     online_family_anchor_ratio="${ANCHOR_RATIO}"
     online_family_history_ratio="${HISTORY_RATIO}"
     online_family_min_current_episodes="${MIN_CURRENT_EPISODES}"
+    online_family_sample_balance="${ONLINE_FAMILY_SAMPLE_BALANCE}"
+    multi_task_bootstrap_min_episodes_per_condition="${MULTI_TASK_BOOTSTRAP_MIN_EPISODES_PER_CONDITION}"
+    multi_task_bootstrap_current_only="${MULTI_TASK_BOOTSTRAP_CURRENT_ONLY}"
     online_family_replay_storage_device="${REPLAY_STORAGE_DEVICE}"
     online_family_acquisition_stop_enabled="${ACQUISITION_STOP_ENABLED}"
     online_family_acquisition_success_threshold="${ACQUISITION_SUCCESS_THRESHOLD}"
@@ -376,6 +408,19 @@ for ASM in ${TARGETS}; do
     task_context_adapter_hidden_dim="${TASK_CONTEXT_ADAPTER_HIDDEN_DIM}"
     task_context_adapter_alpha="${TASK_CONTEXT_ADAPTER_ALPHA}"
     task_context_adapter_source="${TASK_CONTEXT_ADAPTER_SOURCE}"
+    task_context_adapter_apply_encoder="${TASK_CONTEXT_ADAPTER_APPLY_ENCODER}"
+    task_context_adapter_apply_dynamics="${TASK_CONTEXT_ADAPTER_APPLY_DYNAMICS}"
+    task_context_adapter_apply_policy="${TASK_CONTEXT_ADAPTER_APPLY_POLICY}"
+    task_context_adapter_apply_reward="${TASK_CONTEXT_ADAPTER_APPLY_REWARD}"
+    task_context_adapter_apply_q="${TASK_CONTEXT_ADAPTER_APPLY_Q}"
+    task_context_adapter_lr_scale="${TASK_CONTEXT_ADAPTER_LR_SCALE}"
+    task_context_repair_enabled="${TASK_CONTEXT_REPAIR_ENABLED}"
+    task_recon_coef="${TASK_RECON_COEF}"
+    task_spread_coef="${TASK_SPREAD_COEF}"
+    task_raw_residual_scale="${TASK_RAW_RESIDUAL_SCALE}"
+    task_spread_near_threshold="${TASK_SPREAD_NEAR_THRESHOLD}"
+    task_spread_far_threshold="${TASK_SPREAD_FAR_THRESHOLD}"
+    task_spread_margin="${TASK_SPREAD_MARGIN}"
     exp_name="${EXP_NAME}"
     run_id="${RUN_ID}"
   )
@@ -424,6 +469,8 @@ for ASM in ${TARGETS}; do
     --manifest "${MANIFEST_FP}"
     --task-id "${ASM}"
     --assembly-id "${ASM}"
+    --template-id "${SRSA_PARAM_TEMPLATE_ID}"
+    --condition-id "${condition_id}"
     --replay-fp "${replay_fp}"
     --checkpoint "${current_checkpoint}"
     --stage-index "${stage_idx}"
@@ -509,6 +556,19 @@ for ASM in ${TARGETS}; do
     task_context_adapter_hidden_dim="${TASK_CONTEXT_ADAPTER_HIDDEN_DIM}"
     task_context_adapter_alpha="${TASK_CONTEXT_ADAPTER_ALPHA}"
     task_context_adapter_source="${TASK_CONTEXT_ADAPTER_SOURCE}"
+    task_context_adapter_apply_encoder="${TASK_CONTEXT_ADAPTER_APPLY_ENCODER}"
+    task_context_adapter_apply_dynamics="${TASK_CONTEXT_ADAPTER_APPLY_DYNAMICS}"
+    task_context_adapter_apply_policy="${TASK_CONTEXT_ADAPTER_APPLY_POLICY}"
+    task_context_adapter_apply_reward="${TASK_CONTEXT_ADAPTER_APPLY_REWARD}"
+    task_context_adapter_apply_q="${TASK_CONTEXT_ADAPTER_APPLY_Q}"
+    task_context_adapter_lr_scale="${TASK_CONTEXT_ADAPTER_LR_SCALE}"
+    task_context_repair_enabled="${TASK_CONTEXT_REPAIR_ENABLED}"
+    task_recon_coef="${TASK_RECON_COEF}"
+    task_spread_coef="${TASK_SPREAD_COEF}"
+    task_raw_residual_scale="${TASK_RAW_RESIDUAL_SCALE}"
+    task_spread_near_threshold="${TASK_SPREAD_NEAR_THRESHOLD}"
+    task_spread_far_threshold="${TASK_SPREAD_FAR_THRESHOLD}"
+    task_spread_margin="${TASK_SPREAD_MARGIN}"
     eval_success_metric="${EVAL_SUCCESS_METRIC}"
     srsa_eval_success_metric="${EVAL_SUCCESS_METRIC}"
     batch_eval_episodes_per_task="${RETENTION_EVAL_EPISODES}"

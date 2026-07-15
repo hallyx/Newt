@@ -67,7 +67,10 @@ class TDMPC2(torch.nn.Module):
 			if len(residual_params) > 0:
 				optim_groups.append({'params': residual_params})
 			if len(adapter_params) > 0:
-				optim_groups.append({'params': adapter_params})
+				optim_groups.append({
+					'params': adapter_params,
+					'lr': self.cfg.lr * float(self.cfg.get('task_context_adapter_lr_scale', 0.1)),
+				})
 		else:
 			optim_groups = [
 				{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
@@ -83,7 +86,12 @@ class TDMPC2(torch.nn.Module):
 			if getattr(self.model, '_contact_encoder', None) is not None:
 				optim_groups.append({'params': self.model._contact_encoder.parameters()})
 			if getattr(self.model, '_task_context_adapters', None) is not None:
-				optim_groups.append({'params': self.model.task_context_adapter_parameters()})
+				adapter_params = list(self.model.task_context_adapter_parameters())
+				if len(adapter_params) > 0:
+					optim_groups.append({
+						'params': adapter_params,
+						'lr': self.cfg.lr * float(self.cfg.get('task_context_adapter_lr_scale', 0.1)),
+					})
 			if self._latent_residual_enabled:
 				optim_groups.append({'params': self.model.latent_residual_parameters()})
 		self.optim = torch.optim.Adam(optim_groups, lr=self.cfg.lr, capturable=True)
@@ -164,6 +172,23 @@ class TDMPC2(torch.nn.Module):
 			"task_context_adapter_hidden_dim": self.cfg.get("task_context_adapter_hidden_dim", None),
 			"task_context_adapter_alpha": self.cfg.get("task_context_adapter_alpha", None),
 			"task_context_adapter_source": self.cfg.get("task_context_adapter_source", None),
+			"task_context_adapter_lr_scale": self.cfg.get("task_context_adapter_lr_scale", None),
+			"task_context_adapter_apply_encoder": self.cfg.get("task_context_adapter_apply_encoder", None),
+			"task_context_adapter_apply_dynamics": self.cfg.get("task_context_adapter_apply_dynamics", None),
+			"task_context_adapter_apply_policy": self.cfg.get("task_context_adapter_apply_policy", None),
+			"task_context_adapter_apply_reward": self.cfg.get("task_context_adapter_apply_reward", None),
+			"task_context_adapter_apply_q": self.cfg.get("task_context_adapter_apply_q", None),
+			"task_vec_normalization_enabled": self.cfg.get("task_vec_normalization_enabled", None),
+			"task_vec_normalization_stats_fp": self.cfg.get("task_vec_normalization_stats_fp", None),
+			"task_context_repair_enabled": self.cfg.get("task_context_repair_enabled", None),
+			"task_recon_coef": self.cfg.get("task_recon_coef", None),
+			"task_spread_coef": self.cfg.get("task_spread_coef", None),
+			"task_raw_residual_scale": self.cfg.get("task_raw_residual_scale", None),
+			"task_spread_near_threshold": self.cfg.get("task_spread_near_threshold", None),
+			"task_spread_far_threshold": self.cfg.get("task_spread_far_threshold", None),
+			"task_spread_margin": self.cfg.get("task_spread_margin", None),
+			"assembly_conditioning": self.cfg.get("assembly_conditioning", None),
+			"assembly_id_vocab_fp": self.cfg.get("assembly_id_vocab_fp", None),
 		}
 		if bool(self.cfg.get("multitask_continuation_enabled", False)):
 			metadata.update({
@@ -177,6 +202,8 @@ class TDMPC2(torch.nn.Module):
 					self.cfg.get("checkpoint", ""),
 				),
 			})
+		if hasattr(self.model, "task_vec_normalization_metadata"):
+			metadata.update(self.model.task_vec_normalization_metadata())
 		return metadata
 
 	def _is_task_vec(self, task):
@@ -344,6 +371,107 @@ class TDMPC2(torch.nn.Module):
 			return {}
 		return self.model.task_context_adapter_metrics()
 
+	def _task_context_repair_enabled(self):
+		return (
+			bool(self.cfg.get('task_context_repair_enabled', False)) and
+			getattr(self.model, '_task_encoder', None) is not None
+		)
+
+	def _pairwise_task_context_metrics(self, task_raw):
+		zeros = {
+			"loss_spread": torch.zeros((), device=self.device),
+			"context_l2_mean": torch.zeros((), device=self.device),
+			"context_l2_min": torch.zeros((), device=self.device),
+			"context_l2_max": torch.zeros((), device=self.device),
+			"context_cosine_mean": torch.zeros((), device=self.device),
+			"vec_l2_mean": torch.zeros((), device=self.device),
+			"ctx_task_distance_corr": torch.full((), float('nan'), device=self.device),
+		}
+		if task_raw is None or not self._is_task_vec(task_raw):
+			return zeros
+		flat_raw = task_raw.detach().reshape(-1, task_raw.shape[-1]).to(device=self.device, dtype=torch.float32)
+		if flat_raw.numel() == 0:
+			return zeros
+		unique_raw = torch.unique(flat_raw, dim=0)
+		if unique_raw.shape[0] < 2:
+			return zeros
+		dummy = unique_raw.new_zeros(unique_raw.shape[0], 1)
+		info = self.model.task_context_repair_info(dummy, unique_raw, reconstruct=False)
+		context = info["task_context"]
+		vec_norm = info["task_vec_norm"]
+		idx = torch.triu_indices(context.shape[0], context.shape[0], offset=1, device=context.device)
+		ctx_dist = torch.cdist(context, context, p=2)[idx[0], idx[1]]
+		vec_dist = torch.cdist(vec_norm, vec_norm, p=2)[idx[0], idx[1]]
+		near_threshold = float(self.cfg.get('task_spread_near_threshold', 0.3))
+		far_threshold = float(self.cfg.get('task_spread_far_threshold', 1.0))
+		margin = float(self.cfg.get('task_spread_margin', 0.5))
+		loss_terms = []
+		far_mask = vec_dist >= far_threshold
+		if far_mask.any():
+			loss_terms.append(F.relu(margin - ctx_dist[far_mask]).pow(2).mean())
+		near_mask = (vec_dist <= near_threshold) & (vec_dist > 1.0e-8)
+		if near_mask.any():
+			loss_terms.append(ctx_dist[near_mask].pow(2).mean())
+		loss_spread = torch.stack(loss_terms).mean() if loss_terms else torch.zeros((), device=self.device)
+		if ctx_dist.numel() >= 2 and torch.std(ctx_dist) > 1.0e-8 and torch.std(vec_dist) > 1.0e-8:
+			ctx_centered = ctx_dist - ctx_dist.mean()
+			vec_centered = vec_dist - vec_dist.mean()
+			corr = (ctx_centered * vec_centered).mean() / (ctx_centered.std(unbiased=False) * vec_centered.std(unbiased=False)).clamp_min(1.0e-8)
+		else:
+			corr = torch.full((), float('nan'), device=self.device)
+		cosine = F.cosine_similarity(context[idx[0]], context[idx[1]], dim=-1)
+		return {
+			"loss_spread": loss_spread,
+			"context_l2_mean": ctx_dist.mean(),
+			"context_l2_min": ctx_dist.min(),
+			"context_l2_max": ctx_dist.max(),
+			"context_cosine_mean": cosine.mean(),
+			"vec_l2_mean": vec_dist.mean(),
+			"ctx_task_distance_corr": corr,
+		}
+
+	def _task_context_repair_loss(self, task):
+		if not self._task_context_repair_enabled() or task is None or not self._is_task_vec(task):
+			return None
+		dummy = task.new_zeros(*task.shape[:-1], 1)
+		info = self.model.task_context_repair_info(dummy, task, reconstruct=True)
+		if info is None or "task_recon" not in info:
+			return None
+		task_vec_norm = info["task_vec_norm"]
+		task_recon = info["task_recon"]
+		loss_recon = F.mse_loss(task_recon, task_vec_norm)
+		with torch.no_grad():
+			target = task_vec_norm.detach()
+			pred = task_recon.detach()
+			sse = (pred - target).pow(2).sum()
+			reduce_dims = tuple(range(target.ndim - 1))
+			sst = (target - target.mean(dim=reduce_dims, keepdim=True)).pow(2).sum()
+			recon_r2 = 1.0 - sse / sst.clamp_min(1.0e-8)
+		pairwise = self._pairwise_task_context_metrics(task)
+		raw_residual_norm = torch.linalg.vector_norm(info["raw_residual"], dim=-1).mean()
+		axial_context_norm = torch.linalg.vector_norm(info["axial_context"], dim=-1).mean()
+		final_context_norm = torch.linalg.vector_norm(info["task_context"], dim=-1).mean()
+		recon_coef = float(self.cfg.get('task_recon_coef', 0.0))
+		spread_coef = float(self.cfg.get('task_spread_coef', 0.0))
+		aux_loss = recon_coef * loss_recon + spread_coef * pairwise["loss_spread"]
+		metrics = TensorDict({
+			"task/recon_loss": loss_recon,
+			"task/spread_loss": pairwise["loss_spread"],
+			"task/recon_r2": recon_r2,
+			"task/context_l2_mean": pairwise["context_l2_mean"],
+			"task/context_l2_min": pairwise["context_l2_min"],
+			"task/context_l2_max": pairwise["context_l2_max"],
+			"task/context_cosine_mean": pairwise["context_cosine_mean"],
+			"task/vec_l2_mean": pairwise["vec_l2_mean"],
+			"task/ctx_task_distance_corr": pairwise["ctx_task_distance_corr"],
+			"task/raw_residual_norm": raw_residual_norm,
+			"task/axial_context_norm": axial_context_norm,
+			"task/final_context_norm": final_context_norm,
+			"task/recon_coef": torch.tensor(recon_coef, device=self.device),
+			"task/spread_coef": torch.tensor(spread_coef, device=self.device),
+		}, batch_size=())
+		return aux_loss, metrics
+
 	def save(self, fp):
 		"""
 		Save state dict of the agent to filepath.
@@ -397,8 +525,19 @@ class TDMPC2(torch.nn.Module):
 						f"Using current {key} from config instead of checkpoint metadata: "
 						f"checkpoint_shape={tuple(state_dict[source_key].shape)} "
 						f"current_shape={tuple(target_state[key].shape)}."
-					)
+				)
 				state_dict[source_key] = target_state[key]
+		repair_prefixes = (
+			"_task_encoder.raw_residual.",
+			"_task_encoder.decoder.",
+			"module._task_encoder.raw_residual.",
+			"module._task_encoder.decoder.",
+		)
+		for key, value in target_state.items():
+			if key in state_dict:
+				continue
+			if any(key.startswith(prefix) for prefix in repair_prefixes):
+				state_dict[key] = value
 		try:
 			self.model.load_state_dict(state_dict)
 		except Exception as load_error:
@@ -832,6 +971,11 @@ class TDMPC2(torch.nn.Module):
 		)
 		if self._latent_residual_enabled:
 			total_loss = total_loss + float(self.cfg.get('latent_residual_reg_coef', 1.0e-4)) * latent_residual_reg_loss
+		task_repair = self._task_context_repair_loss(task)
+		task_repair_metrics = None
+		if task_repair is not None:
+			task_repair_loss, task_repair_metrics = task_repair
+			total_loss = total_loss + task_repair_loss
 
 		info = TensorDict({
 			"consistency_loss": consistency_loss,
@@ -839,6 +983,8 @@ class TDMPC2(torch.nn.Module):
 			"value_loss": value_loss,
 			"total_loss": total_loss,
 		})
+		if task_repair_metrics is not None:
+			info.update(task_repair_metrics)
 		if self._latent_residual_enabled:
 			info.update(TensorDict({
 				"consistency_loss_base": consistency_loss_base,
@@ -936,9 +1082,37 @@ class TDMPC2(torch.nn.Module):
 		"""Return metrics describing the latest online-family replay sample."""
 		task_counts = getattr(buffer, "last_batch_task_counts", None)
 		source_counts = getattr(buffer, "last_batch_source_counts", None)
-		if not task_counts and not source_counts:
+		assembly_counts = getattr(buffer, "last_batch_assembly_counts", None)
+		template_counts = getattr(buffer, "last_batch_template_counts", None)
+		condition_counts = getattr(buffer, "last_batch_condition_counts", None)
+		task_hash_counts = getattr(buffer, "last_batch_task_hash_counts", None)
+		if not any([task_counts, source_counts, assembly_counts, template_counts, condition_counts, task_hash_counts]):
 			return None
 		values = {}
+		def add_count_metrics(prefix, counts, entropy_key=None):
+			if not counts:
+				return
+			total = float(sum(max(0, int(value)) for value in counts.values()))
+			if total <= 0:
+				return
+			probs = []
+			for key, value in sorted(counts.items()):
+				count = float(max(0, int(value)))
+				prob = count / total
+				probs.append(prob)
+				safe_key = str(key).replace("-", "_").replace("/", "_").replace("|", "_").replace(":", "_")
+				values[f"{prefix}_count_{safe_key}"] = torch.tensor(count, device=self.device)
+				values[f"{prefix}_frac_{safe_key}"] = torch.tensor(prob, device=self.device)
+			if entropy_key is not None:
+				probs_t = torch.tensor(probs, device=self.device, dtype=torch.float32).clamp_min(1.0e-12)
+				entropy = -(probs_t * probs_t.log()).sum()
+				values[f"{entropy_key}_entropy"] = entropy
+				if len(probs) > 1:
+					values[f"{entropy_key}_entropy_norm"] = entropy / torch.log(torch.tensor(float(len(probs)), device=self.device))
+				else:
+					values[f"{entropy_key}_entropy_norm"] = torch.zeros((), device=self.device)
+				values[f"{entropy_key}_num"] = torch.tensor(float(len(probs)), device=self.device)
+
 		if task_counts:
 			total = float(sum(max(0, int(value)) for value in task_counts.values()))
 			if total > 0:
@@ -967,6 +1141,10 @@ class TDMPC2(torch.nn.Module):
 					safe_key = str(key).replace("-", "_").replace("/", "_")
 					values[f"online_family_batch_source_count_{safe_key}"] = torch.tensor(count, device=self.device)
 					values[f"online_family_batch_source_frac_{safe_key}"] = torch.tensor(prob, device=self.device)
+		add_count_metrics("online_family_batch_assembly", assembly_counts)
+		add_count_metrics("online_family_batch_template", template_counts)
+		add_count_metrics("online_family_batch_condition", condition_counts, entropy_key="online_family_batch_condition")
+		add_count_metrics("online_family_batch_task_hash", task_hash_counts)
 		if not values:
 			return None
 		return TensorDict(values, batch_size=())
