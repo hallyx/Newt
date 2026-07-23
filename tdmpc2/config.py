@@ -318,6 +318,11 @@ class Config:
 	online_family_acquisition_min_steps: int = 150_000
 	online_family_acquisition_metric: str = "episode_success"
 	online_family_acquisition_status_fp: Optional[str] = None
+	# Phase 4.2 single-family parametric online replay. This changes sampling
+	# only; the environment remains the source of runtime geometry/task_vec.
+	parametric_phase_replay_enabled: bool = False
+	parametric_phase_replay_anchor_templates: Any = None
+	parametric_phase_replay_seed: int = 4201
 	multi_task_bootstrap_min_episodes_per_condition: int = 20
 	multi_task_bootstrap_current_only: bool = True
 	multi_task_roundrobin_block_steps: int = 50_000

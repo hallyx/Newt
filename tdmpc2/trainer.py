@@ -99,6 +99,15 @@ class Trainer():
 			metrics.update(self.agent.latent_residual_metrics())
 		if hasattr(self.agent, 'task_context_adapter_metrics'):
 			metrics.update(self.agent.task_context_adapter_metrics())
+		if hasattr(self.buffer, 'last_batch_anchor_counts') and self.buffer.last_batch_anchor_counts:
+			for key, value in self.buffer.last_batch_anchor_counts.items():
+				metrics[f'param_batch_anchor_count_{key}'] = int(value)
+			for key, value in (self.buffer.last_batch_phase_counts or {}).items():
+				metrics[f'param_batch_phase_count_{key}'] = int(value)
+			for index, value in enumerate(self.buffer.last_batch_task_vec_std or []):
+				metrics[f'param_batch_task_vec_std_{index}'] = float(value)
+			for key, value in getattr(self.buffer, 'episode_contract', {}).items():
+				metrics[f'param_episode_{key}'] = value
 		return metrics
 
 	def _maybe_save_current_replay(self, reason):

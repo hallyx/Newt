@@ -20,6 +20,7 @@ from common import barrier, set_seed
 from common.buffer import Buffer, EnsembleBuffer
 from common.logger import Logger
 from common.online_family_replay import OnlineFamilyReplayBuffer
+from common.parametric_phase_replay import ParametricPhaseReplayBuffer
 from common.world_model import WorldModel
 from config import Config, split_by_rank, parse_cfg
 from envs import make_env
@@ -298,8 +299,42 @@ def launch(cfg: Config):
 		buffer = EnsembleBuffer(Buffer(**demo_buffer_args), **buffer_args)
 		load_demos(cfg, [buffer._offline, buffer])
 	else:
-		# Default to regular buffer
-		buffer = Buffer(**buffer_args)
+		if cfg.get('parametric_phase_replay_enabled', False):
+			if cfg.get('online_family_replay_enabled', False):
+				raise ValueError('parametric_phase_replay_enabled and online_family_replay_enabled are separate routes.')
+			templates = cfg.get('parametric_phase_replay_anchor_templates', None)
+			if not templates:
+				raise ValueError('parametric_phase_replay_anchor_templates is required when balanced replay is enabled.')
+			if isinstance(templates, str):
+				templates = [
+					[float(value) for value in pair.split(':')]
+					for pair in templates.split(';') if pair.strip()
+				]
+			clearance_base = float(cfg.get('srsa_axial_clearance_base', 0.0) or 0.0)
+			depth_base = float(cfg.get('srsa_axial_depth_base', 0.0) or 0.0)
+			reference_radius = float(cfg.get('srsa_axial_reference_radius', 0.003993) or 0.003993)
+			reference_depth = float(cfg.get('srsa_axial_reference_depth', 0.015) or 0.015)
+			if clearance_base <= 0.0 or depth_base <= 0.0:
+				raise ValueError('Balanced parametric replay requires positive clearance/depth base values.')
+			anchor_names = [f'c{pair[0]:g}_d{pair[1]:g}' for pair in templates]
+			anchor_centers = [
+				[0.5 * clearance_base * float(pair[0]) / reference_radius,
+				 depth_base * float(pair[1]) / reference_depth]
+				for pair in templates
+			]
+			buffer = ParametricPhaseReplayBuffer(
+				**buffer_args,
+				anchor_centers=anchor_centers,
+				anchor_names=anchor_names,
+				seed=int(cfg.get('parametric_phase_replay_seed', 4201)),
+			)
+			print(colored(
+				f'Enabled anchor x phase balanced replay with {len(anchor_names)} anchors: {anchor_names}',
+				'green', attrs=['bold'],
+			))
+		else:
+			# Default to regular buffer
+			buffer = Buffer(**buffer_args)
 
 	if cfg.get('online_family_replay_enabled', False):
 		if cfg.get('use_demos', False):
